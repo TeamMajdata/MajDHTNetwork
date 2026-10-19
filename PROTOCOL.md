@@ -1,5 +1,7 @@
 # MajDHT v1 wire protocol
 
+**English** | [简体中文](PROTOCOL.zh-CN.md)
+
 All integers below, except TCP's frame prefix and explicitly stated single
 bytes, are **signed 64-bit big-endian**. Every byte array/string is prefixed by
 its 64-bit byte length. Strings use strict UTF-8; reject truncated, oversized,
