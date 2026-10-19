@@ -653,55 +653,21 @@ namespace MajDHTNetwork
                 }
             }
             Exception? last = null;
-            foreach (var endpoint in DirectEndpoints(peer))
+            foreach (var route in SelectDirectRoutes(peer))
             {
-                for (var attempt = 0; attempt < 2; attempt++)
+                try
                 {
-                    var transport = attempt == 0 ? _options.PreferredTransport : OtherTransport(_options.PreferredTransport);
-                    var port = endpoint.Port(transport);
-                    if (port == 0)
-                    {
-                        continue;
-                    }
-                    try
-                    {
-                        return await _transport.ExchangeAtAsync(transport, new IPEndPoint(endpoint.NetworkAddress, port), envelope, cancellationToken)
-                            .ConfigureAwait(false);
-                    }
-                    catch (Exception exception) when (IsPeerFailure(exception) || exception is OperationCanceledException
-                        || exception is ObjectDisposedException)
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        _lifetime.Token.ThrowIfCancellationRequested();
-                        last = exception;
-                    }
+                    return await _transport.ExchangeAtAsync(route.Transport, route.NetworkEndpoint, envelope, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception exception) when (IsPeerFailure(exception) || exception is OperationCanceledException
+                    || exception is ObjectDisposedException)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    _lifetime.Token.ThrowIfCancellationRequested();
+                    last = exception;
                 }
             }
-            throw new IOException("No advertised endpoint responded.", last);
-        }
-
-        /// <summary>Orders a contact's endpoints for direct attempts and omits endpoints that cannot be reached from here.</summary>
-        /// <param name="peer">The destination contact.</param>
-        /// <returns>Configured or verified endpoints, then unverified endpoints, then local endpoints.</returns>
-        /// <remarks>A private contact's local endpoints are only tried when both nodes share an external address.</remarks>
-        private List<DHTEndpoint> DirectEndpoints(DHTPeer peer)
-        {
-            var result = new List<DHTEndpoint>(peer.Endpoints.Count);
-            var sameNetwork = peer.ExternalNetworkAddress != null && IsLocalExternalAddress(peer.ExternalNetworkAddress);
-            for (var pass = 0; pass < 3; pass++)
-            {
-                foreach (var endpoint in peer.Endpoints)
-                {
-                    var local = (endpoint.Flags & DHTEndpointFlags.Local) != 0;
-                    var rank = endpoint.IsReachable ? 0 : local ? 2 : 1;
-                    if (rank != pass || (local && peer.Reachability == DHTReachability.Private && !sameNetwork))
-                    {
-                        continue;
-                    }
-                    result.Add(endpoint);
-                }
-            }
-            return result;
+            throw new IOException("No selected direct route responded.", last);
         }
 
         /// <summary>Reclaims expired relay bindings, introduction tickets and direct routes under the state lock.</summary>

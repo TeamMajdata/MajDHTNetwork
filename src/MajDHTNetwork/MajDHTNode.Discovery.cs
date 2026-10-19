@@ -218,7 +218,7 @@ namespace MajDHTNetwork
             var visited = new HashSet<string>();
             var responsive = new HashSet<string>();
             DHTRecord? best = null;
-            foreach (var peer in _routing.Closest(routingId, _options.BucketSize))
+            foreach (var peer in RoutedPeers(routingId, _options.BucketSize))
             {
                 candidates[peer.NodeId] = peer;
             }
@@ -243,7 +243,7 @@ namespace MajDHTNetwork
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var ordered = new List<DHTPeer>(candidates.Values);
-                RoutingTable.Sort(ordered, routingId);
+                XorDistanceComparer.Sort(ordered, routingId);
                 if (ordered.Count > _options.BucketSize)
                 {
                     ordered.RemoveRange(_options.BucketSize, ordered.Count - _options.BucketSize);
@@ -313,13 +313,13 @@ namespace MajDHTNetwork
                     closest.Add(candidate);
                 }
             }
-            RoutingTable.Sort(closest, routingId);
+            XorDistanceComparer.Sort(closest, routingId);
             if (closest.Count > _options.BucketSize)
             {
                 closest.RemoveRange(_options.BucketSize, closest.Count - _options.BucketSize);
             }
             var providerList = new List<DHTPeer>(providers.Values);
-            RoutingTable.Sort(providerList, routingId);
+            XorDistanceComparer.Sort(providerList, routingId);
             if (providerList.Count > 16)
             {
                 providerList.RemoveRange(16, providerList.Count - 16);
@@ -570,7 +570,7 @@ namespace MajDHTNetwork
                         PruneLocked();
                         checkReachability = _lastReachabilityCheck + _options.ReachabilityCheckInterval <= DateTimeOffset.UtcNow;
                     }
-                    if (_options.BootstrapEndpoints.Count != 0 && _routing.Closest(NodeId, 1).Count == 0)
+                    if (_options.BootstrapEndpoints.Count != 0 && RoutedPeers(NodeId, 1).Count == 0)
                     {
                         await BootstrapInBackgroundAsync().ConfigureAwait(false);
                     }

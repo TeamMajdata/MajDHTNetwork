@@ -20,8 +20,10 @@ namespace MajDHTNetwork
         private readonly DHTIdentity _identity;
         /// <summary>The caller-owned content store.</summary>
         private readonly IDHTContentStore _store;
-        /// <summary>The bounded routing table.</summary>
-        private readonly RoutingTable _routing;
+        /// <summary>The caller-supplied or default routing table.</summary>
+        private readonly IDHTRoutingTable _routing;
+        /// <summary>The caller-supplied or default route selection.</summary>
+        private readonly IDHTRouteSelector _routeSelector;
         /// <summary>Serializes state and in-memory index updates.</summary>
         private readonly object _gate = new object();
         /// <summary>Serializes start and stop operations.</summary>
@@ -71,19 +73,27 @@ namespace MajDHTNetwork
             }
         }
         /// <summary>Gets a snapshot of all known live peers.</summary>
-        public IReadOnlyList<DHTPeer> KnownPeers => _routing.Closest(NodeId, 4096).AsReadOnly();
+        public IReadOnlyList<DHTPeer> KnownPeers => RoutedPeers(NodeId, 4096).AsReadOnly();
 
         /// <summary>Constructs an unstarted node without performing filesystem access.</summary>
         /// <param name="options">Listener, resource and protocol limits, or defaults.</param>
         /// <param name="identity">A stable identity, or a newly generated identity.</param>
         /// <param name="contentStore">A concurrent caller-owned block store, or a bounded 64 MiB memory cache.</param>
+        /// <param name="routingTable">
+        /// An unbound thread-safe routing table that this node initializes and owns, or a new <see cref="KademliaDHTRoutingTable"/>.
+        /// </param>
+        /// <param name="routeSelector">A thread-safe route selection, or a <see cref="DefaultDHTRouteSelector"/>; it may be shared.</param>
         /// <exception cref="ArgumentException">The supplied options are invalid.</exception>
-        public MajDHTNode(DHTNodeOptions? options = null, DHTIdentity? identity = null, IDHTContentStore? contentStore = null)
+        /// <exception cref="InvalidOperationException">The routing table is already bound to another node.</exception>
+        public MajDHTNode(DHTNodeOptions? options = null, DHTIdentity? identity = null, IDHTContentStore? contentStore = null,
+            IDHTRoutingTable? routingTable = null, IDHTRouteSelector? routeSelector = null)
         {
             _options = (options ?? new DHTNodeOptions()).Snapshot();
             _identity = identity ?? new DHTIdentity();
             _store = contentStore ?? new MemoryDHTContentStore();
-            _routing = new RoutingTable(NodeId, _options.BucketSize);
+            _routing = routingTable ?? new KademliaDHTRoutingTable();
+            _routing.Initialize(NodeId, _options.BucketSize);
+            _routeSelector = routeSelector ?? new DefaultDHTRouteSelector();
             _transport = new SocketTransport(_options, HandleAsync, _options.Logger);
         }
 

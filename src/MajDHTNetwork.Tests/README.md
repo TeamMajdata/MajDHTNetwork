@@ -70,8 +70,9 @@ and requires the DLL, XML documentation, README, protocol document and license.
 | `src/ProtocolTests.cs`, `src/UdpCookieTests.cs` | Identity, authenticated envelopes, malformed protocol input and address cookies. |
 | `src/ContactTests.cs`, `src/BootstrapTests.cs` | Contact reachability rules, Hello envelopes, address options, endpoint bootstrap and dual-stack listeners. |
 | `src/ReachabilityTests.cs` | External-address voting, independent dial-back verification and relay-hinted private nodes over distinct loopback hosts. |
+| `src/RoutingCustomizationTests.cs` | Default route ordering, custom routing-table initialization and result filtering, and a custom route selector forcing a relay path. |
 | `src/MemoryTests.cs`, `src/ContentStoreTests.cs` | Span APIs, borrowed/owned memory, immutable snapshots and bounded cache eviction. |
-| `src/RoutingTests.cs`, `src/LoggingTests.cs` | XOR distance ordering, routing removal and structured logging contracts. |
+| `src/RoutingTests.cs`, `src/LoggingTests.cs` | Default Kademlia table XOR distance ordering, routing removal and structured logging contracts. |
 | `src/MerkleTests.cs`, `src/NetworkTests.cs` | File geometry, signatures, discovery, aliases, relays and malicious-provider recovery. |
 | `src/TransportTests.cs`, `src/TransportSessionTests.cs` | Dual listeners, IPv6, fallback/loss/replay, persistent duplex TCP and endpoint-pinned UDP demultiplexing. |
 | `src/LeaseTests.cs`, `src/LifecycleTests.cs` | Revision floors, expiry, quotas, capabilities, cancellation and shutdown. |

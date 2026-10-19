@@ -24,6 +24,7 @@ The wire protocol is specified in [PROTOCOL.md](PROTOCOL.md)
 - [Encryption and relays](#encryption-and-relays)
 - [Bootstrap and discovery](#bootstrap-and-discovery)
 - [TCP, UDP and NAT traversal](#tcp-udp-and-nat-traversal)
+- [Custom routing](#custom-routing)
 - [Storage, quotas and lifecycle](#storage-quotas-and-lifecycle)
 - [Logging](#logging)
 - [Memory ownership and allocations](#memory-ownership-and-allocations)
@@ -146,7 +147,7 @@ node ID and publisher namespace must survive restarts, and implement
 
 | Member | Purpose |
 | --- | --- |
-| `MajDHTNode(DHTNodeOptions?, DHTIdentity?, IDHTContentStore?)` | Creates a node; every argument is optional and defaults are created internally. |
+| `MajDHTNode(DHTNodeOptions?, DHTIdentity?, IDHTContentStore?, IDHTRoutingTable?, IDHTRouteSelector?)` | Creates a node; every argument is optional and defaults are created internally. |
 | `StartAsync(CancellationToken)` | Binds listeners once and starts a background bootstrap when endpoints are configured; the token is a lifetime token. |
 | `StopAsync()`, `DisposeAsync()`, `Dispose()` | Idempotent shutdown; a stopped instance cannot be restarted. |
 | `NodeId`, `LocalPeer`, `KnownPeers` | Local identity fingerprint, local signed contact and the current routing contacts. |
@@ -206,6 +207,12 @@ node ID and publisher namespace must survive restarts, and implement
 | `DHTRecord` | `Key`, `FileHash`, `MerkleRoot`, `Length`, `BlockSize`, `BlockCount`, `Revision`, `ExpiresAt`, `IsExpired`, `EncodedLength`, `CopyTo(Span<byte>)`, `ToBytes()`, `Parse(ReadOnlySpan<byte>)` |
 | `IDHTContentStore` | `PutAsync(string blockHash, ReadOnlyMemory<byte>, CancellationToken)`, `GetAsync(string blockHash, CancellationToken)` |
 | `MemoryDHTContentStore` | `MemoryDHTContentStore(long capacity = 64 MiB, int maxEntries = 65536)` |
+| `IDHTRoutingTable` | `Initialize(string localNodeId, int bucketSize)`, `Observe(DHTPeer)`, `Remove(string nodeId)`, `Closest(string routingId, int count)` |
+| `KademliaDHTRoutingTable` | Default routing table: 256 XOR buckets of `BucketSize` contacts |
+| `IDHTRouteSelector` | `SelectDirectRoutes(DHTPeer, DHTRouteContext)`, `SelectRelayRoutes(DHTPeer, IReadOnlyList<DHTPeer> knownRelays, DHTRouteContext)` |
+| `DefaultDHTRouteSelector` | Default route selection described in [Custom routing](#custom-routing) |
+| `DHTRouteContext` | `PreferredTransport`, `AlternateTransport`, `NatTraversalEnabled`, `ExternalAddresses`, `MaxRelayAttempts`, `IsRegisteredWith(string)`, `SharesExternalAddress(DHTPeer)` |
+| `DHTDirectRoute`, `DHTRelayRoute` | `Endpoint`, `Transport`; `Relay`, `AttemptPunch` |
 | `DHTCapabilities` | `Download = 1`, `Provide = 2`, `Relay = 4` |
 | `DHTTransport` | `Tcp`, `Udp` |
 
@@ -407,6 +414,44 @@ seconds later so provider indexes hold the new contact. Private and unverified
 contacts use a one-hour lease; public contacts use one day. A helper accepts at
 most ten delegations per relay and four dial-backs per target address each
 minute.
+
+## Custom routing
+
+Two routing decisions can be replaced when constructing a node:
+
+```csharp
+await using var node = new MajDHTNode(options, identity, store,
+    routingTable: new KademliaDHTRoutingTable(), routeSelector: new MyRouteSelector());
+```
+
+- **`IDHTRoutingTable`** decides which authenticated contacts are kept as lookup
+  hops and which are returned as nearest to a target. The node calls
+  `Initialize` exactly once, so pass a new table to each node. It only passes
+  verified, non-private contacts to `Observe`, calls `Remove` after failures or
+  when a node becomes private, and discards expired, private, duplicate and
+  local contacts that `Closest` returns. The default `KademliaDHTRoutingTable`
+  keeps 256 XOR buckets of `BucketSize` contacts without evicting live entries.
+- **`IDHTRouteSelector`** decides how a destination is reached. It returns the
+  ordered direct attempts (endpoint and transport) and, after they all fail, the
+  ordered relay attempts and whether to punch through each relay first. The
+  `DHTRouteContext` reports the preferred transport, whether NAT traversal is
+  enabled, the confirmed external addresses and the relays this node is
+  registered with. A selector may be shared between nodes.
+
+`DefaultDHTRouteSelector` orders configured or verified endpoints, then
+unverified endpoints, then local endpoints, each with the preferred transport
+first; a private destination's local endpoints are only used behind the same
+external address. Relay routes list the destination's relay hints, punching only
+through hints this node is registered with, followed by at most `BucketSize`
+routed relays; destinations with an endpoint-dependent mapping are never punched.
+
+Both implementations must be thread-safe, return quickly and perform no network
+I/O. Routes are attempts, not trust decisions: every response is authenticated
+against the destination's identity whichever route carried it. Authenticated
+routes learned through punching or rendezvous registrations are always tried
+before the selected direct routes. The node attempts at most sixteen direct and
+thirty-two relay routes and skips relay routes through itself, the destination,
+expired contacts or peers without the `Relay` capability.
 
 ## Storage, quotas and lifecycle
 

@@ -16,7 +16,8 @@ namespace MajDHTNetwork.Tests
         public void ClosestPeersUseCanonicalXorOrderAndRemovalUpdatesCount()
         {
             var identity = new DHTIdentity();
-            var routing = new RoutingTable(identity.NodeId, 2);
+            var routing = new KademliaDHTRoutingTable();
+            routing.Initialize(identity.NodeId, 2);
             var all = new List<DHTPeer>();
             for (var i = 0; i < 20; i++)
             {

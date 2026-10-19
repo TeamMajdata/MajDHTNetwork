@@ -1,42 +1,56 @@
 using System;
 using System.Buffers;
 using System.Collections.Generic;
+using MajDHTNetwork.Protocol;
 
 #nullable enable
 
-namespace MajDHTNetwork.Protocol
+namespace MajDHTNetwork
 {
-    /// <summary>Maintains bounded XOR buckets with lazy allocation and pooled nearest-peer snapshots.</summary>
-    internal sealed class RoutingTable
+    /// <summary>The default routing table: bounded Kademlia XOR buckets with lazy allocation and pooled nearest-peer snapshots.</summary>
+    public sealed class KademliaDHTRoutingTable : IDHTRoutingTable
     {
         /// <summary>Protects the routing entries and count.</summary>
         private readonly object _gate = new object();
-        /// <summary>The local routing digest.</summary>
-        private readonly byte[] _self;
-        /// <summary>The per-bucket capacity.</summary>
-        private readonly int _capacity;
         /// <summary>The sparse distance buckets; empty buckets allocate no lists.</summary>
         private readonly List<DHTPeer>?[] _buckets = new List<DHTPeer>?[256];
+        /// <summary>The local routing digest, or null before initialization.</summary>
+        private byte[]? _self;
+        /// <summary>The per-bucket capacity.</summary>
+        private int _capacity;
         /// <summary>The total retained entry count.</summary>
         private int _count;
 
-        /// <summary>Creates an empty routing table.</summary>
-        /// <param name="nodeId">The local routing ID.</param>
-        /// <param name="capacity">The maximum peers in each bucket.</param>
-        internal RoutingTable(string nodeId, int capacity)
+        /// <inheritdoc />
+        /// <exception cref="ArgumentException">The node identifier or bucket size is invalid.</exception>
+        public void Initialize(string localNodeId, int bucketSize)
         {
-            _self = Crypto.ParseHash(nodeId);
-            _capacity = capacity;
+            if (bucketSize < 1)
+            {
+                throw new ArgumentException("A routing bucket must hold at least one contact.", nameof(bucketSize));
+            }
+            var self = Crypto.ParseHash(localNodeId);
+            lock (_gate)
+            {
+                if (_self != null)
+                {
+                    throw new InvalidOperationException("The routing table is already bound to a node.");
+                }
+                _self = self;
+                _capacity = bucketSize;
+            }
         }
 
         /// <summary>Computes the most significant differing bit without temporary identifier arrays.</summary>
         /// <param name="id">The remote node digest.</param>
         /// <returns>The distance bucket, or minus one for self.</returns>
+        /// <exception cref="InvalidOperationException">The table has not been initialized.</exception>
         private int Bucket(ReadOnlySpan<byte> id)
         {
+            var self = _self ?? throw new InvalidOperationException("The routing table has not been initialized.");
             for (var i = 0; i < id.Length; i++)
             {
-                var difference = id[i] ^ _self[i];
+                var difference = id[i] ^ self[i];
                 if (difference == 0)
                 {
                     continue;
@@ -53,7 +67,8 @@ namespace MajDHTNetwork.Protocol
 
         /// <summary>Records an authenticated contact without displacing a live full bucket; a higher sequence replaces a known contact.</summary>
         /// <param name="peer">The verified contact.</param>
-        internal void Observe(DHTPeer peer)
+        /// <exception cref="InvalidOperationException">The table has not been initialized.</exception>
+        public void Observe(DHTPeer peer)
         {
             var index = Bucket(peer.NodeHash);
             if (index < 0 || peer.IsExpired)
@@ -90,7 +105,8 @@ namespace MajDHTNetwork.Protocol
 
         /// <summary>Removes an unreachable peer using stack-based identifier parsing.</summary>
         /// <param name="nodeId">The canonical peer ID.</param>
-        internal void Remove(string nodeId)
+        /// <exception cref="InvalidOperationException">The table has not been initialized.</exception>
+        public void Remove(string nodeId)
         {
             Span<byte> id = stackalloc byte[32];
             Crypto.ParseHash(nodeId, id);
@@ -118,12 +134,12 @@ namespace MajDHTNetwork.Protocol
         }
 
         /// <summary>Returns the nearest live peers using pooled sorting storage.</summary>
-        /// <param name="target">The canonical target ID.</param>
+        /// <param name="routingId">The canonical target ID.</param>
         /// <param name="count">The maximum results.</param>
         /// <returns>An owned small peer list.</returns>
-        internal List<DHTPeer> Closest(string target, int count)
+        public IReadOnlyList<DHTPeer> Closest(string routingId, int count)
         {
-            var comparer = new DistanceComparer(target);
+            var comparer = new XorDistanceComparer(routingId);
             DHTPeer[] entries;
             var length = 0;
             lock (_gate)
@@ -156,7 +172,7 @@ namespace MajDHTNetwork.Protocol
             try
             {
                 Array.Sort(entries, 0, length, comparer);
-                var result = new List<DHTPeer>(Math.Min(count, length));
+                var result = new List<DHTPeer>(Math.Max(0, Math.Min(count, length)));
                 for (var i = 0; i < Math.Min(count, length); i++)
                 {
                     result.Add(entries[i]);
@@ -166,56 +182,6 @@ namespace MajDHTNetwork.Protocol
             finally
             {
                 ArrayPool<DHTPeer>.Shared.Return(entries, clearArray: true);
-            }
-        }
-
-        /// <summary>Sorts a caller-owned candidate list without parsing each peer ID again.</summary>
-        /// <param name="peers">The candidate list.</param>
-        /// <param name="target">The routing target.</param>
-        internal static void Sort(List<DHTPeer> peers, string target)
-        {
-            peers.Sort(new DistanceComparer(target));
-        }
-
-        /// <summary>Compares cached peer digests against one owned target digest.</summary>
-        private sealed class DistanceComparer : IComparer<DHTPeer>
-        {
-            /// <summary>The target digest reused for every comparison.</summary>
-            private readonly byte[] _target;
-
-            /// <summary>Parses a target once for an entire sort.</summary>
-            /// <param name="target">The canonical target.</param>
-            internal DistanceComparer(string target)
-            {
-                _target = Crypto.ParseHash(target);
-            }
-
-            /// <inheritdoc />
-            public int Compare(DHTPeer? left, DHTPeer? right)
-            {
-                if (ReferenceEquals(left, right))
-                {
-                    return 0;
-                }
-                if (left == null)
-                {
-                    return -1;
-                }
-                if (right == null)
-                {
-                    return 1;
-                }
-                var a = left.NodeHash;
-                var b = right.NodeHash;
-                for (var i = 0; i < _target.Length; i++)
-                {
-                    var order = (a[i] ^ _target[i]).CompareTo(b[i] ^ _target[i]);
-                    if (order != 0)
-                    {
-                        return order;
-                    }
-                }
-                return 0;
             }
         }
     }

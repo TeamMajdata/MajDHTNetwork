@@ -221,24 +221,6 @@ namespace MajDHTNetwork
             return _externalAddresses.TryGetValue(AddressFamily.InterNetworkV6, out address) ? address : null;
         }
 
-        /// <summary>Checks whether a confirmed external address belongs to this node.</summary>
-        /// <param name="address">The remote contact's external address.</param>
-        /// <returns>Whether this node and the remote node share an external address.</returns>
-        private bool IsLocalExternalAddress(IPAddress address)
-        {
-            lock (_gate)
-            {
-                foreach (var external in _externalAddresses.Values)
-                {
-                    if (external.Equals(address))
-                    {
-                        return true;
-                    }
-                }
-                return false;
-            }
-        }
-
         /// <summary>Checks whether relays observed different ports for the confirmed external address.</summary>
         /// <returns>Whether the NAT mapping depends on the destination endpoint.</returns>
         /// <remarks>The caller must hold the state lock.</remarks>
@@ -639,7 +621,7 @@ namespace MajDHTNetwork
                 }
             }
             var result = new List<DHTPeer>();
-            foreach (var peer in _routing.Closest(client.NodeId, 256))
+            foreach (var peer in RoutedPeers(client.NodeId, 256))
             {
                 if (peer.NodeId == client.NodeId || peer.NodeId == NodeId || peer.Reachability != DHTReachability.Public
                     || (peer.Capabilities & DHTCapabilities.Relay) == 0)

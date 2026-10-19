@@ -21,6 +21,7 @@ MajDHTNetwork 是一个独立的 **.NET Standard 2.1** 类库，命名空间为
 - [加密与中继](#加密与中继)
 - [引导与发现](#引导与发现)
 - [TCP、UDP 与 NAT 穿透](#tcpudp-与-nat-穿透)
+- [自定义选路](#自定义选路)
 - [存储、配额与生命周期](#存储配额与生命周期)
 - [日志](#日志)
 - [内存所有权与内存分配](#内存所有权与内存分配)
@@ -137,7 +138,7 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 
 | 成员 | 用途 |
 | --- | --- |
-| `MajDHTNode(DHTNodeOptions?, DHTIdentity?, IDHTContentStore?)` | 创建节点；所有参数都可选，缺省时在内部创建默认实现。 |
+| `MajDHTNode(DHTNodeOptions?, DHTIdentity?, IDHTContentStore?, IDHTRoutingTable?, IDHTRouteSelector?)` | 创建节点；所有参数都可选，缺省时在内部创建默认实现。 |
 | `StartAsync(CancellationToken)` | 只绑定一次监听器；配置了引导端点时在后台开始引导；该令牌是生命周期令牌。 |
 | `StopAsync()`、`DisposeAsync()`、`Dispose()` | 幂等的关闭流程；已停止的实例不能重启。 |
 | `NodeId`、`LocalPeer`、`KnownPeers` | 本地身份指纹、本地签名联系人与当前路由中的联系人。 |
@@ -197,6 +198,12 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | `DHTRecord` | `Key`、`FileHash`、`MerkleRoot`、`Length`、`BlockSize`、`BlockCount`、`Revision`、`ExpiresAt`、`IsExpired`、`EncodedLength`、`CopyTo(Span<byte>)`、`ToBytes()`、`Parse(ReadOnlySpan<byte>)` |
 | `IDHTContentStore` | `PutAsync(string blockHash, ReadOnlyMemory<byte>, CancellationToken)`、`GetAsync(string blockHash, CancellationToken)` |
 | `MemoryDHTContentStore` | `MemoryDHTContentStore(long capacity = 64 MiB, int maxEntries = 65536)` |
+| `IDHTRoutingTable` | `Initialize(string localNodeId, int bucketSize)`、`Observe(DHTPeer)`、`Remove(string nodeId)`、`Closest(string routingId, int count)` |
+| `KademliaDHTRoutingTable` | 默认路由表：256 个 XOR 距离桶，每桶 `BucketSize` 个联系人 |
+| `IDHTRouteSelector` | `SelectDirectRoutes(DHTPeer, DHTRouteContext)`、`SelectRelayRoutes(DHTPeer, IReadOnlyList<DHTPeer> knownRelays, DHTRouteContext)` |
+| `DefaultDHTRouteSelector` | 默认路径选择，见[自定义选路](#自定义选路) |
+| `DHTRouteContext` | `PreferredTransport`、`AlternateTransport`、`NatTraversalEnabled`、`ExternalAddresses`、`MaxRelayAttempts`、`IsRegisteredWith(string)`、`SharesExternalAddress(DHTPeer)` |
+| `DHTDirectRoute`、`DHTRelayRoute` | `Endpoint`、`Transport`；`Relay`、`AttemptPunch` |
 | `DHTCapabilities` | `Download = 1`、`Provide = 2`、`Relay = 4` |
 | `DHTTransport` | `Tcp`、`Udp` |
 
@@ -339,6 +346,35 @@ var connected = await downloader.TryPunchAsync(provider.LocalPeer, relayPeer,
 作为查找跳点返回。联系人变化会立即重新签名，本地发布会在五秒后重新宣告，使提供者索引持有新
 联系人。私有与未验证联系人的租约为一小时，公网联系人为一天。每个协助者每分钟最多接受同一中继
 的十次委托，并最多向同一目标地址回拨四次。
+
+## 自定义选路
+
+构建节点时可以替换两类选路决策：
+
+```csharp
+await using var node = new MajDHTNode(options, identity, store,
+    routingTable: new KademliaDHTRoutingTable(), routeSelector: new MyRouteSelector());
+```
+
+- **`IDHTRoutingTable`** 决定把哪些已认证联系人保留为查找跳点，以及哪些联系人作为离目标最近的
+  节点返回。节点只会调用一次 `Initialize`，因此每个节点都要传入新的路由表。节点只把已校验且
+  非私有的联系人交给 `Observe`，在请求失败或节点变为私有时调用 `Remove`，并丢弃 `Closest`
+  返回的过期、私有、重复以及本节点自身的联系人。默认的 `KademliaDHTRoutingTable` 维护 256 个
+  XOR 距离桶，每桶最多 `BucketSize` 个联系人，不会淘汰仍然有效的条目。
+- **`IDHTRouteSelector`** 决定如何访问目标节点。它返回按顺序排列的直连尝试（端点与传输），
+  以及直连全部失败后按顺序排列的中继尝试，并指明是否先经该中继打洞。`DHTRouteContext` 提供
+  首选传输、是否启用 NAT 穿透、已确认的外部地址，以及本节点已登记的中继。同一个路径选择实现
+  可以在多个节点间共享。
+
+`DefaultDHTRouteSelector` 先尝试已配置或已验证的端点，再尝试未验证端点，最后尝试本地端点，
+每个端点都先用首选传输；只有双方外部地址相同时，才会使用私有目标的本地端点。中继路径先列出
+目标的中继提示（只对本节点已登记的提示中继尝试打洞），再列出最多 `BucketSize` 个路由中的中继；
+目标映射依赖目的端点时从不打洞。
+
+两种实现都必须线程安全、快速返回，并且不得进行网络 I/O。路径只是尝试，而非信任决策：无论经由
+哪条路径，每个响应都会按目标身份进行认证。经打洞或会合登记得到的已认证路径总是先于所选的直连
+路径尝试。节点最多尝试十六条直连路径和三十二条中继路径，并跳过经由本节点、目标本身、过期联系人
+或不具备 `Relay` 能力的节点的中继路径。
 
 ## 存储、配额与生命周期
 
