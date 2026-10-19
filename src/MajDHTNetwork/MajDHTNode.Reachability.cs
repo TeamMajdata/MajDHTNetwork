@@ -28,6 +28,10 @@ namespace MajDHTNetwork
         private const int ProbesPerRelay = 10;
         /// <summary>The maximum dial-backs sent to one target address per quota window.</summary>
         private const int ProbesPerTarget = 4;
+        /// <summary>The maximum dial-back requests a relay accepts from one requester per quota window.</summary>
+        internal const int DialBacksPerRequester = 3;
+        /// <summary>The maximum probe rounds a helper sends for one delegation, bounding traffic towards an arbitrary target.</summary>
+        internal const int MaxProbeRounds = 5;
         /// <summary>The number of helpers a relay asks before rejecting a dial-back request.</summary>
         private const int DialBackHelperAttempts = 3;
         /// <summary>The number of failed dial-backs, from distinct relay networks, that marks the node private.</summary>
@@ -91,7 +95,12 @@ namespace MajDHTNetwork
             }
             foreach (var verified in _verifiedEndpoints.Values)
             {
-                AddLocalEndpoint(endpoints, verified.Address, verified.TcpPort, verified.UdpPort, DHTEndpointFlags.Verified);
+                // A single relay chooses both the reported address and the helper, so a colluding pair could otherwise make
+                // this node advertise an attacker's address; only the address confirmed by independent relays is advertised.
+                if (_externalAddresses.TryGetValue(verified.Address.AddressFamily, out var external) && external.Equals(verified.Address))
+                {
+                    AddLocalEndpoint(endpoints, verified.Address, verified.TcpPort, verified.UdpPort, DHTEndpointFlags.Verified);
+                }
             }
             if (_options.AdvertisedAddresses.Count == 0)
             {
@@ -535,11 +544,19 @@ namespace MajDHTNetwork
         /// <param name="source">The client's observed endpoint, which is the only permitted dial-back address.</param>
         /// <param name="cancellationToken">The handler lifetime.</param>
         /// <returns>The observed endpoint, helper identity, nonce, expiry and candidate ports.</returns>
-        /// <exception cref="IOException">No helper accepted the dial-back.</exception>
+        /// <exception cref="IOException">The requester exceeded its quota or no helper accepted the dial-back.</exception>
         /// <exception cref="InvalidDataException">The request is malformed.</exception>
         private async Task<ReadOnlyMemory<byte>> DispatchDialBackAsync(Packet packet, Wire request, DHTTransport transport, IPEndPoint source,
             CancellationToken cancellationToken)
         {
+            lock (_gate)
+            {
+                // Each request makes this relay contact helpers, so a requester cannot use it as a traffic multiplier.
+                if (!TakeProbeQuotaLocked("requester:" + packet.Sender.NodeId, DialBacksPerRequester))
+                {
+                    throw new IOException("The dial-back request quota was reached.");
+                }
+            }
             var count = request.Long();
             if (count < 0 || count > 2)
             {
@@ -763,7 +780,8 @@ namespace MajDHTNetwork
         }
 
         /// <summary>
-        /// Probes each candidate port of the client's observed address until one probe is accepted or the dial-back expires.
+        /// Probes each candidate port of the client's observed address until one probe is accepted, the bounded rounds are
+        /// used up or the dial-back expires.
         /// </summary>
         /// <param name="owner">The client whose reachability is checked.</param>
         /// <param name="transport">The transport to dial.</param>
@@ -771,10 +789,11 @@ namespace MajDHTNetwork
         /// <param name="ports">The candidate ports.</param>
         /// <param name="nonce">The relay-issued nonce.</param>
         /// <param name="expiresAt">The dial-back expiry.</param>
-        /// <returns>Completion after a probe was accepted or the dial-back expired.</returns>
+        /// <returns>Completion after a probe was accepted or the probe budget was spent.</returns>
         /// <remarks>
         /// The client registers its pending job only after the relay answers, which can be later than the first probe, so a
-        /// rejected probe is retried with a fresh request identifier.
+        /// rejected probe is retried with a fresh request identifier. A relay can name any target, so the helper never sends
+        /// more than <see cref="MaxProbeRounds"/> rounds and never probes longer than its own traversal budget.
         /// </remarks>
         private async Task SendProbesAsync(DHTPeer owner, DHTTransport transport, IPAddress target, List<int> ports, byte[] nonce,
             DateTimeOffset expiresAt)
@@ -782,10 +801,14 @@ namespace MajDHTNetwork
             await Task.Yield();
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
             var remaining = expiresAt - DateTimeOffset.UtcNow;
+            if (remaining > _options.NatTraversalTimeout)
+            {
+                remaining = _options.NatTraversalTimeout;
+            }
             timeout.CancelAfter(remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero);
             try
             {
-                while (true)
+                for (var round = 0; round < MaxProbeRounds; round++)
                 {
                     for (var index = 0; index < ports.Count; index++)
                     {
@@ -796,8 +819,12 @@ namespace MajDHTNetwork
                             return;
                         }
                     }
-                    await Task.Delay(s_probeRetryInterval, timeout.Token).ConfigureAwait(false);
+                    if (round + 1 < MaxProbeRounds)
+                    {
+                        await Task.Delay(s_probeRetryInterval, timeout.Token).ConfigureAwait(false);
+                    }
                 }
+                Log(LogLevel.Debug, "Dial-back probes did not reach their target.");
             }
             catch (OperationCanceledException) when (timeout.IsCancellationRequested)
             {

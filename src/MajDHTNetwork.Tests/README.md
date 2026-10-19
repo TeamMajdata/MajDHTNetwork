@@ -72,6 +72,7 @@ and requires the DLL, XML documentation, README, protocol document and license.
 | `src/ReachabilityTests.cs` | External-address voting, independent dial-back verification and relay-hinted private nodes over distinct loopback hosts. |
 | `src/RoutingCustomizationTests.cs` | Default route ordering, custom routing-table initialization and result filtering, and a custom route selector forcing a relay path. |
 | `src/DownloadStatisticsTests.cs` | Per-peer and per-route packet-loss statistics through a lossy UDP proxy, loss-ranked default routes and relays, concurrent two-provider downloads within per-peer limits, and download option validation. |
+| `src/AttackSurfaceTests.cs`, `src/ScriptedPeer.cs` | Scripted malicious relays, helpers and clients: colluding address hijack, bounded helper probe traffic, helper scope and quota refusals, relay dial-back quotas, unsolicited probes and named Hello envelopes, copied relay hints, provider failover and malformed contacts. |
 | `src/MemoryTests.cs`, `src/ContentStoreTests.cs` | Span APIs, borrowed/owned memory, immutable snapshots and bounded cache eviction. |
 | `src/RoutingTests.cs`, `src/LoggingTests.cs` | Default Kademlia table XOR distance ordering, routing removal and structured logging contracts. |
 | `src/MerkleTests.cs`, `src/NetworkTests.cs` | File geometry, signatures, discovery, aliases, relays and malicious-provider recovery. |

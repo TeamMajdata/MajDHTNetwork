@@ -426,7 +426,9 @@ determines its reachability itself:
    `ReachabilityCheckInterval`, the node asks its relays to arrange a dial-back.
    The relay delegates it to an independent public helper in another network,
    which probes only the address the relay observed. An accepted probe adds a
-   `Verified` endpoint and makes the contact `Public`.
+   `Verified` endpoint and makes the contact `Public` once that address matches
+   the confirmed `ExternalAddress`, so one relay cannot get a foreign address
+   advertised.
 3. **Private contacts.** When dial-backs through relays in two distinct networks
    time out, the contact becomes `Private`: it drops unreachable endpoints and
    embeds up to three public relays with live registrations as `RelayHints`.
@@ -438,9 +440,10 @@ Private nodes act as DHT clients: they search, download and provide content,
 but are never added to routing tables or returned as lookup hops. A contact
 change is re-signed immediately and local publications are reannounced five
 seconds later so provider indexes hold the new contact. Private and unverified
-contacts use a one-hour lease; public contacts use one day. A helper accepts at
+contacts use a one-hour lease; public contacts use one day. A relay accepts at
+most three dial-back requests per requester each minute; a helper accepts at
 most ten delegations per relay and four dial-backs per target address each
-minute.
+minute, and sends at most five probe rounds per delegation.
 
 ## Custom routing
 
@@ -603,8 +606,12 @@ are allocation regressions rather than throughput or cross-runtime claims.
 - Applications must authenticate keys and publisher fingerprints out of band,
   configure bootstrap endpoints only from trusted sources, and persist identity
   seeds and revisions securely. A Hello request is signed but not encrypted.
-- Reachability evidence relies on independent relays and helpers; colluding relays
-  can make a node look private, which reduces efficiency but not integrity.
+- Reachability evidence relies on independent relays and helpers. A single relay
+  cannot set the external address or get a foreign address advertised as
+  Verified; relays colluding across two networks can, and colluding relays can
+  make a node look private. Both affect reachability, never content integrity.
+- Bootstrap endpoints, Hello and Ping admit any identity, so the routing table is
+  open to Sybil identities; lookups and provider claims remain hints.
 - Freshness beyond a lease is the application's responsibility; pin a complete-file
   hash when content must never change.
 

@@ -229,7 +229,8 @@ observed ports for that address on one transport set the endpoint-dependent
 mapping bit. A change of a confirmed external address starts a new epoch, which
 discards that family's Verified endpoint and all recorded dial-back failures.
 
-Rendezvous action 2 asks the relay for a dial-back:
+Rendezvous action 2 asks the relay for a dial-back; a relay accepts at most three
+such requests per requester per minute:
 `byte(2), integer(portCount 0..2), integer(port) × portCount`. The candidate
 ports are the observed source port followed by the requested ports, deduplicated,
 at most three. The dial-back address is always the observed source address. The
@@ -250,12 +251,16 @@ distant expiries, link-local targets and loopback/private targets outside the
 scopes of its own listeners, and allows each relay ten delegations and each
 target address four dial-backs per minute. It answers immediately and then sends
 Probe requests, sealed to the requester's contact, from its own address to each
-candidate port until one is accepted or the expiry passes. TCP probes open new
+candidate port until one is accepted, at most five rounds and never longer than its
+own traversal budget, because a relay can name any target. TCP probes open new
 connections; UDP probes use the ordinary cookie exchange.
 
 The requester accepts a Probe only for a pending nonce whose helper identity,
 transport and port index match and whose expiry has not passed; the probed port
-becomes a Verified endpoint at the observed address, making the contact Public.
+becomes a Verified endpoint at the observed address. Because the relay chooses both
+the reported address and the helper, a Verified endpoint is advertised, making the
+contact Public, only while its address equals the external address confirmed by
+relays in two distinct networks.
 A dial-back that times out records a failure for the relay's network. Without a
 Verified or Configured endpoint, failures from two distinct relay networks make
 the contact Private when at least one public relay with a live registration can
