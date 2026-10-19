@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <RootNamespace>MajDHTNetwork</RootNamespace>
+    <AssemblyName>MajDHTNetwork</AssemblyName>
+    <Version>0.1.0</Version>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <!-- Keep the sibling test project (`src/MajDHTNetwork.Tests`) out of this project's implicit
+         None/Content globs, so it does not show up as part of the library project tree. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);src/MajDHTNetwork.Tests/**</DefaultItemExcludes>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <Deterministic>true</Deterministic>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <PackageId>MajDHTNetwork</PackageId>
+    <Authors>MajdataPlay contributors</Authors>
+    <Description>An authenticated DHT file distribution library with verified blocks, TCP/UDP NAT traversal, relay-assisted rendezvous and end-to-end encrypted relays.</Description>
+    <PackageTags>dht;p2p;file-distribution;encryption;netstandard</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
+    <RepositoryType>git</RepositoryType>
+    <RepositoryUrl>https://github.com/LingFeng-bbben/MajdataPlay</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/LingFeng-bbben/MajdataPlay</PackageProjectUrl>
+    <PackageOutputPath>$(MSBuildThisFileDirectory)artifacts/nuget</PackageOutputPath>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <DebugType>portable</DebugType>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="src/MajDHTNetwork/**/*.cs" />
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.7.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.13" />
+    <InternalsVisibleTo Include="MajDHTNetwork.Tests" />
+    <None Update="LICENSE" Pack="true" PackagePath="/" />
+    <None Update="README.md" Pack="true" PackagePath="/" />
+    <None Update="PROTOCOL.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+</Project>
