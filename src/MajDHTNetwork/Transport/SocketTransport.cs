@@ -532,13 +532,14 @@ namespace MajDHTNetwork.Transport
         /// <param name="endpoint">The exact pinned remote endpoint.</param>
         /// <param name="packet">The sealed request.</param>
         /// <param name="cancellationToken">Cancels queueing and exchange.</param>
+        /// <param name="counter">An optional counter of transmissions and unanswered transmissions for packet-loss statistics.</param>
         /// <returns>The response; the caller must authenticate its sender and request identifier.</returns>
         /// <exception cref="IOException">The packet, endpoint or transport is invalid, or no response arrives.</exception>
         /// <exception cref="OperationCanceledException">The exchange or transport was cancelled.</exception>
         internal Task<ReadOnlyMemory<byte>> ExchangeAtAsync(DHTTransport transport, IPEndPoint endpoint,
-            ReadOnlyMemory<byte> packet, CancellationToken cancellationToken)
+            ReadOnlyMemory<byte> packet, CancellationToken cancellationToken, TransmissionCounter? counter = null)
         {
-            return StartExchange(transport, endpoint, packet, cancellationToken, false);
+            return StartExchange(transport, endpoint, packet, cancellationToken, false, counter);
         }
 
         /// <summary>Retries direct punching within one request budget and retains a successful TCP session.</summary>
@@ -552,7 +553,7 @@ namespace MajDHTNetwork.Transport
         internal Task<ReadOnlyMemory<byte>> PunchAsync(DHTTransport transport, IPEndPoint endpoint,
             ReadOnlyMemory<byte> packet, CancellationToken cancellationToken)
         {
-            return StartExchange(transport, endpoint, packet, cancellationToken, true);
+            return StartExchange(transport, endpoint, packet, cancellationToken, true, null);
         }
 
         /// <summary>Registers outgoing work before shutdown can start draining it.</summary>
@@ -561,15 +562,16 @@ namespace MajDHTNetwork.Transport
         /// <param name="packet">The immutable request for the lifetime of the task.</param>
         /// <param name="cancellationToken">The caller's cancellation.</param>
         /// <param name="punch">Whether a listener and a single short retry budget are required.</param>
+        /// <param name="counter">An optional transmission counter; punching is never counted.</param>
         /// <returns>The tracked exchange task.</returns>
         /// <exception cref="OperationCanceledException">The transport has stopped.</exception>
         private Task<ReadOnlyMemory<byte>> StartExchange(DHTTransport transport, IPEndPoint endpoint,
-            ReadOnlyMemory<byte> packet, CancellationToken cancellationToken, bool punch)
+            ReadOnlyMemory<byte> packet, CancellationToken cancellationToken, bool punch, TransmissionCounter? counter)
         {
             lock (_lifecycleSync)
             {
                 _shutdownToken.ThrowIfCancellationRequested();
-                var task = ExchangeCoreAsync(transport, CopyEndpoint(endpoint), packet, cancellationToken, punch);
+                var task = ExchangeCoreAsync(transport, CopyEndpoint(endpoint), packet, cancellationToken, punch, counter);
                 Track(task, false);
                 return task;
             }
@@ -581,11 +583,12 @@ namespace MajDHTNetwork.Transport
         /// <param name="packet">The immutable encrypted request.</param>
         /// <param name="cancellationToken">The caller's cancellation.</param>
         /// <param name="punch">Whether to require a reusable local listener.</param>
+        /// <param name="counter">An optional transmission counter.</param>
         /// <returns>The opaque response.</returns>
         /// <exception cref="IOException">Validation, connection or response retrieval fails.</exception>
         /// <exception cref="OperationCanceledException">The caller, budget or transport was cancelled.</exception>
         private async Task<ReadOnlyMemory<byte>> ExchangeCoreAsync(DHTTransport transport,
-            IPEndPoint endpoint, ReadOnlyMemory<byte> packet, CancellationToken cancellationToken, bool punch)
+            IPEndPoint endpoint, ReadOnlyMemory<byte> packet, CancellationToken cancellationToken, bool punch, TransmissionCounter? counter)
         {
             if (packet.Length == 0 || packet.Length > Wire.MaxPacket || endpoint.Port == 0
                 || (transport != DHTTransport.Tcp && transport != DHTTransport.Udp))
@@ -611,7 +614,7 @@ namespace MajDHTNetwork.Transport
                         throw new IOException("UDP punching requires an active UDP listener of the destination address family.");
                     }
                     EnsureUdpSocket(endpoint.AddressFamily);
-                    return await ExchangeUdpAsync(endpoint, packet, lifetime.Token, punch).ConfigureAwait(false);
+                    return await ExchangeUdpAsync(endpoint, packet, lifetime.Token, punch, counter).ConfigureAwait(false);
                 }
                 if (punch && (!_tcpRunning || TcpPortFor(endpoint.AddressFamily) == 0))
                 {
@@ -623,12 +626,15 @@ namespace MajDHTNetwork.Transport
                     try
                     {
                         var session = GetTcpSession(endpoint, punch ? s_punchInterval : _options.RequestTimeout);
-                        return await session.ExchangeAsync(packet, lifetime.Token).ConfigureAwait(false);
+                        var response = await session.ExchangeAsync(packet, lifetime.Token).ConfigureAwait(false);
+                        counter?.Delivered();
+                        return response;
                     }
                     catch (Exception exception) when (IsTransportFailure(exception))
                     {
                         cancellationToken.ThrowIfCancellationRequested();
                         _shutdownToken.ThrowIfCancellationRequested();
+                        counter?.Dropped();
                         lifetime.Token.ThrowIfCancellationRequested();
                         if (!punch)
                         {
@@ -656,11 +662,12 @@ namespace MajDHTNetwork.Transport
         /// <param name="packet">The identical sealed request for every retransmission.</param>
         /// <param name="cancellationToken">The overall exchange lifetime.</param>
         /// <param name="punch">Whether retries use short intervals within one parent budget.</param>
+        /// <param name="counter">An optional counter receiving one entry per completed attempt.</param>
         /// <returns>The correlated sealed response from the pinned endpoint.</returns>
         /// <exception cref="IOException">The pending entry conflicts or all retries expire.</exception>
         /// <exception cref="OperationCanceledException">The overall lifetime is cancelled.</exception>
         private async Task<ReadOnlyMemory<byte>> ExchangeUdpAsync(IPEndPoint endpoint, ReadOnlyMemory<byte> packet,
-            CancellationToken cancellationToken, bool punch)
+            CancellationToken cancellationToken, bool punch, TransmissionCounter? counter)
         {
             var digest = Crypto.Hash(packet.Span);
             var key = new UdpExchangeKey(endpoint, digest);
@@ -693,11 +700,15 @@ namespace MajDHTNetwork.Transport
                         }
                         pending.MarkRequestSent();
                         await SendUdpAsync(request.Memory, endpoint, timeout.Token).ConfigureAwait(false);
-                        return await AwaitCancellableAsync(pending.Response.Task, timeout.Token).ConfigureAwait(false);
+                        var response = await AwaitCancellableAsync(pending.Response.Task, timeout.Token).ConfigureAwait(false);
+                        counter?.Delivered();
+                        return response;
                     }
                     catch (Exception exception) when (IsTransportFailure(exception))
                     {
                         cancellationToken.ThrowIfCancellationRequested();
+                        // A lost hello, challenge, request or response all leave this attempt unanswered.
+                        counter?.Dropped();
                     }
                 }
                 throw new IOException("UDP retry budget exhausted.");

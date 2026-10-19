@@ -61,7 +61,7 @@ namespace MajDHTNetwork
             lock (_gate)
             {
                 return new DHTRouteContext(_options.PreferredTransport, _options.EnableNatTraversal, _externalAddresses.Values,
-                    _natRelays.Keys, _options.BucketSize);
+                    _natRelays.Keys, _options.BucketSize, GetPeerStatistics);
             }
         }
 

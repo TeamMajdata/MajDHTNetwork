@@ -7,6 +7,7 @@ using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 using MajDHTNetwork.Protocol;
+using MajDHTNetwork.Transport;
 
 #nullable enable
 
@@ -112,9 +113,10 @@ namespace MajDHTNetwork
             {
                 var transport = attempt == 0 ? _options.PreferredTransport : OtherTransport(_options.PreferredTransport);
                 var request = new Packet(LocalPeer, Crypto.Random(16), (byte)Operation.Hello, ReadOnlyMemory<byte>.Empty);
+                var counter = new TransmissionCounter();
                 try
                 {
-                    var encoded = await _transport.ExchangeAtAsync(transport, endpoint, request.SealHello(_identity), cancellationToken)
+                    var encoded = await _transport.ExchangeAtAsync(transport, endpoint, request.SealHello(_identity), cancellationToken, counter)
                         .ConfigureAwait(false);
                     var response = Packet.Open(_identity, encoded);
                     if (response.Sender.NodeId == NodeId || response.Kind != (request.Kind | 128)
@@ -127,6 +129,8 @@ namespace MajDHTNetwork
                     reader.End();
                     ObservePeer(response.Sender);
                     RecordObservation(response.Sender, endpoint.Address, transport, observed);
+                    // The responder is unknown until it answers, so only answered Hello exchanges enter its statistics.
+                    RecordTransmissions(response.Sender.NodeId, transport, endpoint, counter);
                     return response.Sender;
                 }
                 catch (Exception exception) when (IsPeerFailure(exception) || exception is OperationCanceledException)

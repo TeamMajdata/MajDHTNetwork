@@ -154,6 +154,7 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | `ReadBlockAsync(DHTRecord, DHTPeer, int index, DHTPeer? relay, CancellationToken)` | 经过校验的单块读取，用于应用自行管理续传或指定中继。 |
 | `RegisterRelayAsync(DHTPeer relay, CancellationToken)` | 向中继登记本节点被观测到的端点。 |
 | `TryPunchAsync(DHTPeer peer, DHTPeer relay, DHTTransport, CancellationToken)` | 通过中继协调尝试 TCP 或 UDP 直连。 |
+| `PeerStatistics`、`GetPeerStatistics(string nodeId)` | 节点生命周期内按节点与路径收集的丢包统计。 |
 
 ### `DHTNodeOptions` 默认值
 
@@ -172,6 +173,8 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | `MaxRecords` | `1024` |
 | `MaxFileSize` | `1 GiB` |
 | `BlockSize` | `16384`（允许 1 KiB–32 KiB） |
+| `MaxConcurrentBlockRequests` | `8`（允许 1–64） |
+| `MaxBlockRequestsPerPeer` | `2`（允许 1–16） |
 | `RequestTimeout` | `5 秒` |
 | `UdpAttempts` | `3` |
 | `RecordLifetime` | `24 小时`（允许 1 秒–7 天） |
@@ -202,7 +205,9 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | `KademliaDHTRoutingTable` | 默认路由表：256 个 XOR 距离桶，每桶 `BucketSize` 个联系人 |
 | `IDHTRouteSelector` | `SelectDirectRoutes(DHTPeer, DHTRouteContext)`、`SelectRelayRoutes(DHTPeer, IReadOnlyList<DHTPeer> knownRelays, DHTRouteContext)` |
 | `DefaultDHTRouteSelector` | 默认路径选择，见[自定义选路](#自定义选路) |
-| `DHTRouteContext` | `PreferredTransport`、`AlternateTransport`、`NatTraversalEnabled`、`ExternalAddresses`、`MaxRelayAttempts`、`IsRegisteredWith(string)`、`SharesExternalAddress(DHTPeer)` |
+| `DHTRouteContext` | `PreferredTransport`、`AlternateTransport`、`NatTraversalEnabled`、`ExternalAddresses`、`MaxRelayAttempts`、`IsRegisteredWith(string)`、`SharesExternalAddress(DHTPeer)`、`GetPeerStatistics(string)`、`PacketLossRate(string)`、`PacketLossRate(string, DHTDirectRoute)` |
+| `DHTPeerStatistics` | `NodeId`、`SentPackets`、`LostPackets`、`PacketLossRate`、`LastUpdated`、`Routes`、`GetRoute(IPEndPoint, DHTTransport)` |
+| `DHTRouteStatistics` | `Endpoint`、`Transport`、`SentPackets`、`LostPackets`、`PacketLossRate`、`LastUpdated` |
 | `DHTDirectRoute`、`DHTRelayRoute` | `Endpoint`、`Transport`；`Relay`、`AttemptPunch` |
 | `DHTCapabilities` | `Download = 1`、`Provide = 2`、`Relay = 4` |
 | `DHTTransport` | `Tcp`、`Udp` |
@@ -266,8 +271,22 @@ var block = await downloader.ReadBlockAsync(record, provider.LocalPeer, 0,
     relay: relayPeer, cancellationToken: cancellationToken);
 ```
 
-提供者声明只是可用性提示；单独一份签名联系人并不能证明其确实持有数据。下载会在不同数据块
-之间轮换初始提供者，并在遇到无效或不可用的块之后改试其他提供者。
+提供者声明只是可用性提示；单独一份签名联系人并不能证明其确实持有数据。一次下载会同时向多个
+提供者请求数据块：总共最多有 `MaxConcurrentBlockRequests` 个数据块在途，每个提供者最多
+`MaxBlockRequestsPerPeer` 个。每个数据块交给有空闲名额且排名最佳的提供者：本节点优先，其次是
+测得丢包率更低、在途请求更少、失败次数更少的提供者。无效或不可用的数据块会回到队列，改由其他
+提供者获取；只有所有提供者都无法提供某个数据块时，下载才会失败。经过校验的数据块按顺序写入
+目标流、摘要与存储；重排窗口为 `MaxConcurrentBlockRequests` 的两倍，用于限制提前到达的数据块
+占用的内存。TCP 的一条连接同一时间只承载一个请求，因此并行主要来自同时使用多个提供者。
+
+### 节点统计
+
+节点在整个生命周期内，按节点以及按路径（端点与传输）记录发出的请求传输次数，以及在单次尝试
+超时前没有收到响应的次数。每次 UDP 重传和每次 TCP 尝试都会计入；打洞与回拨探测不计入；经中继
+转发的请求计入该中继。`GetPeerStatistics(nodeId)` 与 `PeerStatistics` 返回不可变的
+`DHTPeerStatistics` 快照，其中 `PacketLossRate` 为 `LostPackets / SentPackets`，按路径的明细见
+`Routes` 与 `GetRoute(endpoint, transport)`。最多保留 4,096 个节点、每个节点 16 条路径，超出时
+淘汰最久未更新的条目。选路与下载调度都会使用这些丢包率。
 
 ## 引导与发现
 
@@ -366,10 +385,12 @@ await using var node = new MajDHTNode(options, identity, store,
   首选传输、是否启用 NAT 穿透、已确认的外部地址，以及本节点已登记的中继。同一个路径选择实现
   可以在多个节点间共享。
 
-`DefaultDHTRouteSelector` 先尝试已配置或已验证的端点，再尝试未验证端点，最后尝试本地端点，
-每个端点都先用首选传输；只有双方外部地址相同时，才会使用私有目标的本地端点。中继路径先列出
-目标的中继提示（只对本节点已登记的提示中继尝试打洞），再列出最多 `BucketSize` 个路由中的中继；
-目标映射依赖目的端点时从不打洞。
+`DefaultDHTRouteSelector` 先尝试已配置或已验证的端点，再尝试未验证端点，最后尝试本地端点；
+只有双方外部地址相同时，才会使用私有目标的本地端点。中继路径先列出目标的中继提示（只对本节点
+已登记的提示中继尝试打洞），再列出最多 `BucketSize` 个路由中的中继；目标映射依赖目的端点时从不
+打洞。在上述每一层内，测得丢包率更低的路径与中继排在前面；未尝试过的路径按无丢包计算，丢包率
+相同时保持首选传输与路由顺序在前。自定义的路径选择可以通过 `DHTRouteContext.GetPeerStatistics`
+与 `DHTRouteContext.PacketLossRate` 读取同样的测量结果。
 
 两种实现都必须线程安全、快速返回，并且不得进行网络 I/O。路径只是尝试，而非信任决策：无论经由
 哪条路径，每个响应都会按目标身份进行认证。经打洞或会合登记得到的已认证路径总是先于所选的直连
@@ -479,7 +500,8 @@ dotnet test src/MajDHTNetwork.Tests/MajDHTNetwork.Tests.csproj --configuration R
 
 覆盖范围包括：协议测试向量与畸形输入、已认证信封与身份冒充、Merkle 几何、三节点发现与下载、
 中继回退、双传输、IPv6 与双栈传输、端点引导、UDP 丢包/重放、NAT 登记与打洞、外部地址投票、
-回拨探测与经中继提示访问的私有节点、配额与生命周期限制，以及热身分配预算。
+回拨探测与经中继提示访问的私有节点、丢包统计与按丢包率选路、多提供者并发下载、配额与生命周期
+限制，以及热身分配预算。
 
 .NET Standard 只是 API 目标，并不代表已经成功集成 Unity、Mono、IL2CPP、Player、移动端、
 NAT、WAN 或硬件。上述宿主与网络条件在部署前需要各自进行验证。

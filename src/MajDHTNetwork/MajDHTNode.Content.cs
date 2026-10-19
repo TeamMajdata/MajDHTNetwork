@@ -177,7 +177,10 @@ namespace MajDHTNetwork
             return await DownloadAsync(record, destination, expectedFileHash, cancellationToken).ConfigureAwait(false);
         }
 
-        /// <summary>Downloads verified blocks from discovered providers and checks the complete SHA-256 digest.</summary>
+        /// <summary>
+        /// Downloads verified blocks concurrently from the discovered providers, preferring providers with lower packet loss,
+        /// and checks the complete SHA-256 digest.
+        /// </summary>
         /// <param name="record">The verified, unexpired publisher manifest.</param>
         /// <param name="destination">A writable stream; use application-managed staging when atomic publication is required.</param>
         /// <param name="expectedFileHash">An optional independent complete-file hash pin.</param>
@@ -221,34 +224,9 @@ namespace MajDHTNetwork
             }
             using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
             using var leaves = new Wire();
-            for (var index = 0; index < record.BlockCount; index++)
+            using (var download = new BlockDownload(this, record, providers, destination, digest, leaves, cancellation.Token))
             {
-                ReadOnlyMemory<byte>? bytes = null;
-                Exception? last = null;
-                for (var candidate = 0; candidate < providers.Count; candidate++)
-                {
-                    var provider = providers[(index + candidate) % providers.Count];
-                    try
-                    {
-                        bytes = await ReadBlockAsync(record, provider, index, cancellationToken: cancellation.Token).ConfigureAwait(false);
-                        break;
-                    }
-                    catch (Exception exception) when (IsPeerFailure(exception))
-                    {
-                        cancellation.Token.ThrowIfCancellationRequested();
-                        last = exception;
-                        Log(LogLevel.Warning, "Provider block rejected: ", exception);
-                    }
-                }
-                if (!bytes.HasValue)
-                {
-                    throw new IOException("No provider returned an authenticated block.", last);
-                }
-                var block = bytes.Value;
-                digest.AppendData(block.Span);
-                var leafId = MerkleTree.AppendLeaf(leaves, block.Span);
-                await _store.PutAsync(leafId, block, cancellation.Token).ConfigureAwait(false);
-                await destination.WriteAsync(block, cancellation.Token).ConfigureAwait(false);
+                await download.RunAsync().ConfigureAwait(false);
             }
             if (Crypto.Hex(digest.GetHashAndReset()) != record.FileHash)
             {

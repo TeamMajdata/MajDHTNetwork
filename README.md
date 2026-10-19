@@ -163,6 +163,7 @@ node ID and publisher namespace must survive restarts, and implement
 | `ReadBlockAsync(DHTRecord, DHTPeer, int index, DHTPeer? relay, CancellationToken)` | Verified single-block read for application-managed resume or a specific relay. |
 | `RegisterRelayAsync(DHTPeer relay, CancellationToken)` | Registers the node's observed endpoint with a relay. |
 | `TryPunchAsync(DHTPeer peer, DHTPeer relay, DHTTransport, CancellationToken)` | Attempts a direct TCP or UDP route through relay coordination. |
+| `PeerStatistics`, `GetPeerStatistics(string nodeId)` | Packet-loss statistics per peer and route collected during the node lifetime. |
 
 ### `DHTNodeOptions` defaults
 
@@ -181,6 +182,8 @@ node ID and publisher namespace must survive restarts, and implement
 | `MaxRecords` | `1024` |
 | `MaxFileSize` | `1 GiB` |
 | `BlockSize` | `16384` (1 KiB–32 KiB accepted) |
+| `MaxConcurrentBlockRequests` | `8` (1–64 accepted) |
+| `MaxBlockRequestsPerPeer` | `2` (1–16 accepted) |
 | `RequestTimeout` | `5 s` |
 | `UdpAttempts` | `3` |
 | `RecordLifetime` | `24 h` (1 s–7 days accepted) |
@@ -211,7 +214,9 @@ node ID and publisher namespace must survive restarts, and implement
 | `KademliaDHTRoutingTable` | Default routing table: 256 XOR buckets of `BucketSize` contacts |
 | `IDHTRouteSelector` | `SelectDirectRoutes(DHTPeer, DHTRouteContext)`, `SelectRelayRoutes(DHTPeer, IReadOnlyList<DHTPeer> knownRelays, DHTRouteContext)` |
 | `DefaultDHTRouteSelector` | Default route selection described in [Custom routing](#custom-routing) |
-| `DHTRouteContext` | `PreferredTransport`, `AlternateTransport`, `NatTraversalEnabled`, `ExternalAddresses`, `MaxRelayAttempts`, `IsRegisteredWith(string)`, `SharesExternalAddress(DHTPeer)` |
+| `DHTRouteContext` | `PreferredTransport`, `AlternateTransport`, `NatTraversalEnabled`, `ExternalAddresses`, `MaxRelayAttempts`, `IsRegisteredWith(string)`, `SharesExternalAddress(DHTPeer)`, `GetPeerStatistics(string)`, `PacketLossRate(string)`, `PacketLossRate(string, DHTDirectRoute)` |
+| `DHTPeerStatistics` | `NodeId`, `SentPackets`, `LostPackets`, `PacketLossRate`, `LastUpdated`, `Routes`, `GetRoute(IPEndPoint, DHTTransport)` |
+| `DHTRouteStatistics` | `Endpoint`, `Transport`, `SentPackets`, `LostPackets`, `PacketLossRate`, `LastUpdated` |
 | `DHTDirectRoute`, `DHTRelayRoute` | `Endpoint`, `Transport`; `Relay`, `AttemptPunch` |
 | `DHTCapabilities` | `Download = 1`, `Provide = 2`, `Relay = 4` |
 | `DHTTransport` | `Tcp`, `Udp` |
@@ -302,8 +307,30 @@ var block = await downloader.ReadBlockAsync(record, provider.LocalPeer, 0,
 ```
 
 Provider claims are availability hints; a signed contact alone does not prove
-possession. Downloads rotate the initial provider between blocks and retry
-another provider after invalid or unavailable blocks.
+possession. A download requests blocks from several providers at once: at most
+`MaxConcurrentBlockRequests` blocks are in flight in total and at most
+`MaxBlockRequestsPerPeer` per provider. Each block goes to the provider ranked
+best among those with a free slot: the local node first, then lower measured
+packet loss, fewer requests in flight and fewer failures. An invalid or
+unavailable block returns to the queue for another provider, and the download
+fails only after every provider failed that block. Verified blocks are written
+to the destination, the digest and the store in order, with a reorder window of
+twice `MaxConcurrentBlockRequests` blocks bounding the memory held for blocks
+that arrive early. Over TCP one connection carries one request at a time, so
+parallelism mainly comes from using several providers.
+
+### Peer statistics
+
+For its whole lifetime a node records, per peer and per route (endpoint and
+transport), how many request transmissions it sent and how many received no
+response before their attempt timeout. Every UDP retransmission and TCP attempt
+counts; hole-punching and dial-back probes do not, and requests forwarded
+through a relay count towards the relay. `GetPeerStatistics(nodeId)` and
+`PeerStatistics` return immutable `DHTPeerStatistics` snapshots whose
+`PacketLossRate` is `LostPackets / SentPackets`, with a per-route breakdown in
+`Routes` and `GetRoute(endpoint, transport)`. At most 4,096 peers and 16 routes
+per peer are retained, evicting the least recently updated entry. Route
+selection and download scheduling use these rates.
 
 ## Bootstrap and discovery
 
@@ -439,11 +466,15 @@ await using var node = new MajDHTNode(options, identity, store,
   registered with. A selector may be shared between nodes.
 
 `DefaultDHTRouteSelector` orders configured or verified endpoints, then
-unverified endpoints, then local endpoints, each with the preferred transport
-first; a private destination's local endpoints are only used behind the same
-external address. Relay routes list the destination's relay hints, punching only
-through hints this node is registered with, followed by at most `BucketSize`
-routed relays; destinations with an endpoint-dependent mapping are never punched.
+unverified endpoints, then local endpoints; a private destination's local
+endpoints are only used behind the same external address. Relay routes list the
+destination's relay hints, punching only through hints this node is registered
+with, followed by at most `BucketSize` routed relays; destinations with an
+endpoint-dependent mapping are never punched. Within each of these tiers, routes
+and relays with a lower measured packet loss come first; untried routes count as
+lossless, and equal rates keep the preferred transport and routing order first.
+Custom selectors read the same measurements through
+`DHTRouteContext.GetPeerStatistics` and `DHTRouteContext.PacketLossRate`.
 
 Both implementations must be thread-safe, return quickly and perform no network
 I/O. Routes are attempts, not trust decisions: every response is authenticated
@@ -592,7 +623,8 @@ Coverage includes protocol vectors and malformed input, authenticated envelopes
 and impersonation, Merkle geometry, three-node discovery and downloads, relay
 fallback, dual-transport, IPv6 and dual-stack transfers, endpoint bootstrap, UDP
 loss/replay, NAT registration and punching, external-address voting, dial-back
-and relay-hinted private nodes, quota and lifecycle limits, and warmed allocation
+and relay-hinted private nodes, packet-loss statistics and loss-ranked routes,
+concurrent multi-provider downloads, quota and lifecycle limits, and warmed allocation
 budgets.
 
 .NET Standard is an API target, not evidence of successful Unity, Mono, IL2CPP,

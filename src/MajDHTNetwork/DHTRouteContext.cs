@@ -11,6 +11,8 @@ namespace MajDHTNetwork
     {
         /// <summary>The relays this node holds a live rendezvous registration with.</summary>
         private readonly HashSet<string> _registeredRelays;
+        /// <summary>Looks up the node's lifetime statistics for a peer, or null when statistics are unavailable.</summary>
+        private readonly Func<string, DHTPeerStatistics?>? _statistics;
 
         /// <summary>Gets the transport the node prefers for outgoing requests.</summary>
         public DHTTransport PreferredTransport { get; }
@@ -27,9 +29,10 @@ namespace MajDHTNetwork
         /// <param name="externalAddresses">The confirmed external addresses; they are copied.</param>
         /// <param name="registeredRelays">The identifiers of relays with live registrations; they are copied.</param>
         /// <param name="maxRelayAttempts">The routed relay attempt budget.</param>
+        /// <param name="statistics">An optional lookup of per-peer statistics, normally <see cref="MajDHTNode.GetPeerStatistics"/>.</param>
         /// <exception cref="ArgumentException">The transport or budget is invalid, or a collection is null.</exception>
         public DHTRouteContext(DHTTransport preferredTransport, bool natTraversalEnabled, IEnumerable<IPAddress> externalAddresses,
-            IEnumerable<string> registeredRelays, int maxRelayAttempts)
+            IEnumerable<string> registeredRelays, int maxRelayAttempts, Func<string, DHTPeerStatistics?>? statistics = null)
         {
             if ((preferredTransport != DHTTransport.Tcp && preferredTransport != DHTTransport.Udp) || maxRelayAttempts < 0
                 || externalAddresses == null || registeredRelays == null)
@@ -46,6 +49,32 @@ namespace MajDHTNetwork
             ExternalAddresses = addresses;
             _registeredRelays = new HashSet<string>(registeredRelays, StringComparer.Ordinal);
             MaxRelayAttempts = maxRelayAttempts;
+            _statistics = statistics;
+        }
+
+        /// <summary>Gets the statistics the node collected for a peer during its lifetime.</summary>
+        /// <param name="nodeId">The peer's node identifier.</param>
+        /// <returns>The peer and per-route statistics, or null when the peer was never contacted directly.</returns>
+        public DHTPeerStatistics? GetPeerStatistics(string nodeId)
+        {
+            return nodeId == null || _statistics == null ? null : _statistics(nodeId);
+        }
+
+        /// <summary>Gets a peer's packet loss rate over all routes.</summary>
+        /// <param name="nodeId">The peer's node identifier.</param>
+        /// <returns>The loss rate from zero to one, or zero when the peer was never contacted directly.</returns>
+        public double PacketLossRate(string nodeId)
+        {
+            return GetPeerStatistics(nodeId)?.PacketLossRate ?? 0;
+        }
+
+        /// <summary>Gets the packet loss rate of one direct route to a peer.</summary>
+        /// <param name="nodeId">The peer's node identifier.</param>
+        /// <param name="route">The direct route.</param>
+        /// <returns>The loss rate from zero to one, or zero when the route was never used.</returns>
+        public double PacketLossRate(string nodeId, DHTDirectRoute route)
+        {
+            return route == null ? 0 : GetPeerStatistics(nodeId)?.GetRoute(route.NetworkEndpoint, route.Transport)?.PacketLossRate ?? 0;
         }
 
         /// <summary>Gets the transport tried after the preferred transport.</summary>

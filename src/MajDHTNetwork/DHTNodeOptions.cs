@@ -51,6 +51,10 @@ namespace MajDHTNetwork
         public long MaxFileSize { get; set; } = 1024L * 1024 * 1024;
         /// <summary>Gets or sets the block size for new publications, between 1 KiB and 32 KiB.</summary>
         public int BlockSize { get; set; } = 16384;
+        /// <summary>Gets or sets the maximum block requests one download keeps in flight across all providers, from 1 to 64.</summary>
+        public int MaxConcurrentBlockRequests { get; set; } = 8;
+        /// <summary>Gets or sets the maximum block requests one download keeps in flight to a single provider, from 1 to 16.</summary>
+        public int MaxBlockRequestsPerPeer { get; set; } = 2;
         /// <summary>Gets or sets the timeout for each transport attempt, including a relay response.</summary>
         public TimeSpan RequestTimeout { get; set; } = TimeSpan.FromSeconds(5);
         /// <summary>Gets or sets the total UDP transmissions per request, including the first transmission.</summary>
@@ -103,6 +107,8 @@ namespace MajDHTNetwork
                 || MaxConcurrentRequests < 1 || MaxConcurrentRequests > 1024
                 || MaxRecords < 1 || MaxRecords > 65536 || MaxFileSize < 0 || MaxFileSize > 1024L * 1024 * 1024
                 || BlockSize < 1024 || BlockSize > 32768 || UdpAttempts < 1 || UdpAttempts > 5
+                || MaxConcurrentBlockRequests < 1 || MaxConcurrentBlockRequests > 64
+                || MaxBlockRequestsPerPeer < 1 || MaxBlockRequestsPerPeer > 16
                 || RequestTimeout < TimeSpan.FromMilliseconds(50) || RequestTimeout > TimeSpan.FromMinutes(2)
                 || RecordLifetime < TimeSpan.FromSeconds(1) || RecordLifetime > TimeSpan.FromDays(7)
                 || MaintenanceInterval < TimeSpan.FromSeconds(1) || MaintenanceInterval > TimeSpan.FromHours(1)

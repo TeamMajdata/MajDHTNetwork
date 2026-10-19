@@ -259,7 +259,7 @@ namespace MajDHTNetwork
             }
             var endpoint = NatEndpoint(relay, transport) ?? throw new IOException("The relay has no endpoint in a listened address family.");
             var packet = new Packet(LocalPeer, Crypto.Random(16), (byte)Operation.Rendezvous, body);
-            var result = await _transport.ExchangeAtAsync(transport, endpoint, packet.Seal(_identity, relay), cancellationToken).ConfigureAwait(false);
+            var result = await ExchangeCountedAsync(relay, transport, endpoint, packet.Seal(_identity, relay), cancellationToken).ConfigureAwait(false);
             var response = AuthenticateResponse(result, relay, packet);
             ObservePeer(response.Sender);
             return (response.Sender, ReadResponseBody(response), endpoint);
@@ -637,7 +637,7 @@ namespace MajDHTNetwork
                 }
                 try
                 {
-                    return await _transport.ExchangeAtAsync(transport, route.Endpoint, envelope, cancellationToken).ConfigureAwait(false);
+                    return await ExchangeCountedAsync(peer, transport, route.Endpoint, envelope, cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception exception) when (IsPeerFailure(exception))
                 {
@@ -657,7 +657,7 @@ namespace MajDHTNetwork
             {
                 try
                 {
-                    return await _transport.ExchangeAtAsync(route.Transport, route.NetworkEndpoint, envelope, cancellationToken).ConfigureAwait(false);
+                    return await ExchangeCountedAsync(peer, route.Transport, route.NetworkEndpoint, envelope, cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception exception) when (IsPeerFailure(exception) || exception is OperationCanceledException
                     || exception is ObjectDisposedException)
