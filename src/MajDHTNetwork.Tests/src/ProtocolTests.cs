@@ -1,6 +1,7 @@
 #nullable enable
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Security.Cryptography;
@@ -26,18 +27,19 @@ namespace MajDHTNetwork.Tests
             Assert.True(identity.NodeId == restored.NodeId, "Exported secrets must be defensive copies.");
         }
 
-        /// <summary>Round-trips signed contacts and rejects modified invitation signatures.</summary>
+        /// <summary>Round-trips signed contacts and rejects modified contact signatures.</summary>
         [Fact]
-        public void SignedInvitationsRejectModifiedSignatures()
+        public void SignedContactsRejectModifiedSignatures()
         {
             var identity = new DHTIdentity();
-            var remote = new DHTIdentity();
             var sender = DHTPeer.Create(identity, IPAddress.Loopback, 22001, 22002, DHTCapabilities.Download);
-            var recipient = DHTPeer.Create(remote, IPAddress.Loopback, 22003, 22004, DHTCapabilities.Provide);
-            Assert.True(DHTPeer.ParseInvitation(sender.ToInvitation()).NodeId == identity.NodeId, "Public invitation must round trip.");
-            var inviteBytes = sender.Encoded.ToArray();
-            inviteBytes[inviteBytes.Length - 1] ^= 1;
-            Assert.ThrowsAny<InvalidDataException>(() => new DHTPeer(inviteBytes));
+            var parsed = new DHTPeer(sender.Encoded.ToArray());
+            Assert.True(parsed.NodeId == identity.NodeId && parsed.Sequence == sender.Sequence, "A signed contact must round trip.");
+            Assert.Equal(22001, parsed.Endpoints[0].TcpPort);
+            Assert.Equal(22002, parsed.Endpoints[0].UdpPort);
+            var contactBytes = sender.Encoded.ToArray();
+            contactBytes[contactBytes.Length - 1] ^= 1;
+            Assert.ThrowsAny<InvalidDataException>(() => new DHTPeer(contactBytes));
         }
 
         /// <summary>Rejects substituted recipients, forged senders, modified ciphertext and nested relays.</summary>
@@ -75,7 +77,7 @@ namespace MajDHTNetwork.Tests
             badLength.PutLong(long.MaxValue);
             using var reader = new Wire(badLength.ToArray());
             Assert.ThrowsAny<InvalidDataException>(() => reader.Bytes(64));
-            Assert.ThrowsAny<ArgumentException>(() => new DHTNodeOptions { ListenAddress = IPAddress.Any }.Snapshot());
+            Assert.ThrowsAny<ArgumentException>(() => new DHTNodeOptions { ListenAddresses = new List<IPAddress> { IPAddress.Any, IPAddress.IPv6Any, IPAddress.Loopback } }.Snapshot());
             Assert.ThrowsAny<ArgumentException>(() => new DHTKey(identity.NodeId, "bad\nname"));
         }
     }

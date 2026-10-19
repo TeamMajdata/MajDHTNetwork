@@ -65,8 +65,8 @@ namespace MajDHTNetwork.Tests
         internal async Task<ReadOnlyMemory<byte>> ExchangeAsync(DHTPeer receiver, Operation operation, ReadOnlyMemory<byte> body, CancellationToken token)
         {
             var packet = new Packet(Peer, Crypto.Random(16), (byte)operation, body);
-            var endpoint = new IPEndPoint(IPAddress.Loopback, _kind == DHTTransport.Tcp ? receiver.TcpPort : receiver.UdpPort);
-            var encoded = await _transport.ExchangeAtAsync(receiver, _kind, endpoint, packet.Seal(Identity, receiver), token);
+            var endpoint = new IPEndPoint(IPAddress.Loopback, _kind == DHTTransport.Tcp ? receiver.TcpPort() : receiver.UdpPort());
+            var encoded = await _transport.ExchangeAtAsync(_kind, endpoint, packet.Seal(Identity, receiver), token);
             var response = Packet.Open(Identity, encoded);
             if (response.Sender.NodeId != receiver.NodeId || !response.RequestId.Span.SequenceEqual(packet.RequestId.Span)
                 || response.Kind != (byte)(packet.Kind | 128))

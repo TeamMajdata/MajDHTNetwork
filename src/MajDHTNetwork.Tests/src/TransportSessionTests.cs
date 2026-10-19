@@ -51,7 +51,7 @@ namespace MajDHTNetwork.Tests
             local = DHTPeer.Create(localIdentity, IPAddress.Loopback, transport.TcpPort, 0, DHTCapabilities.Download);
             transport.Run();
             var punch = Request(local, Operation.Punch, 0);
-            var punching = transport.PunchAsync(remote, DHTTransport.Tcp, endpoint, punch.Seal(localIdentity, remote), token);
+            var punching = transport.PunchAsync(DHTTransport.Tcp, endpoint, punch.Seal(localIdentity, remote), token);
             using var connection = await listener.AcceptTcpClientAsync(token);
             Assert.Equal(transport.TcpPort, Assert.IsType<IPEndPoint>(connection.Client.RemoteEndPoint).Port);
 
@@ -76,7 +76,7 @@ namespace MajDHTNetwork.Tests
             {
                 var localRequest = Request(local, Operation.Ping, (byte)(round + 2));
                 var remoteRequest = Request(remote, Operation.Ping, (byte)(round + 32));
-                var outgoing = transport.ExchangeAtAsync(remote, DHTTransport.Tcp, endpoint,
+                var outgoing = transport.ExchangeAtAsync(DHTTransport.Tcp, endpoint,
                     localRequest.Seal(localIdentity, remote), token);
                 AssertRequest(remoteIdentity, local, localRequest, await ReadTcpFrameAsync(stream, token));
                 await WriteTcpFrameAsync(stream, remoteRequest.Seal(remoteIdentity, local), token);
@@ -106,8 +106,8 @@ namespace MajDHTNetwork.Tests
             var second = Request(local, Operation.Ping, 22);
             var firstBytes = first.Seal(localIdentity, remote);
             var secondBytes = second.Seal(localIdentity, remote);
-            var firstExchange = transport.ExchangeAtAsync(remote, DHTTransport.Udp, endpoint, firstBytes, token);
-            var secondExchange = transport.ExchangeAtAsync(remote, DHTTransport.Udp, endpoint, secondBytes, token);
+            var firstExchange = transport.ExchangeAtAsync(DHTTransport.Udp, endpoint, firstBytes, token);
+            var secondExchange = transport.ExchangeAtAsync(DHTTransport.Udp, endpoint, secondBytes, token);
             var cookies = new UdpCookies();
             var firstReceived = await ReceiveUdpRequestAsync(server, cookies, transport.UdpPort, token);
             var secondReceived = await ReceiveUdpRequestAsync(server, cookies, transport.UdpPort, token);
@@ -149,7 +149,7 @@ namespace MajDHTNetwork.Tests
             var local = DHTPeer.Create(localIdentity, IPAddress.Loopback, 0, transport.UdpPort, DHTCapabilities.Download);
             var request = Request(local, Operation.Ping, 33);
             var requestBytes = request.Seal(localIdentity, remote);
-            var exchange = transport.ExchangeAtAsync(remote, DHTTransport.Udp, endpoint, requestBytes, token);
+            var exchange = transport.ExchangeAtAsync(DHTTransport.Udp, endpoint, requestBytes, token);
             var received = await ReceiveUdpRequestAsync(server, new UdpCookies(), transport.UdpPort, token);
             AssertRequest(remoteIdentity, local, request, received.Packet);
             var digest = Crypto.Hash(requestBytes);

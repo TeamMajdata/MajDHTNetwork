@@ -28,7 +28,7 @@ namespace MajDHTNetwork.Transport
         /// <param name="endpoint">The exact remote endpoint.</param>
         /// <param name="connectTimeout">The maximum lifetime of a connecting socket.</param>
         /// <returns>A cached or newly connecting session.</returns>
-        /// <exception cref="IOException">The bounded cache is busy or address families do not match.</exception>
+        /// <exception cref="IOException">The bounded cache is busy.</exception>
         /// <exception cref="SocketException">The reusable source endpoint cannot bind.</exception>
         /// <exception cref="OperationCanceledException">The transport has stopped.</exception>
         private TcpSession GetTcpSession(IPEndPoint endpoint, TimeSpan connectTimeout)
@@ -47,14 +47,11 @@ namespace MajDHTNetwork.Transport
                 var client = new TcpClient(endpoint.AddressFamily);
                 try
                 {
-                    if (_tcpEndpoint != null)
+                    if (_tcpEndpoints.TryGetValue(endpoint.AddressFamily, out var local))
                     {
-                        if (_tcpEndpoint.AddressFamily != endpoint.AddressFamily)
-                        {
-                            throw new IOException("The TCP listener and destination address families differ.");
-                        }
+                        DisableDualMode(client.Client);
                         ConfigureReusableTcp(client.Client);
-                        client.Client.Bind(_tcpEndpoint);
+                        client.Client.Bind(local);
                     }
                     return AddSession(client, endpoint, false, connectTimeout);
                 }

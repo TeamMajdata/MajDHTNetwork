@@ -44,7 +44,7 @@ namespace MajDHTNetwork
             {
                 if (_natRelays.TryGetValue(relay.NodeId, out var existing))
                 {
-                    if (relay.ExpiresAt >= existing.Peer.ExpiresAt)
+                    if (relay.Sequence >= existing.Peer.Sequence)
                     {
                         existing.Peer = relay;
                     }
@@ -93,10 +93,13 @@ namespace MajDHTNetwork
                     throw new IOException("The rendezvous relay limit was reached.");
                 }
                 var registration = new NatRelay(relay);
+                registration.LastSuccess = DateTimeOffset.UtcNow;
                 _natRelays.Add(relay.NodeId, registration);
                 registration.Work = PollNatRelayAsync(registration);
+                RefreshLocalPeerLocked();
             }
             Log(LogLevel.Information, "Rendezvous registration established.");
+            TriggerReachabilityCheck();
         }
 
         /// <summary>Asks a relay to introduce two registered peers, probes simultaneously, and retains an authenticated direct route.</summary>
@@ -120,7 +123,7 @@ namespace MajDHTNetwork
                 throw new ArgumentException("A TCP or UDP transport is required.", nameof(transport));
             }
             using var cancellation = OperationCancellation(cancellationToken);
-            if (!_options.EnableNatTraversal || !SupportsNatTransport(peer, transport) || !SupportsNatTransport(relay, transport))
+            if (!_options.EnableNatTraversal || !MaySupportTransport(peer, transport) || !SupportsNatTransport(relay, transport))
             {
                 return false;
             }
@@ -177,15 +180,59 @@ namespace MajDHTNetwork
             }
         }
 
-        /// <summary>Checks whether both ends have a listener for a transport.</summary>
-        /// <param name="peer">The remote contact.</param>
+        /// <summary>Checks whether a relay advertises an endpoint that a local listener of the same family can register from.</summary>
+        /// <param name="peer">The remote relay contact.</param>
         /// <param name="transport">The transport to check.</param>
-        /// <returns>Whether both endpoints support the transport.</returns>
+        /// <returns>Whether both ends support the transport in a common address family.</returns>
         private bool SupportsNatTransport(DHTPeer peer, DHTTransport transport)
         {
-            return transport == DHTTransport.Tcp
-                ? _transport.TcpPort != 0 && peer.TcpPort != 0
-                : _transport.UdpPort != 0 && peer.UdpPort != 0;
+            return NatEndpoint(peer, transport) != null;
+        }
+
+        /// <summary>Selects a relay endpoint whose address family has a local listener for the transport.</summary>
+        /// <param name="peer">The remote relay contact.</param>
+        /// <param name="transport">The transport to use.</param>
+        /// <returns>The remote endpoint, or null when no common address family exists.</returns>
+        private IPEndPoint? NatEndpoint(DHTPeer peer, DHTTransport transport)
+        {
+            foreach (var endpoint in peer.Endpoints)
+            {
+                var port = endpoint.Port(transport);
+                if (port != 0 && _transport.PortFor(transport, endpoint.NetworkAddress.AddressFamily) != 0)
+                {
+                    return new IPEndPoint(endpoint.NetworkAddress, port);
+                }
+            }
+            return null;
+        }
+
+        /// <summary>Checks whether a punch target may listen on a transport; private contacts omit endpoints, so the relay decides.</summary>
+        /// <param name="peer">The punch target.</param>
+        /// <param name="transport">The transport to check.</param>
+        /// <returns>Whether this node listens on the transport and the target does not rule it out.</returns>
+        private bool MaySupportTransport(DHTPeer peer, DHTTransport transport)
+        {
+            var local = false;
+            foreach (var address in _options.ListenAddresses)
+            {
+                local |= _transport.PortFor(transport, address.AddressFamily) != 0;
+            }
+            if (!local)
+            {
+                return false;
+            }
+            if (peer.Endpoints.Count == 0)
+            {
+                return true;
+            }
+            foreach (var endpoint in peer.Endpoints)
+            {
+                if (endpoint.Port(transport) != 0)
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         /// <summary>Gets the alternate wire transport.</summary>
@@ -201,19 +248,24 @@ namespace MajDHTNetwork
         /// <param name="transport">The mapping being observed.</param>
         /// <param name="body">The rendezvous operation arguments.</param>
         /// <param name="cancellationToken">The operation lifetime.</param>
-        /// <returns>The refreshed relay contact and decoded response body.</returns>
-        private async Task<(DHTPeer Peer, ReadOnlyMemory<byte> Body)> RequestNatAsync(DHTPeer relay, DHTTransport transport,
+        /// <returns>The refreshed relay contact, decoded response body and the relay endpoint that was used.</returns>
+        /// <exception cref="IOException">No common address family exists or the relay rejected the request.</exception>
+        private async Task<(DHTPeer Peer, ReadOnlyMemory<byte> Body, IPEndPoint Endpoint)> RequestNatAsync(DHTPeer relay, DHTTransport transport,
             ReadOnlyMemory<byte> body, CancellationToken cancellationToken)
         {
+            if (relay.IsExpired)
+            {
+                throw new IOException("The relay contact has expired.");
+            }
+            var endpoint = NatEndpoint(relay, transport) ?? throw new IOException("The relay has no endpoint in a listened address family.");
             var packet = new Packet(LocalPeer, Crypto.Random(16), (byte)Operation.Rendezvous, body);
-            var endpoint = new IPEndPoint(relay.NetworkAddress, transport == DHTTransport.Tcp ? relay.TcpPort : relay.UdpPort);
-            var result = await _transport.ExchangeAtAsync(relay, transport, endpoint, packet.Seal(_identity, relay), cancellationToken).ConfigureAwait(false);
+            var result = await _transport.ExchangeAtAsync(transport, endpoint, packet.Seal(_identity, relay), cancellationToken).ConfigureAwait(false);
             var response = AuthenticateResponse(result, relay, packet);
-            _routing.Observe(response.Sender);
-            return (response.Sender, ReadResponseBody(response));
+            ObservePeer(response.Sender);
+            return (response.Sender, ReadResponseBody(response), endpoint);
         }
 
-        /// <summary>Refreshes an observed mapping and starts a queued peer introduction, if present.</summary>
+        /// <summary>Refreshes an observed mapping, records it for the external-address vote and starts a queued introduction.</summary>
         /// <param name="relay">The assisting relay.</param>
         /// <param name="transport">The mapping to register.</param>
         /// <param name="cancellationToken">The bounded registration lifetime.</param>
@@ -222,7 +274,8 @@ namespace MajDHTNetwork
         {
             var response = await RequestNatAsync(relay, transport, s_natRegistration, cancellationToken).ConfigureAwait(false);
             using var reader = new Wire(response.Body);
-            ReadNatEndpoint(reader);
+            var observed = ReadNatEndpoint(reader);
+            RecordObservation(response.Peer, response.Endpoint.Address, transport, observed);
             var hasInvitation = reader.Byte();
             if (hasInvitation > 1)
             {
@@ -264,16 +317,27 @@ namespace MajDHTNetwork
                             var refreshed = await RegisterNatTransportAsync(peer, transport, _lifetime.Token).ConfigureAwait(false);
                             lock (_gate)
                             {
-                                if (refreshed.ExpiresAt >= registration.Peer.ExpiresAt)
+                                if (refreshed.Sequence >= registration.Peer.Sequence)
                                 {
                                     registration.Peer = refreshed;
                                 }
+                                registration.LastSuccess = DateTimeOffset.UtcNow;
                             }
                         }
                         catch (Exception exception) when (IsPeerFailure(exception))
                         {
                             _lifetime.Token.ThrowIfCancellationRequested();
                             Log(LogLevel.Debug, "Rendezvous lease refresh failed: ", exception);
+                        }
+                    }
+                    lock (_gate)
+                    {
+                        // A lapsed or restored registration adds or removes this relay from the local contact's hints.
+                        var live = registration.LastSuccess + _options.NatRegistrationLifetime > DateTimeOffset.UtcNow;
+                        if (live != registration.Live)
+                        {
+                            registration.Live = live;
+                            RefreshLocalPeerLocked();
                         }
                     }
                 }
@@ -287,21 +351,45 @@ namespace MajDHTNetwork
             }
         }
 
-        /// <summary>Executes authenticated relay registration or introduction using the actual transport source.</summary>
+        /// <summary>Executes an authenticated rendezvous action using the actual transport source.</summary>
         /// <param name="packet">The authenticated requester.</param>
         /// <param name="request">The operation arguments.</param>
         /// <param name="transport">The receiving transport.</param>
         /// <param name="source">The socket's validated remote endpoint.</param>
-        /// <returns>The observed mapping or peer introduction.</returns>
-        /// <exception cref="IOException">Relaying is disabled, a mapping is absent, or a quota was reached.</exception>
+        /// <param name="cancellationToken">The handler lifetime.</param>
+        /// <returns>The action result.</returns>
+        /// <exception cref="IOException">Relaying is disabled, a mapping or helper is absent, or a quota was reached.</exception>
         /// <exception cref="InvalidDataException">The request is invalid.</exception>
-        private ReadOnlyMemory<byte> DispatchRendezvous(Packet packet, Wire request, DHTTransport transport, IPEndPoint source)
+        private async Task<ReadOnlyMemory<byte>> DispatchRendezvousAsync(Packet packet, Wire request, DHTTransport transport, IPEndPoint source,
+            CancellationToken cancellationToken)
         {
             if ((_options.Capabilities & DHTCapabilities.Relay) == 0)
             {
                 throw new IOException("Rendezvous assistance requires relay capability.");
             }
             var action = request.Byte();
+            switch (action)
+            {
+                case 2:
+                    return await DispatchDialBackAsync(packet, request, transport, source, cancellationToken).ConfigureAwait(false);
+                case 3:
+                    return DispatchDialBackAssist(packet, request);
+                default:
+                    return DispatchRendezvous(packet, request, action, transport, source);
+            }
+        }
+
+        /// <summary>Executes authenticated relay registration or introduction using the actual transport source.</summary>
+        /// <param name="packet">The authenticated requester.</param>
+        /// <param name="request">The operation arguments after the action byte.</param>
+        /// <param name="action">Zero to register and poll, or one to request an introduction.</param>
+        /// <param name="transport">The receiving transport.</param>
+        /// <param name="source">The socket's validated remote endpoint.</param>
+        /// <returns>The observed mapping or peer introduction.</returns>
+        /// <exception cref="IOException">A mapping is absent, or a quota was reached.</exception>
+        /// <exception cref="InvalidDataException">The request is invalid.</exception>
+        private ReadOnlyMemory<byte> DispatchRendezvous(Packet packet, Wire request, byte action, DHTTransport transport, IPEndPoint source)
+        {
             var targetId = action == 1 ? request.Text(64) : string.Empty;
             request.End();
             if (action > 1 || targetId == packet.Sender.NodeId)
@@ -456,7 +544,7 @@ namespace MajDHTNetwork
                     var request = new Packet(LocalPeer, Crypto.Random(16), (byte)Operation.Punch, invitation.Token);
                     try
                     {
-                        var encoded = await _transport.PunchAsync(invitation.Peer, invitation.Transport, invitation.Endpoint,
+                        var encoded = await _transport.PunchAsync(invitation.Transport, invitation.Endpoint,
                             request.Seal(_identity, invitation.Peer), timeout.Token).ConfigureAwait(false);
                         ReadResponseBody(AuthenticateResponse(encoded, invitation.Peer, request));
                         lock (_gate)
@@ -522,8 +610,14 @@ namespace MajDHTNetwork
         /// <param name="envelope">The sealed request.</param>
         /// <param name="cancellationToken">The request lifetime.</param>
         /// <returns>The encrypted direct response.</returns>
+        /// <exception cref="IOException">The contact expired or no route answered.</exception>
+        /// <exception cref="OperationCanceledException">The request or node lifetime was cancelled.</exception>
         private async Task<ReadOnlyMemory<byte>> ExchangeDirectAsync(DHTPeer peer, ReadOnlyMemory<byte> envelope, CancellationToken cancellationToken)
         {
+            if (peer.IsExpired)
+            {
+                throw new IOException("The destination contact has expired.");
+            }
             for (var attempt = 0; attempt < 2; attempt++)
             {
                 var transport = attempt == 0 ? _options.PreferredTransport : OtherTransport(_options.PreferredTransport);
@@ -543,7 +637,7 @@ namespace MajDHTNetwork
                 }
                 try
                 {
-                    return await _transport.ExchangeAtAsync(peer, transport, route.Endpoint, envelope, cancellationToken).ConfigureAwait(false);
+                    return await _transport.ExchangeAtAsync(transport, route.Endpoint, envelope, cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception exception) when (IsPeerFailure(exception))
                 {
@@ -558,7 +652,56 @@ namespace MajDHTNetwork
                     Log(LogLevel.Debug, "Previously introduced direct route failed: ", exception);
                 }
             }
-            return await _transport.ExchangeAsync(peer, envelope, cancellationToken).ConfigureAwait(false);
+            Exception? last = null;
+            foreach (var endpoint in DirectEndpoints(peer))
+            {
+                for (var attempt = 0; attempt < 2; attempt++)
+                {
+                    var transport = attempt == 0 ? _options.PreferredTransport : OtherTransport(_options.PreferredTransport);
+                    var port = endpoint.Port(transport);
+                    if (port == 0)
+                    {
+                        continue;
+                    }
+                    try
+                    {
+                        return await _transport.ExchangeAtAsync(transport, new IPEndPoint(endpoint.NetworkAddress, port), envelope, cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+                    catch (Exception exception) when (IsPeerFailure(exception) || exception is OperationCanceledException
+                        || exception is ObjectDisposedException)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        _lifetime.Token.ThrowIfCancellationRequested();
+                        last = exception;
+                    }
+                }
+            }
+            throw new IOException("No advertised endpoint responded.", last);
+        }
+
+        /// <summary>Orders a contact's endpoints for direct attempts and omits endpoints that cannot be reached from here.</summary>
+        /// <param name="peer">The destination contact.</param>
+        /// <returns>Configured or verified endpoints, then unverified endpoints, then local endpoints.</returns>
+        /// <remarks>A private contact's local endpoints are only tried when both nodes share an external address.</remarks>
+        private List<DHTEndpoint> DirectEndpoints(DHTPeer peer)
+        {
+            var result = new List<DHTEndpoint>(peer.Endpoints.Count);
+            var sameNetwork = peer.ExternalNetworkAddress != null && IsLocalExternalAddress(peer.ExternalNetworkAddress);
+            for (var pass = 0; pass < 3; pass++)
+            {
+                foreach (var endpoint in peer.Endpoints)
+                {
+                    var local = (endpoint.Flags & DHTEndpointFlags.Local) != 0;
+                    var rank = endpoint.IsReachable ? 0 : local ? 2 : 1;
+                    if (rank != pass || (local && peer.Reachability == DHTReachability.Private && !sameNetwork))
+                    {
+                        continue;
+                    }
+                    result.Add(endpoint);
+                }
+            }
+            return result;
         }
 
         /// <summary>Reclaims expired relay bindings, introduction tickets and direct routes under the state lock.</summary>
@@ -611,13 +754,13 @@ namespace MajDHTNetwork
             }
         }
 
-        /// <summary>Waits for every retained rendezvous loop and probe after lifetime cancellation.</summary>
+        /// <summary>Waits for every retained rendezvous loop, probe, reachability check and contact announcement after lifetime cancellation.</summary>
         /// <returns>Completion after all background traversal work has drained.</returns>
         private Task DrainNatAsync()
         {
             lock (_gate)
             {
-                var work = new List<Task>(_natRelays.Count + _natSessions.Count);
+                var work = ReachabilityWorkLocked();
                 foreach (var relay in _natRelays.Values)
                 {
                     work.Add(relay.Work);
@@ -682,13 +825,13 @@ namespace MajDHTNetwork
         /// <exception cref="InvalidDataException">The ticket is expired, malformed, local, or uses another address family.</exception>
         private NatInvitation ReadNatInvitation(Wire reader, DHTTransport transport)
         {
-            var peer = new DHTPeer(reader.Bytes(2048));
+            var peer = new DHTPeer(reader.Bytes(DHTPeer.MaxEncodedLength));
             var endpoint = ReadNatEndpoint(reader);
             var token = reader.Bytes(16);
             var expiresAt = DateTimeOffset.FromUnixTimeMilliseconds(reader.Long());
-            if (token.Length != 16 || peer.NodeId == NodeId || endpoint.AddressFamily != _options.ListenAddress.AddressFamily
+            if (token.Length != 16 || peer.NodeId == NodeId || _transport.PortFor(transport, endpoint.AddressFamily) == 0
                 || expiresAt <= DateTimeOffset.UtcNow || expiresAt > DateTimeOffset.UtcNow.AddMinutes(2)
-                || expiresAt > peer.ExpiresAt || !SupportsNatTransport(peer, transport))
+                || expiresAt > peer.ExpiresAt || !MaySupportTransport(peer, transport))
             {
                 throw new InvalidDataException("Invalid or expired rendezvous introduction.");
             }
@@ -730,6 +873,10 @@ namespace MajDHTNetwork
             internal DHTPeer Peer { get; set; }
             /// <summary>Gets or sets the observed background polling task.</summary>
             internal Task Work { get; set; } = Task.CompletedTask;
+            /// <summary>Gets or sets the time of the most recent successful registration refresh.</summary>
+            internal DateTimeOffset LastSuccess { get; set; }
+            /// <summary>Gets or sets whether the registration was live when last evaluated for relay hints.</summary>
+            internal bool Live { get; set; } = true;
 
             /// <summary>Creates the lifetime-owned registration state.</summary>
             /// <param name="peer">The authenticated assisting relay.</param>

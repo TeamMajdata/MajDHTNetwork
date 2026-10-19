@@ -46,6 +46,8 @@ namespace MajDHTNetwork
         private DHTPeer? _self;
         /// <summary>The maintenance loop task.</summary>
         private Task _maintenance = Task.CompletedTask;
+        /// <summary>The initial background bootstrap through the configured endpoints.</summary>
+        private Task _bootstrap = Task.CompletedTask;
         /// <summary>Tracks whether this single-use node has started.</summary>
         private volatile bool _started;
         /// <summary>Tracks whether the node has stopped permanently.</summary>
@@ -85,7 +87,10 @@ namespace MajDHTNetwork
             _transport = new SocketTransport(_options, HandleAsync, _options.Logger);
         }
 
-        /// <summary>Binds listeners and starts a single-use node and its background maintenance.</summary>
+        /// <summary>
+        /// Binds listeners and starts a single-use node, its background maintenance and, when bootstrap endpoints are
+        /// configured, a background bootstrap.
+        /// </summary>
         /// <param name="cancellationToken">An optional lifetime token; cancellation stops listener work.</param>
         /// <returns>Completion once listeners are bound and the signed contact is available.</returns>
         /// <exception cref="InvalidOperationException">The node was already started or stopped.</exception>
@@ -103,7 +108,7 @@ namespace MajDHTNetwork
                 _transport.Bind();
                 lock (_gate)
                 {
-                    _self = DHTPeer.Create(_identity, _options.AdvertisedAddress!, _transport.TcpPort, _transport.UdpPort, _options.Capabilities);
+                    RefreshLocalPeerLocked();
                     _started = true;
                 }
                 _transport.Run();
@@ -113,6 +118,10 @@ namespace MajDHTNetwork
                     _transport.Stop();
                 });
                 _maintenance = MaintainAsync();
+                if (_options.BootstrapEndpoints.Count != 0)
+                {
+                    _bootstrap = BootstrapInBackgroundAsync();
+                }
                 Log(LogLevel.Information, "Node listeners started.");
             }
             catch
@@ -147,6 +156,7 @@ namespace MajDHTNetwork
                 _externalCancellation.Dispose();
                 await _transport.DisposeAsync().ConfigureAwait(false);
                 await _maintenance.ConfigureAwait(false);
+                await _bootstrap.ConfigureAwait(false);
                 await DrainNatAsync().ConfigureAwait(false);
                 Log(LogLevel.Information, "Node stopped.");
             }

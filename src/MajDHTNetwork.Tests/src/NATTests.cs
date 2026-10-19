@@ -1,6 +1,7 @@
 #nullable enable
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -37,10 +38,10 @@ namespace MajDHTNetwork.Tests
             using var rightSource = new MemoryStream(rightBytes);
             var leftRecord = await left.PublishAsync("nat/left", leftSource, cancellationToken: token);
             var rightRecord = await right.PublishAsync("nat/right", rightSource, cancellationToken: token);
-            await left.BootstrapAsync(relay.LocalPeer, token);
-            await right.BootstrapAsync(relay.LocalPeer, token);
-            Assert.Equal(IPAddress.Parse("127.0.0.2"), left.LocalPeer.Address);
-            Assert.Equal(IPAddress.Parse("127.0.0.2"), right.LocalPeer.Address);
+            await left.JoinAsync(relay.LocalPeer, token);
+            await right.JoinAsync(relay.LocalPeer, token);
+            Assert.Equal(IPAddress.Parse("127.0.0.2"), left.LocalPeer.Address());
+            Assert.Equal(IPAddress.Parse("127.0.0.2"), right.LocalPeer.Address());
             Assert.True(await left.TryPunchAsync(right.LocalPeer, relay.LocalPeer, transport, token));
             await relay.StopAsync();
             for (var round = 0; round < 3; round++)
@@ -84,7 +85,7 @@ namespace MajDHTNetwork.Tests
             var content = Crypto.Random(2049);
             using var source = new MemoryStream(content);
             var record = await dual.PublishAsync("nat/recovered-udp", source, cancellationToken: token);
-            var stale = DHTPeer.Create(relayIdentity, IPAddress.Loopback, relay.LocalPeer.TcpPort, 1, DHTCapabilities.Relay);
+            var stale = DHTPeer.Create(relayIdentity, IPAddress.Loopback, relay.LocalPeer.TcpPort(), 1, DHTCapabilities.Relay);
             await dual.RegisterRelayAsync(stale, token);
             await udpOnly.RegisterRelayAsync(relay.LocalPeer, token);
             var punched = false;
@@ -314,7 +315,7 @@ namespace MajDHTNetwork.Tests
             Assert.NotNull(failure);
             Assert.True(failure is IOException || failure is SocketException || failure is TimeoutException,
                 "An invalid ticket or endpoint must not install a route to the otherwise valid content provider.");
-            var reachable = DHTPeer.Create(introduced.Identity, IPAddress.Loopback, introduced.Peer.TcpPort, introduced.Peer.UdpPort, DHTCapabilities.Provide);
+            var reachable = DHTPeer.Create(introduced.Identity, IPAddress.Loopback, introduced.Peer.TcpPort(), introduced.Peer.UdpPort(), DHTCapabilities.Provide);
             var direct = await target.ReadBlockAsync(introduced.Record, reachable, 0, cancellationToken: token);
             Assert.Equal(introduced.Content, direct.ToArray());
         }
@@ -376,8 +377,8 @@ namespace MajDHTNetwork.Tests
         {
             return new DHTNodeOptions
             {
-                ListenAddress = IPAddress.Loopback,
-                AdvertisedAddress = hidden ? IPAddress.Parse("127.0.0.2") : IPAddress.Loopback,
+                ListenAddresses = new List<IPAddress> { IPAddress.Loopback },
+                AdvertisedAddresses = new List<IPAddress> { hidden ? IPAddress.Parse("127.0.0.2") : IPAddress.Loopback },
                 TcpPort = transport == DHTTransport.Tcp ? 0 : (int?)null,
                 UdpPort = transport == DHTTransport.Udp ? 0 : (int?)null,
                 PreferredTransport = transport,

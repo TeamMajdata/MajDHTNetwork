@@ -1,7 +1,11 @@
 #nullable enable
 
 using System;
+using System.Net;
+using System.Threading;
+using System.Threading.Tasks;
 using MajDHTNetwork.Protocol;
+using MajDHTNetwork.Transport;
 
 namespace MajDHTNetwork.Tests
 {
@@ -42,5 +46,42 @@ namespace MajDHTNetwork.Tests
             return a.Span.SequenceEqual(b.Span);
         }
 
+        /// <summary>Gets the address of a contact's first advertised endpoint.</summary>
+        /// <param name="peer">The contact.</param>
+        /// <returns>The first endpoint address.</returns>
+        internal static IPAddress Address(this DHTPeer peer)
+        {
+            return peer.Endpoints[0].Address;
+        }
+
+        /// <summary>Gets the TCP port of a contact's first advertised endpoint.</summary>
+        /// <param name="peer">The contact.</param>
+        /// <returns>The TCP port, or zero.</returns>
+        internal static int TcpPort(this DHTPeer peer)
+        {
+            return peer.Endpoints[0].TcpPort;
+        }
+
+        /// <summary>Gets the UDP port of a contact's first advertised endpoint.</summary>
+        /// <param name="peer">The contact.</param>
+        /// <returns>The UDP port, or zero.</returns>
+        internal static int UdpPort(this DHTPeer peer)
+        {
+            return peer.Endpoints[0].UdpPort;
+        }
+
+        /// <summary>Sends a sealed request to a contact's first endpoint, preferring TCP when it is advertised.</summary>
+        /// <param name="transport">The raw transport.</param>
+        /// <param name="peer">The destination contact.</param>
+        /// <param name="packet">The sealed request.</param>
+        /// <param name="token">The test deadline.</param>
+        /// <returns>The opaque response.</returns>
+        internal static Task<ReadOnlyMemory<byte>> ExchangeAsync(this SocketTransport transport, DHTPeer peer, ReadOnlyMemory<byte> packet,
+            CancellationToken token)
+        {
+            var protocol = peer.TcpPort() != 0 ? DHTTransport.Tcp : DHTTransport.Udp;
+            var port = protocol == DHTTransport.Tcp ? peer.TcpPort() : peer.UdpPort();
+            return transport.ExchangeAtAsync(protocol, new IPEndPoint(peer.Address(), port), packet, token);
+        }
     }
 }

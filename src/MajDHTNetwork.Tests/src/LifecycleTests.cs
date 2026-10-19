@@ -27,7 +27,7 @@ namespace MajDHTNetwork.Tests
             var options = Options(DHTTransport.Tcp, DHTCapabilities.Download);
             options.Logger = new TestLogger(logs, throwOnWrite: true);
             await using var node = new MajDHTNode(options);
-            Assert.ThrowsAny<InvalidOperationException>(() => node.LocalPeer.ToInvitation());
+            Assert.ThrowsAny<InvalidOperationException>(() => node.LocalPeer);
             await node.StartAsync(token);
             var contact = node.LocalPeer;
             await Assert.ThrowsAnyAsync<InvalidOperationException>(() => node.StartAsync(token));
@@ -35,7 +35,7 @@ namespace MajDHTNetwork.Tests
             await Assert.ThrowsAnyAsync<InvalidOperationException>(() => node.PublishAsync("disabled", source, cancellationToken: token));
             await node.StopAsync();
             await node.StopAsync();
-            Assert.ThrowsAny<InvalidOperationException>(() => node.LocalPeer.ToInvitation());
+            Assert.ThrowsAny<InvalidOperationException>(() => node.LocalPeer);
             Assert.True(logs.Contains(LogLevel.Information), "Lifecycle logging must survive diagnostic callback exceptions.");
         }
 
@@ -51,14 +51,14 @@ namespace MajDHTNetwork.Tests
             var contact = node.LocalPeer;
             using (var badClient = new TcpClient())
             {
-                await badClient.ConnectAsync(IPAddress.Loopback, contact.TcpPort, token);
+                await badClient.ConnectAsync(IPAddress.Loopback, contact.TcpPort(), token);
                 await badClient.GetStream().WriteAsync(new byte[] { 255, 255, 255, 255 }, token);
                 var buffer = new byte[1];
                 Assert.True(await badClient.GetStream().ReadAsync(buffer, token) == 0, "Oversized TCP frame must be rejected without allocation.");
             }
             await using var observer = new MajDHTNode(Options(DHTTransport.Tcp, DHTCapabilities.Download));
             await observer.StartAsync(token);
-            await observer.BootstrapAsync(contact, token);
+            await observer.JoinAsync(contact, token);
         }
 
         /// <summary>Propagates cancellation from a request token before issuing a routing lookup.</summary>

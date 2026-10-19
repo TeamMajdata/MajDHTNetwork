@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Threading;
@@ -83,11 +84,11 @@ namespace MajDHTNetwork.Tests
             await using var relay = new MajDHTNode(options, relayIdentity);
             await relay.StartAsync(deadline.Token);
             options.Capabilities = DHTCapabilities.Download;
-            options.AdvertisedAddress = IPAddress.Parse("127.0.0.2");
+            options.AdvertisedAddresses = new List<IPAddress> { IPAddress.Parse("127.0.0.2") };
             await using var target = new MajDHTNode(options);
             await using var requester = new MajDHTNode(options);
             await Task.WhenAll(target.StartAsync(deadline.Token), requester.StartAsync(deadline.Token));
-            var initiallyUdpOnly = DHTPeer.Create(relayIdentity, IPAddress.Loopback, 1, relay.LocalPeer.UdpPort, DHTCapabilities.Relay);
+            var initiallyUdpOnly = DHTPeer.Create(relayIdentity, IPAddress.Loopback, 1, relay.LocalPeer.UdpPort(), DHTCapabilities.Relay);
             await target.RegisterRelayAsync(initiallyUdpOnly, deadline.Token);
             await requester.RegisterRelayAsync(relay.LocalPeer, deadline.Token);
             var punched = false;
@@ -146,8 +147,8 @@ namespace MajDHTNetwork.Tests
             var sender = DHTPeer.Create(identity, IPAddress.Loopback, protocol == DHTTransport.Tcp ? 1 : 0,
                 protocol == DHTTransport.Udp ? 1 : 0, DHTCapabilities.Download);
             var request = new Packet(sender, Crypto.Random(16), (byte)Operation.Rendezvous, new byte[] { 0 });
-            var endpoint = new IPEndPoint(relay.Address, protocol == DHTTransport.Tcp ? relay.TcpPort : relay.UdpPort);
-            var result = await client.ExchangeAtAsync(relay, protocol, endpoint, request.Seal(identity, relay), cancellationToken);
+            var endpoint = new IPEndPoint(relay.Address(), protocol == DHTTransport.Tcp ? relay.TcpPort() : relay.UdpPort());
+            var result = await client.ExchangeAtAsync(protocol, endpoint, request.Seal(identity, relay), cancellationToken);
             var response = Packet.Open(identity, result);
             Assert.Equal(relay.NodeId, response.Sender.NodeId);
             Assert.True(request.RequestId.Span.SequenceEqual(response.RequestId.Span));

@@ -2,6 +2,8 @@ using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Net;
+using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 using MajDHTNetwork.Protocol;
@@ -12,13 +14,57 @@ namespace MajDHTNetwork
 {
     public sealed partial class MajDHTNode
     {
-        /// <summary>Joins the network through any existing node's signed invitation.</summary>
-        /// <param name="bootstrap">A trusted, unexpired public node contact.</param>
+        /// <summary>Joins the network through every configured bootstrap endpoint, then discovers neighbors.</summary>
+        /// <param name="cancellationToken">Cancels joining and initial discovery.</param>
+        /// <returns>The number of bootstrap endpoints that answered.</returns>
+        /// <remarks>
+        /// Each endpoint first returns its signed contact through an unencrypted, signed Hello exchange. The library cannot
+        /// authenticate which identity should answer at an endpoint, so configure endpoints only from trusted sources.
+        /// </remarks>
+        /// <exception cref="InvalidOperationException">The node is not running or no bootstrap endpoint is configured.</exception>
+        /// <exception cref="IOException">No configured bootstrap endpoint answered.</exception>
+        /// <exception cref="OperationCanceledException">Joining was cancelled.</exception>
+        public async Task<int> BootstrapAsync(CancellationToken cancellationToken = default)
+        {
+            using var cancellation = OperationCancellation(cancellationToken);
+            if (_options.BootstrapEndpoints.Count == 0)
+            {
+                throw new InvalidOperationException("No bootstrap endpoints are configured.");
+            }
+            var joined = 0;
+            Exception? last = null;
+            foreach (var endpoint in _options.BootstrapEndpoints)
+            {
+                try
+                {
+                    var peer = await HelloAsync(endpoint, cancellation.Token).ConfigureAwait(false);
+                    await RegisterBootstrapRelayAsync(peer, cancellation.Token).ConfigureAwait(false);
+                    joined++;
+                }
+                catch (Exception exception) when (IsPeerFailure(exception))
+                {
+                    cancellation.Token.ThrowIfCancellationRequested();
+                    last = exception;
+                    Log(LogLevel.Warning, "Bootstrap endpoint did not answer: ", exception);
+                }
+            }
+            if (joined == 0)
+            {
+                throw new IOException("No bootstrap endpoint answered.", last);
+            }
+            await LookupAsync(0, NodeId, cancellation.Token).ConfigureAwait(false);
+            Log(LogLevel.Information, "Bootstrap and neighbor discovery completed.");
+            return joined;
+        }
+
+        /// <summary>Joins the network through an already known signed contact.</summary>
+        /// <param name="bootstrap">An unexpired remote contact.</param>
         /// <param name="cancellationToken">Cancels joining and initial discovery.</param>
         /// <returns>Completion after authentication and iterative neighbor discovery.</returns>
+        /// <exception cref="ArgumentException">The contact is absent or local.</exception>
         /// <exception cref="IOException">The bootstrap node could not be contacted.</exception>
         /// <exception cref="OperationCanceledException">Joining was cancelled.</exception>
-        public async Task BootstrapAsync(DHTPeer bootstrap, CancellationToken cancellationToken = default)
+        internal async Task JoinAsync(DHTPeer bootstrap, CancellationToken cancellationToken = default)
         {
             if (bootstrap == null || bootstrap.NodeId == NodeId)
             {
@@ -26,20 +72,88 @@ namespace MajDHTNetwork
             }
             using var cancellation = OperationCancellation(cancellationToken);
             await RequestAsync(bootstrap, Operation.Ping, Array.Empty<byte>(), cancellation.Token).ConfigureAwait(false);
-            if (_options.EnableNatTraversal && (bootstrap.Capabilities & DHTCapabilities.Relay) != 0)
-            {
-                try
-                {
-                    await RegisterRelayAsync(bootstrap, cancellation.Token).ConfigureAwait(false);
-                }
-                catch (Exception exception) when (IsPeerFailure(exception))
-                {
-                    cancellation.Token.ThrowIfCancellationRequested();
-                    Log(LogLevel.Warning, "Bootstrap relay registration failed: ", exception);
-                }
-            }
+            await RegisterBootstrapRelayAsync(bootstrap, cancellation.Token).ConfigureAwait(false);
             await LookupAsync(0, NodeId, cancellation.Token).ConfigureAwait(false);
             Log(LogLevel.Information, "Bootstrap authentication and neighbor discovery completed.");
+        }
+
+        /// <summary>Registers with a bootstrap node that offers rendezvous assistance, logging rather than failing on errors.</summary>
+        /// <param name="bootstrap">The authenticated bootstrap contact.</param>
+        /// <param name="cancellationToken">Cancels registration.</param>
+        /// <returns>Completion after the registration attempt.</returns>
+        /// <exception cref="OperationCanceledException">Registration was cancelled.</exception>
+        private async Task RegisterBootstrapRelayAsync(DHTPeer bootstrap, CancellationToken cancellationToken)
+        {
+            if (!_options.EnableNatTraversal || (bootstrap.Capabilities & DHTCapabilities.Relay) == 0)
+            {
+                return;
+            }
+            try
+            {
+                await RegisterRelayAsync(bootstrap, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception exception) when (IsPeerFailure(exception))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Log(LogLevel.Warning, "Bootstrap relay registration failed: ", exception);
+            }
+        }
+
+        /// <summary>Learns the signed contact listening at an endpoint and the endpoint it observed for this node.</summary>
+        /// <param name="endpoint">The remote endpoint.</param>
+        /// <param name="cancellationToken">Cancels the exchange.</param>
+        /// <returns>The authenticated remote contact.</returns>
+        /// <exception cref="IOException">Neither transport answered.</exception>
+        /// <exception cref="OperationCanceledException">The exchange was cancelled.</exception>
+        private async Task<DHTPeer> HelloAsync(IPEndPoint endpoint, CancellationToken cancellationToken)
+        {
+            Exception? last = null;
+            for (var attempt = 0; attempt < 2; attempt++)
+            {
+                var transport = attempt == 0 ? _options.PreferredTransport : OtherTransport(_options.PreferredTransport);
+                var request = new Packet(LocalPeer, Crypto.Random(16), (byte)Operation.Hello, ReadOnlyMemory<byte>.Empty);
+                try
+                {
+                    var encoded = await _transport.ExchangeAtAsync(transport, endpoint, request.SealHello(_identity), cancellationToken)
+                        .ConfigureAwait(false);
+                    var response = Packet.Open(_identity, encoded);
+                    if (response.Sender.NodeId == NodeId || response.Kind != (request.Kind | 128)
+                        || !CryptographicOperations.FixedTimeEquals(response.RequestId.Span, request.RequestId.Span))
+                    {
+                        throw new CryptographicException("Hello response sender, operation or correlation mismatch.");
+                    }
+                    using var reader = new Wire(ReadResponseBody(response));
+                    var observed = ReadNatEndpoint(reader);
+                    reader.End();
+                    ObservePeer(response.Sender);
+                    RecordObservation(response.Sender, endpoint.Address, transport, observed);
+                    return response.Sender;
+                }
+                catch (Exception exception) when (IsPeerFailure(exception) || exception is OperationCanceledException)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    last = exception;
+                }
+            }
+            throw new IOException("The endpoint did not answer a Hello request.", last);
+        }
+
+        /// <summary>Runs the initial bootstrap without failing node startup.</summary>
+        /// <returns>Completion after the attempt.</returns>
+        private async Task BootstrapInBackgroundAsync()
+        {
+            await Task.Yield();
+            try
+            {
+                await BootstrapAsync(_lifetime.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+            {
+            }
+            catch (Exception exception) when (IsPeerFailure(exception) || exception is InvalidOperationException)
+            {
+                Log(LogLevel.Warning, "Background bootstrap failed: ", exception);
+            }
         }
 
         /// <summary>Finds reachable nodes nearest a SHA-256 routing identifier.</summary>
@@ -165,10 +279,11 @@ namespace MajDHTNetwork
                     responsive.Add(queried[replyIndex].NodeId);
                     foreach (var peer in reply.Peers)
                     {
-                        if (peer.NodeId != NodeId && (!visited.Contains(peer.NodeId) || responsive.Contains(peer.NodeId))
+                        if (peer.NodeId != NodeId && peer.Reachability != DHTReachability.Private
+                            && (!visited.Contains(peer.NodeId) || responsive.Contains(peer.NodeId))
                             && (candidates.Count < _options.MaxLookupQueries * 16 || candidates.ContainsKey(peer.NodeId)))
                         {
-                            if (!candidates.TryGetValue(peer.NodeId, out var existing) || peer.ExpiresAt > existing.ExpiresAt)
+                            if (!candidates.TryGetValue(peer.NodeId, out var existing) || peer.Sequence > existing.Sequence)
                             {
                                 candidates[peer.NodeId] = peer;
                             }
@@ -436,7 +551,10 @@ namespace MajDHTNetwork
             }
         }
 
-        /// <summary>Refreshes contact leases and reannounces locally available content on a cancellable interval.</summary>
+        /// <summary>
+        /// Refreshes contact leases, retries bootstrap while isolated, schedules reachability checks and reannounces locally
+        /// available content on a cancellable interval.
+        /// </summary>
         /// <returns>Completion when the node stops.</returns>
         private async Task MaintainAsync()
         {
@@ -445,35 +563,23 @@ namespace MajDHTNetwork
                 while (!_lifetime.IsCancellationRequested)
                 {
                     await Task.Delay(_options.MaintenanceInterval, _lifetime.Token).ConfigureAwait(false);
-                    var publications = new List<DHTRecord>();
+                    bool checkReachability;
                     lock (_gate)
                     {
-                        _self = DHTPeer.Create(_identity, _options.AdvertisedAddress!, _transport.TcpPort, _transport.UdpPort, _options.Capabilities);
+                        RefreshLocalPeerLocked();
                         PruneLocked();
-                        foreach (var record in _records.Values)
-                        {
-                            if ((_options.Capabilities & DHTCapabilities.Provide) != 0 && _contents.ContainsKey(ContentId(record)))
-                            {
-                                publications.Add(record);
-                            }
-                        }
+                        checkReachability = _lastReachabilityCheck + _options.ReachabilityCheckInterval <= DateTimeOffset.UtcNow;
+                    }
+                    if (_options.BootstrapEndpoints.Count != 0 && _routing.Closest(NodeId, 1).Count == 0)
+                    {
+                        await BootstrapInBackgroundAsync().ConfigureAwait(false);
+                    }
+                    if (checkReachability)
+                    {
+                        TriggerReachabilityCheck();
                     }
                     await LookupAsync(0, NodeId, _lifetime.Token).ConfigureAwait(false);
-                    foreach (var record in publications)
-                    {
-                        try
-                        {
-                            if (!record.IsExpired)
-                            {
-                                await AnnounceRecordAsync(record, _lifetime.Token).ConfigureAwait(false);
-                            }
-                        }
-                        catch (Exception exception) when (IsPeerFailure(exception))
-                        {
-                            _lifetime.Token.ThrowIfCancellationRequested();
-                            Log(LogLevel.Warning, "Maintenance announcement failed: ", exception);
-                        }
-                    }
+                    await ReannounceLocalRecordsAsync(_lifetime.Token).ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
@@ -484,6 +590,40 @@ namespace MajDHTNetwork
                 if (!_lifetime.IsCancellationRequested)
                 {
                     Log(LogLevel.Error, "Maintenance stopped: ", exception);
+                }
+            }
+        }
+
+        /// <summary>Reannounces every unexpired locally available publication.</summary>
+        /// <param name="cancellationToken">The node lifetime.</param>
+        /// <returns>Completion after every announcement attempt.</returns>
+        /// <exception cref="OperationCanceledException">The node stopped.</exception>
+        private async Task ReannounceLocalRecordsAsync(CancellationToken cancellationToken)
+        {
+            var publications = new List<DHTRecord>();
+            lock (_gate)
+            {
+                foreach (var record in _records.Values)
+                {
+                    if ((_options.Capabilities & DHTCapabilities.Provide) != 0 && _contents.ContainsKey(ContentId(record)))
+                    {
+                        publications.Add(record);
+                    }
+                }
+            }
+            foreach (var record in publications)
+            {
+                try
+                {
+                    if (!record.IsExpired)
+                    {
+                        await AnnounceRecordAsync(record, cancellationToken).ConfigureAwait(false);
+                    }
+                }
+                catch (Exception exception) when (IsPeerFailure(exception))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    Log(LogLevel.Warning, "Maintenance announcement failed: ", exception);
                 }
             }
         }

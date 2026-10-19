@@ -27,7 +27,7 @@ namespace MajDHTNetwork
             {
                 throw new InvalidDataException("Unexpected incoming response or self request.");
             }
-            _routing.Observe(packet.Sender);
+            ObservePeer(packet.Sender);
             var id = packet.Sender.NodeId + ":" + Crypto.Hex(packet.RequestId.Span);
             var fingerprint = packet.Kind.ToString(System.Globalization.CultureInfo.InvariantCulture) + ":" + Crypto.Hex(Crypto.Hash(packet.Body.Span));
             CachedReply cached;
@@ -150,8 +150,9 @@ namespace MajDHTNetwork
                     {
                         response.Put(record.Encoded);
                     }
-                    PutPeers(response, _routing.Closest(routingId, _options.BucketSize));
-                    PutPeers(response, mode == 2 ? LocalProviders(target) : record == null ? new List<DHTPeer>() : LocalProviders(record.FileHash));
+                    PutPeers(response, _routing.Closest(routingId, _options.BucketSize), ContactListBudget);
+                    PutPeers(response, mode == 2 ? LocalProviders(target) : record == null ? new List<DHTPeer>() : LocalProviders(record.FileHash),
+                        ContactListBudget);
                     return response.ToArray();
                 }
                 case Operation.Store:
@@ -184,9 +185,15 @@ namespace MajDHTNetwork
                     return response.ToArray();
                 }
                 case Operation.Rendezvous:
-                    return DispatchRendezvous(packet, request, transport, source);
+                    return await DispatchRendezvousAsync(packet, request, transport, source, cancellationToken).ConfigureAwait(false);
                 case Operation.Punch:
                     return DispatchPunch(packet, transport, source);
+                case Operation.Hello:
+                    request.End();
+                    PutNatEndpoint(response, source);
+                    return response.ToArray();
+                case Operation.Probe:
+                    return DispatchProbe(packet, transport);
                 case Operation.Relay:
                 {
                     if ((_options.Capabilities & DHTCapabilities.Relay) == 0)
@@ -197,16 +204,8 @@ namespace MajDHTNetwork
                     var inner = request.Bytes(Wire.MaxPacket);
                     request.End();
                     Packet.CheckForward(inner, target);
-                    DHTPeer? destination = null;
-                    foreach (var peer in _routing.Closest(target, _options.BucketSize))
-                    {
-                        if (peer.NodeId == target && peer.NodeId != packet.Sender.NodeId)
-                        {
-                            destination = peer;
-                            break;
-                        }
-                    }
-                    if (destination == null)
+                    var destination = KnownRelayDestination(target);
+                    if (destination == null || destination.NodeId == packet.Sender.NodeId)
                     {
                         throw new IOException("Relay destination must be an already known peer.");
                     }
@@ -253,8 +252,45 @@ namespace MajDHTNetwork
                 }
             }
             var response = authenticated ?? AuthenticateResponse(result, peer, request);
-            _routing.Observe(response.Sender);
+            ObservePeer(response.Sender);
             return ReadResponseBody(response);
+        }
+
+        /// <summary>Adds an authenticated contact to the routing table unless it can only be reached through relays.</summary>
+        /// <param name="peer">The authenticated contact.</param>
+        /// <remarks>
+        /// Private nodes participate as clients: they are never returned as lookup hops, and a node that becomes private
+        /// is removed together with its earlier contact.
+        /// </remarks>
+        private void ObservePeer(DHTPeer peer)
+        {
+            if (peer.Reachability == DHTReachability.Private)
+            {
+                _routing.Remove(peer.NodeId);
+            }
+            else
+            {
+                _routing.Observe(peer);
+            }
+        }
+
+        /// <summary>Finds a relay destination among routed peers and live rendezvous registrations.</summary>
+        /// <param name="target">The destination node identifier.</param>
+        /// <returns>The destination contact, or null when it is unknown.</returns>
+        private DHTPeer? KnownRelayDestination(string target)
+        {
+            foreach (var peer in _routing.Closest(target, _options.BucketSize))
+            {
+                if (peer.NodeId == target)
+                {
+                    return peer;
+                }
+            }
+            lock (_gate)
+            {
+                PruneNatState();
+                return _natRegistrations.TryGetValue(target, out var registration) ? registration.Peer : null;
+            }
         }
 
         /// <summary>Validates the operation status and extracts its bounded response body.</summary>
@@ -314,46 +350,49 @@ namespace MajDHTNetwork
             return result;
         }
 
-        /// <summary>Tries bounded known relay candidates after a direct route fails.</summary>
+        /// <summary>Tries the destination's relay hints, then bounded known relay candidates, after a direct route fails.</summary>
         /// <param name="destination">The unreachable final recipient.</param>
         /// <param name="envelope">The final recipient's ciphertext.</param>
         /// <param name="request">The request whose response must be authenticated.</param>
         /// <param name="cancellationToken">The operation lifetime.</param>
         /// <returns>A response from the first successful relay.</returns>
-        /// <exception cref="IOException">No known relay could reach the destination.</exception>
+        /// <exception cref="IOException">No hinted or known relay could reach the destination.</exception>
         private async Task<ReadOnlyMemory<byte>> FindRelayAsync(DHTPeer destination, ReadOnlyMemory<byte> envelope, Packet request, CancellationToken cancellationToken)
         {
+            var attempted = new HashSet<string>();
+            var punchable = _options.EnableNatTraversal && !destination.HasEndpointDependentMapping;
+            foreach (var hint in destination.RelayHints)
+            {
+                if (hint.NodeId == NodeId || hint.IsExpired || !attempted.Add(hint.NodeId))
+                {
+                    continue;
+                }
+                bool registered;
+                lock (_gate)
+                {
+                    registered = _natRelays.ContainsKey(hint.NodeId);
+                }
+                try
+                {
+                    // A hinted relay already serving this node can introduce a direct path; otherwise forward without registering.
+                    return await RelayRouteAsync(hint, destination, envelope, request, punchable && registered, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception exception) when (IsPeerFailure(exception))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    Log(LogLevel.Debug, "Hinted relay route failed: ", exception);
+                }
+            }
             var tried = 0;
             foreach (var relay in _routing.Closest(destination.NodeId, 256))
             {
-                if (relay.NodeId == destination.NodeId || (relay.Capabilities & DHTCapabilities.Relay) == 0)
+                if (relay.NodeId == destination.NodeId || (relay.Capabilities & DHTCapabilities.Relay) == 0 || !attempted.Add(relay.NodeId))
                 {
                     continue;
                 }
                 try
                 {
-                    if (_options.EnableNatTraversal)
-                    {
-                        var preferred = _options.PreferredTransport;
-                        if (await TryPunchAsync(destination, relay, preferred, cancellationToken).ConfigureAwait(false)
-                            || await TryPunchAsync(destination, relay, OtherTransport(preferred), cancellationToken).ConfigureAwait(false))
-                        {
-                            try
-                            {
-                                var direct = await ExchangeDirectAsync(destination, envelope, cancellationToken).ConfigureAwait(false);
-                                AuthenticateResponse(direct, destination, request);
-                                return direct;
-                            }
-                            catch (Exception exception) when (IsPeerFailure(exception))
-                            {
-                                cancellationToken.ThrowIfCancellationRequested();
-                                Log(LogLevel.Debug, "Introduced path failed; trying its assisting relay: ", exception);
-                            }
-                        }
-                    }
-                    var result = await ForwardAsync(relay, destination, envelope, cancellationToken).ConfigureAwait(false);
-                    AuthenticateResponse(result, destination, request);
-                    return result;
+                    return await RelayRouteAsync(relay, destination, envelope, request, punchable, cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception exception) when (IsPeerFailure(exception))
                 {
@@ -368,6 +407,42 @@ namespace MajDHTNetwork
             throw new IOException("No known relay could reach the destination.");
         }
 
+        /// <summary>Tries an introduced direct path through one relay, then opaque forwarding through the same relay.</summary>
+        /// <param name="relay">The assisting relay.</param>
+        /// <param name="destination">The final recipient.</param>
+        /// <param name="envelope">The final recipient's ciphertext.</param>
+        /// <param name="request">The request whose response must be authenticated.</param>
+        /// <param name="punch">Whether to attempt hole punching first.</param>
+        /// <param name="cancellationToken">The operation lifetime.</param>
+        /// <returns>The authenticated encrypted response.</returns>
+        /// <exception cref="IOException">The relay could not reach the destination.</exception>
+        private async Task<ReadOnlyMemory<byte>> RelayRouteAsync(DHTPeer relay, DHTPeer destination, ReadOnlyMemory<byte> envelope, Packet request,
+            bool punch, CancellationToken cancellationToken)
+        {
+            if (punch)
+            {
+                var preferred = _options.PreferredTransport;
+                if (await TryPunchAsync(destination, relay, preferred, cancellationToken).ConfigureAwait(false)
+                    || await TryPunchAsync(destination, relay, OtherTransport(preferred), cancellationToken).ConfigureAwait(false))
+                {
+                    try
+                    {
+                        var direct = await ExchangeDirectAsync(destination, envelope, cancellationToken).ConfigureAwait(false);
+                        AuthenticateResponse(direct, destination, request);
+                        return direct;
+                    }
+                    catch (Exception exception) when (IsPeerFailure(exception))
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        Log(LogLevel.Debug, "Introduced path failed; trying its assisting relay: ", exception);
+                    }
+                }
+            }
+            var result = await ForwardAsync(relay, destination, envelope, cancellationToken).ConfigureAwait(false);
+            AuthenticateResponse(result, destination, request);
+            return result;
+        }
+
         /// <summary>Identifies recoverable peer-specific protocol and transport failures.</summary>
         /// <param name="exception">The failure.</param>
         /// <returns>Whether another peer may be attempted.</returns>
@@ -377,13 +452,21 @@ namespace MajDHTNetwork
                 || exception is System.Net.Sockets.SocketException;
         }
 
-        /// <summary>Encodes a bounded contact list.</summary>
+        /// <summary>Encodes a contact list bounded by count and encoded size.</summary>
         /// <param name="writer">The destination encoder.</param>
-        /// <param name="peers">At most sixteen signed contacts.</param>
-        private static void PutPeers(Wire writer, List<DHTPeer> peers)
+        /// <param name="peers">The ordered candidate contacts; at most sixteen are written.</param>
+        /// <param name="budget">The maximum encoded bytes of the written contacts, including their length prefixes.</param>
+        private static void PutPeers(Wire writer, List<DHTPeer> peers, int budget)
         {
-            writer.PutLong(Math.Min(16, peers.Count));
-            for (var i = 0; i < Math.Min(16, peers.Count); i++)
+            var count = 0;
+            var used = 0;
+            while (count < Math.Min(16, peers.Count) && used + 8 + peers[count].Encoded.Length <= budget)
+            {
+                used += 8 + peers[count].Encoded.Length;
+                count++;
+            }
+            writer.PutLong(count);
+            for (var i = 0; i < count; i++)
             {
                 writer.Put(peers[i].Encoded);
             }
@@ -402,7 +485,7 @@ namespace MajDHTNetwork
             var peers = new List<DHTPeer>((int)count);
             for (var i = 0; i < count; i++)
             {
-                peers.Add(new DHTPeer(reader.Bytes(1200)));
+                peers.Add(new DHTPeer(reader.Bytes(DHTPeer.MaxEncodedLength)));
             }
             return peers;
         }

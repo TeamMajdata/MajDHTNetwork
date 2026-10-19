@@ -1,10 +1,13 @@
 #nullable enable
 
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
 using MajDHTNetwork.Protocol;
+using Xunit;
 using static MajDHTNetwork.Tests.TestSupport;
 
 namespace MajDHTNetwork.Tests
@@ -57,21 +60,30 @@ namespace MajDHTNetwork.Tests
             var identity = new DHTIdentity();
             var bootstrap = new MajDHTNode(Options(transport, DHTCapabilities.Download | DHTCapabilities.Relay));
             var provider = new MajDHTNode(Options(transport, DHTCapabilities.Download | DHTCapabilities.Provide), identity);
-            var downloader = new MajDHTNode(Options(transport, DHTCapabilities.Download));
+            MajDHTNode? downloader = null;
             try
             {
-                await Task.WhenAll(bootstrap.StartAsync(token), provider.StartAsync(token), downloader.StartAsync(token));
-                await provider.BootstrapAsync(bootstrap.LocalPeer, token);
+                await Task.WhenAll(bootstrap.StartAsync(token), provider.StartAsync(token));
+                await provider.JoinAsync(bootstrap.LocalPeer, token);
                 var input = Crypto.Random((16384 * 2) + 79);
                 using var source = new MemoryStream(input);
                 var record = await provider.PublishAsync("songs/test", source, cancellationToken: token);
                 var alias = await provider.PublishAliasAsync("songs/alternate", record, cancellationToken: token);
-                await downloader.BootstrapAsync(DHTPeer.ParseInvitation(bootstrap.LocalPeer.ToInvitation()), token);
+                // The downloader joins through a configured endpoint rather than a pre-shared contact.
+                var downloaderOptions = Options(transport, DHTCapabilities.Download);
+                var port = transport == DHTTransport.Tcp ? bootstrap.LocalPeer.TcpPort() : bootstrap.LocalPeer.UdpPort();
+                downloaderOptions.BootstrapEndpoints = new List<IPEndPoint> { new IPEndPoint(IPAddress.Loopback, port) };
+                downloader = new MajDHTNode(downloaderOptions);
+                await downloader.StartAsync(token);
+                Assert.Equal(1, await downloader.BootstrapAsync(token));
                 return new ThreeNodeNetwork(identity, bootstrap, provider, downloader, input, record, alias);
             }
             catch
             {
-                await downloader.DisposeAsync();
+                if (downloader != null)
+                {
+                    await downloader.DisposeAsync();
+                }
                 await provider.DisposeAsync();
                 await bootstrap.DisposeAsync();
                 throw;

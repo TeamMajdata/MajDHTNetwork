@@ -39,6 +39,10 @@ MajDHTNetwork 是一个独立的 **.NET Standard 2.1** 类库，命名空间为
   数据报 UDP。
 - **中继辅助穿透。** 声明 `Relay` 能力的节点观测真实端点并协调 TCP/UDP 打洞；当直连
   路径不可行时，同一个中继可以转发不透明的加密信封。
+- **面向家宽的可达性发现。** NAT 之后的节点通过独立中继得知自己的外部地址，用独立的
+  回拨探测验证它；无法验证时改为通告签名的中继提示，而不是地址。
+- **双栈监听与端点引导。** 一个节点可以同时监听 IPv4 与 IPv6，并通过配置的引导端点
+  加入网络。
 - **可插拔存储。** 数据块由 `IDHTContentStore` 承载；默认的 `MemoryDHTContentStore`
   是有界的 LRU 缓存，应用也可以提供持久化存储。
 - **与宿主无关。** 不使用 Unity 类型，不调用 `System.IO.File`/`FileStream`，日志走
@@ -86,6 +90,7 @@ dotnet test src/MajDHTNetwork.Tests/MajDHTNetwork.Tests.csproj --configuration R
 取消令牌、流以及任何持久化的身份存储都由应用负责。下面是一段异步方法的方法体。
 
 ```csharp
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Text;
@@ -93,26 +98,25 @@ using MajDHTNetwork;
 
 #nullable enable
 
-// 绑定显式端口；用 0 让操作系统分配端口，用 null 关闭对应监听器。
+// 在 IPv4 与 IPv6 上绑定显式端口；用 0 让操作系统分配端口，用 null 关闭对应监听器。
 await using var provider = new MajDHTNode(new DHTNodeOptions
 {
-    ListenAddress = IPAddress.Loopback,
+    ListenAddresses = new List<IPAddress> { IPAddress.Loopback, IPAddress.IPv6Loopback },
     TcpPort = 42000,
     UdpPort = 42000,
     Capabilities = DHTCapabilities.Download | DHTCapabilities.Provide | DHTCapabilities.Relay
 });
 await provider.StartAsync(cancellationToken);
 
-// 这份公开邀请只包含签名端点和公钥，绝不包含私钥。
-var invitation = provider.LocalPeer.ToInvitation();
-
+// 通过已知节点的端点加入网络；该节点会自行返回它的签名联系人。
 await using var downloader = new MajDHTNode(new DHTNodeOptions
 {
     PreferredTransport = DHTTransport.Udp,
-    Capabilities = DHTCapabilities.Download
+    Capabilities = DHTCapabilities.Download,
+    BootstrapEndpoints = { new IPEndPoint(IPAddress.Loopback, 42000) }
 });
 await downloader.StartAsync(cancellationToken);
-await downloader.BootstrapAsync(DHTPeer.ParseInvitation(invitation), cancellationToken);
+await downloader.BootstrapAsync(cancellationToken);
 
 using var source = new MemoryStream(Encoding.UTF8.GetBytes("verified file content"));
 var record = await provider.PublishAsync("songs/example", source, cancellationToken: cancellationToken);
@@ -134,10 +138,10 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | 成员 | 用途 |
 | --- | --- |
 | `MajDHTNode(DHTNodeOptions?, DHTIdentity?, IDHTContentStore?)` | 创建节点；所有参数都可选，缺省时在内部创建默认实现。 |
-| `StartAsync(CancellationToken)` | 只绑定一次监听器；该令牌是生命周期令牌。 |
+| `StartAsync(CancellationToken)` | 只绑定一次监听器；配置了引导端点时在后台开始引导；该令牌是生命周期令牌。 |
 | `StopAsync()`、`DisposeAsync()`、`Dispose()` | 幂等的关闭流程；已停止的实例不能重启。 |
 | `NodeId`、`LocalPeer`、`KnownPeers` | 本地身份指纹、本地签名联系人与当前路由中的联系人。 |
-| `BootstrapAsync(DHTPeer, CancellationToken)` | 引入一个可信且未过期的联系人。 |
+| `BootstrapAsync(CancellationToken)` | 联系所有配置的引导端点，返回作出应答的端点数量。 |
 | `FindNodesAsync(string routingId, CancellationToken)` | 迭代式 XOR 距离查找。 |
 | `PublishAsync(string, Stream, long revision, CancellationToken)` | 在本地发布者命名空间下发布一个流。 |
 | `PublishAliasAsync(string, DHTRecord, long revision, CancellationToken)` | 为已发布内容再发布一个名称。 |
@@ -154,8 +158,9 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 
 | 选项 | 默认值 |
 | --- | --- |
-| `ListenAddress` | `IPAddress.Loopback` |
-| `AdvertisedAddress` | `null`（此时使用 `ListenAddress`；通配监听器必须显式指定） |
+| `ListenAddresses` | `{ IPAddress.Loopback }`（一到两项，每个地址族最多一项） |
+| `AdvertisedAddresses` | 空（通告具体的监听地址并自动发现可达性；最多四项） |
+| `BootstrapEndpoints` | 空（最多十六项） |
 | `TcpPort`、`UdpPort` | `0`（由操作系统分配）；`null` 关闭对应监听器 |
 | `PreferredTransport` | `DHTTransport.Tcp` |
 | `Capabilities` | `Download \| Provide` |
@@ -174,6 +179,7 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | `NatTraversalTimeout` | `5 秒` |
 | `NatPollInterval` | `1 秒` |
 | `NatRegistrationLifetime` | `30 秒`（至少覆盖三个轮询间隔） |
+| `ReachabilityCheckInterval` | `30 分钟`（允许 1 分钟–1 天） |
 | `MaxNatRegistrations` | `256` |
 | `MaxNatRelays` | `4` |
 | `Logger` | `NullLogger.Instance` |
@@ -183,7 +189,10 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | 类型 | 主要成员 |
 | --- | --- |
 | `DHTIdentity` | `DHTIdentity()`、`DHTIdentity(ReadOnlySpan<byte> seed)`、`NodeId`、`PublicKey`、`ExportSeed()`、`ExportSeed(Span<byte>)` |
-| `DHTPeer` | `NodeId`、`Address`、`TcpPort`、`UdpPort`、`Capabilities`、`ExpiresAt`、`IsExpired`、`ToInvitation()`、`ParseInvitation(string)` |
+| `DHTPeer` | `NodeId`、`Endpoints`、`RelayHints`、`Reachability`、`HasEndpointDependentMapping`、`ExternalAddress`、`Capabilities`、`Sequence`、`ExpiresAt`、`IsExpired` |
+| `DHTEndpoint` | `DHTEndpoint(IPAddress, int tcpPort, int udpPort, DHTEndpointFlags)`、`Address`、`TcpPort`、`UdpPort`、`Flags` |
+| `DHTReachability` | `Unknown = 0`、`Public = 1`、`Private = 2` |
+| `DHTEndpointFlags` | `None = 0`、`Verified = 1`、`Local = 2`、`Configured = 4` |
 | `DHTKey` | `DHTKey(string publisherId, string name)`、`Parse(string)`、`IsValid`、`PublisherId`、`Name`、`RoutingId`、相等比较与哈希 |
 | `DHTRecord` | `Key`、`FileHash`、`MerkleRoot`、`Length`、`BlockSize`、`BlockCount`、`Revision`、`ExpiresAt`、`IsExpired`、`EncodedLength`、`CopyTo(Span<byte>)`、`ToBytes()`、`Parse(ReadOnlySpan<byte>)` |
 | `IDHTContentStore` | `PutAsync(string blockHash, ReadOnlyMemory<byte>, CancellationToken)`、`GetAsync(string blockHash, CancellationToken)` |
@@ -194,7 +203,7 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 ## 身份、密钥与完整性
 
 `DHTIdentity` 持有一个 32 字节的秘密种子。用先前保存的 `ExportSeed()` 构造它，即可在重启后
-保留节点 ID 与发布者命名空间。调用方必须借助应用自身的存储层安全持久化这个秘密。公开邀请
+保留节点 ID 与发布者命名空间。调用方必须借助应用自身的存储层安全持久化这个秘密。签名联系人
 只包含公开材料。
 
 规范化密钥的形式是 `发布者-sha256-指纹:区分大小写的名称`。名称非空、最多 256 个严格 UTF-8
@@ -235,12 +244,12 @@ Ed25519 签名覆盖信封转录与明文。接收方的签名联系人会把其
 本设计面向长期接收方密钥加密，**不提供**针对身份种子日后泄露的完全前向保密。发送方使用
 全新的临时密钥也不会改变这一性质。本实现尚未经过独立的密码学审计。
 
-当直连失败时，节点首先请求已知的、声明 `Relay` 的节点为它引入一条 TCP 或 UDP 直连路径。
-如果穿透无法建立路径，则尝试既有的不透明中继操作。中继会收到一个单独加密的外层 RPC，其中
+当直连失败时，节点首先使用目标签名联系人中的中继提示，然后请求其他已知的、声明 `Relay`
+的节点为它引入一条 TCP 或 UDP 直连路径。如果穿透无法建立路径，则尝试既有的不透明中继操作。中继会收到一个单独加密的外层 RPC，其中
 包含目标 ID 与一个不透明的内层信封。它原样转发内层信封并返回不透明响应。只有最初的下载方
 与提供者能打开文件请求与数据块响应；中继可以观测端点、包大小、时序以及可见的操作编号。损坏
-的中继响应会被拒绝，并可尝试其他已知中继。中继只会转发给已经认证过的已知节点，并拒绝显式
-嵌套的中继包。恶意参与者仍然可以建立多个独立连接；这不是匿名路由，也不防御 Sybil/eclipse
+的中继响应会被拒绝，并可尝试其他已知中继。中继只会转发给已经认证过的已知节点，或在本中继
+持有有效会合登记的节点，并拒绝显式嵌套的中继包。恶意参与者仍然可以建立多个独立连接；这不是匿名路由，也不防御 Sybil/eclipse
 攻击。
 
 需要应用自行管理续传或指定中继时，请使用底层的、经过校验的数据块 API：
@@ -255,22 +264,29 @@ var block = await downloader.ReadBlockAsync(record, provider.LocalPeer, 0,
 
 ## 引导与发现
 
-每个运行中的节点都会导出一份引导邀请。不存在特权引导角色、中心目录或内置硬编码服务器。
-引导只负责引入已知联系人，随后由有界的迭代 XOR 距离查找发现更多节点。离线节点可以在本地
-发布；等有节点可用后，`AnnounceAsync` 或自动维护会复制其记录。即使没有任何远端副本接受，
-发布也会返回签名记录，并通过可选日志上报一条警告。`AnnounceAsync` 返回远端副本数量。
+任何运行中的节点都可以充当引导节点。不存在特权引导角色、中心目录或内置硬编码服务器。把已知
+节点的端点列在 `DHTNodeOptions.BootstrapEndpoints` 中：`StartAsync` 会在后台联系它们，
+路由表为空时维护流程会重试，`BootstrapAsync` 则显式联系它们并返回作出应答的端点数量。每个
+端点对一个签名的 Hello 请求作出应答，返回自己的签名联系人以及它观测到的调用方端点。引导只负责
+引入已知联系人，随后由有界的迭代 XOR 距离查找发现更多节点。离线节点可以在本地发布；等有节点
+可用后，`AnnounceAsync` 或自动维护会复制其记录。即使没有任何远端副本接受，发布也会返回签名
+记录，并通过可选日志上报一条警告。`AnnounceAsync` 返回远端副本数量。
 
-引导邀请在一天后过期。维护流程会刷新运行中节点的签名联系人；需要时重新分发新的
-`LocalPeer.ToInvitation()`。邀请本身是自认证的，但如果应用需要某个特定的引导身份，仍需
-在带外信任其初始来源。声明 `Relay` 能力的节点还会提供可认证的会合协助。
+端点并不标识某个节点：在配置的端点上作出应答的任何一方都会成为第一个联系人。请只从可信来源
+配置引导端点。声明 `Relay` 能力的节点还会提供可认证的会合协助与可达性检查。
 
-在局域网或互联网中使用时，请选择合适的监听接口，并把 `AdvertisedAddress` 设为其他节点
-可达的 IP 地址。通配监听器必须显式指定同一地址族的广播地址。支持 IPv4 与 IPv6 监听器、
-任意 TCP/UDP 端口、相同或不同的 TCP/UDP 端口号。TCP 与 UDP 监听器可以独立启用。出站请求
-会先尝试首选的通告传输，然后尝试另一种传输。
+`ListenAddresses` 接受一个地址，或者一个 IPv4 地址加一个 IPv6 地址，以便在相同的配置端口上
+双栈监听；允许使用通配地址。支持任意 TCP/UDP 端口、相同或不同的 TCP/UDP 端口号，TCP 与
+UDP 监听器也可以独立启用。签名联系人最多通告四个端点：
 
-主机名、外部 STUN 服务器、UPnP 与路由器端口配置不在本库范围内。签名联系人保留配置的
-通告地址；观测到的 NAT 端点会作为可认证的直连路由单独保留。
+- `AdvertisedAddresses` 中的每一项，标记为 `Configured`，用于固定公网地址或应用配置的
+  路由器端口映射；
+- 否则为每个具体（非通配）的监听地址，回环、私有、运营商级 NAT 或链路本地地址会标记为
+  `Local`；
+- 经独立回拨验证后的外部端点，标记为 `Verified`。
+
+出站请求先尝试已配置或已验证的端点，再尝试未验证端点与本地端点；每个端点都先用首选传输，再用
+另一种传输。主机名、外部 STUN 服务器与 UPnP 不在本库范围内。
 
 ## TCP、UDP 与 NAT 穿透
 
@@ -300,6 +316,29 @@ var connected = await downloader.TryPunchAsync(provider.LocalPeer, relayPeer,
 以及路由器策略都可能阻止直连。当中继可以到达目标时，不透明转发依然可用。它会复用仍然有效的
 已认证登记，包括在签名联系人通告私有端点时复用现有 TCP 会话或观测到的 UDP 映射。如果引入的
 探测成功但随后的 RPC 失败，请求方仍会尝试同一中继的不透明转发路径。
+
+### 家宽网络中的可达性
+
+家用路由器之后的节点通常没有固定、可达的地址。此时请保持 `AdvertisedAddresses` 为空，并保持
+`EnableNatTraversal` 开启，节点会自行判定可达性：
+
+1. **外部地址。** 中继登记与 Hello 响应会报告每个远端节点观测到的端点。若至少两个处于不同
+   网络（IPv4 /24 或 IPv6 /48 前缀不同）的中继报告同一地址，它就成为已确认的
+   `ExternalAddress`。若中继为该地址观测到不同端口，联系人会置位
+   `HasEndpointDependentMapping`，请求方随之跳过打洞。外部地址变化（例如 PPPoE 重拨）会开启
+   新纪元，丢弃之前的验证结果并重新检查可达性。
+2. **回拨探测。** 每次新建中继登记以及每隔 `ReachabilityCheckInterval`，节点都会请求其中继
+   安排一次回拨。中继把回拨委托给另一网络中的独立公网协助者，协助者只探测中继观测到的地址。
+   探测被接受后，联系人会增加一个 `Verified` 端点并成为 `Public`。
+3. **私有联系人。** 当经由两个不同网络中继的回拨都超时，联系人成为 `Private`：它去掉不可达
+   的端点，并把最多三个持有有效登记的公网中继嵌入为 `RelayHints`。请求方跳过它的端点（只有
+   双方外部地址相同时才尝试本地端点），并经提示中继访问它；若请求方已在该中继登记，会先尝试
+   打洞。
+
+私有节点以 DHT 客户端身份参与网络：它可以查找、下载与提供内容，但不会被加入路由表，也不会
+作为查找跳点返回。联系人变化会立即重新签名，本地发布会在五秒后重新宣告，使提供者索引持有新
+联系人。私有与未验证联系人的租约为一小时，公网联系人为一天。每个协助者每分钟最多接受同一中继
+的十次委托，并最多向同一目标地址回拨四次。
 
 ## 存储、配额与生命周期
 
@@ -386,7 +425,10 @@ UDP 在处理请求前必须先通过无状态源地址 Cookie 校验。固定 6
 - 中继会隐藏载荷，但能观测端点、大小、时序与操作编号。这不是匿名路由，也不抵御 Sybil 或
   eclipse 攻击。
 - 提供者通告只是提示；只有签名记录、Merkle 证明与完整文件哈希具有权威性。
-- 应用必须在带外认证密钥、发布者指纹与引导联系人，并安全持久化身份种子与修订号。
+- 应用必须在带外认证密钥与发布者指纹，只从可信来源配置引导端点，并安全持久化身份种子与
+  修订号。Hello 请求有签名但不加密。
+- 可达性证据依赖独立的中继与协助者；串通的中继可以让节点看起来是私有的，这会降低效率，但
+  不影响完整性。
 - 超出租约的新鲜度由应用负责；当内容必须永不变更时，请固定完整文件哈希。
 
 ## 测试与验证
@@ -400,8 +442,8 @@ dotnet test src/MajDHTNetwork.Tests/MajDHTNetwork.Tests.csproj --configuration R
 ```
 
 覆盖范围包括：协议测试向量与畸形输入、已认证信封与身份冒充、Merkle 几何、三节点发现与下载、
-中继回退、双传输与 IPv6 传输、UDP 丢包/重放、NAT 登记与打洞、配额与生命周期限制，以及热身
-分配预算。
+中继回退、双传输、IPv6 与双栈传输、端点引导、UDP 丢包/重放、NAT 登记与打洞、外部地址投票、
+回拨探测与经中继提示访问的私有节点、配额与生命周期限制，以及热身分配预算。
 
 .NET Standard 只是 API 目标，并不代表已经成功集成 Unity、Mono、IL2CPP、Player、移动端、
 NAT、WAN 或硬件。上述宿主与网络条件在部署前需要各自进行验证。

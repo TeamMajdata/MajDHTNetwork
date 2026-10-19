@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using MajDHTNetwork.Protocol;
 using Org.BouncyCastle.Crypto.Parameters;
 
@@ -15,6 +16,8 @@ namespace MajDHTNetwork
         private readonly Ed25519PrivateKeyParameters _signingKey;
         /// <summary>The signing public key.</summary>
         private readonly byte[] _publicKey;
+        /// <summary>The last contact sequence issued by this process for this identity.</summary>
+        private long _lastSequence;
         /// <summary>The agreement private key.</summary>
         internal X25519PrivateKeyParameters Agreement { get; }
         /// <summary>Gets the SHA-256 signing-key fingerprint used as the node identifier.</summary>
@@ -64,6 +67,21 @@ namespace MajDHTNetwork
         internal byte[] Sign(ReadOnlyMemory<byte> bytes)
         {
             return Crypto.Sign(_signingKey, bytes);
+        }
+
+        /// <summary>Issues a strictly increasing contact sequence based on the current Unix time in milliseconds.</summary>
+        /// <returns>A sequence larger than every sequence previously issued for this instance.</returns>
+        internal long NextSequence()
+        {
+            while (true)
+            {
+                var last = Interlocked.Read(ref _lastSequence);
+                var next = Math.Max(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), last + 1);
+                if (Interlocked.CompareExchange(ref _lastSequence, next, last) == last)
+                {
+                    return next;
+                }
+            }
         }
     }
 }

@@ -25,16 +25,36 @@ Payload fields, in order:
 | Domain | string `MajDHT/1/contact` |
 | Signing key | bytes, exactly 32 |
 | Agreement key | bytes, exactly 32 |
-| Advertised address | canonical .NET IPAddress string, max 96 UTF-8 bytes |
-| TCP port | integer 0..65535; zero disables the listener |
-| UDP port | integer 0..65535; at least one listener must be nonzero |
 | Capabilities | byte flags: Download=1, Provide=2, Relay=4 |
+| Reachability | byte: bits 0–1 state (0 Unknown, 1 Public, 2 Private; 3 is rejected), bit 2 endpoint-dependent mapping, other bits zero |
+| Sequence | integer, the owner's issue time in Unix **milliseconds**, strictly increasing per identity |
 | Expiry | Unix seconds, future and at most two days ahead at validation |
+| External address | canonical IP string, max 96 UTF-8 bytes, or empty when unconfirmed |
+| Endpoint count | integer 0..4, followed by that many endpoints |
+| Relay hint count | integer 0..3, followed by that many byte arrays of at most 1,024 bytes, each a signed contact |
 
-The implementation issues one-day contacts. Public invitations are the literal
-prefix `majdht1:` followed by standard padded base64 of the signed contact.
-Wildcards, IPv6 multicast and IPv4 all-ones broadcast are rejected. The declared
-address is signed but does not itself prove network ownership.
+Each endpoint is a canonical IP string (max 96 UTF-8 bytes), an integer TCP port
+(0..65535, zero means no TCP), an integer UDP port (0..65535, zero means no UDP)
+and a flag byte: Verified=1 (reached by an independent dial-back in the current
+external-address epoch), Local=2 (reachable only inside the owner's local
+network), Configured=4 (configured by the application). At least one port is
+nonzero, Verified and Local are exclusive, unknown flag bits are rejected and an
+address appears at most once. Wildcards, multicast and IPv4 broadcast are
+rejected. Declared addresses are signed but do not prove network ownership.
+
+The signed payload is at most 2,048 bytes and an encoded contact at most 2,200
+bytes. Reachability constraints:
+
+- **Public** requires at least one Verified or Configured endpoint.
+- **Private** requires at least one relay hint and only Local endpoints.
+- **Unknown** permits any endpoints and hints, including none (a client-only node).
+
+Each relay hint must be a valid unexpired contact advertising Relay with Public
+reachability and no relay hints of its own; hints are distinct and differ from
+the owner. The owner's expiry must not exceed any hint's expiry. Receivers
+replace a stored contact only with a higher sequence. The implementation issues
+one-day leases for Public contacts and one-hour leases otherwise, re-signing
+immediately whenever the advertisement changes.
 
 ## Key and signed manifest
 
@@ -75,7 +95,7 @@ The outer envelope is `bytes(header), bytes(ciphertextWith16ByteTag)`.
 The header is the following canonical sequence:
 
 1. string `MajDHT/1/envelope`.
-2. One operation byte: Ping=1, Find=2, Store=3, Block=4, Relay=5. Set bit 7 for a response.
+2. One operation byte: Ping=1, Find=2, Store=3, Block=4, Relay=5, Rendezvous=6, Punch=7, Hello=8, Probe=9. Set bit 7 for a response.
 3. Final recipient node-ID string.
 4. Fresh ephemeral X25519 public key, exactly 32 bytes.
 5. Fresh random nonce, exactly 12 bytes.
@@ -102,6 +122,13 @@ operation with response bit set. A response operation body always contains
 rejection without private error details. Successful result bytes are described
 below. Requests do not include this response status wrapper.
 
+A Hello request (operation 8 without the response bit) is the only exception:
+its sender does not yet know the recipient, so the header names 64 `0`
+characters as recipient and 32 zero bytes as ephemeral key, and the second outer
+field carries `bytes(message), bytes(signature)` in plaintext. The receiver
+verifies the signature as usual and seals its Hello response normally to the
+sender's contact.
+
 Fresh sender ephemeral keys do not provide full forward secrecy: possession of
 a recipient's static identity seed permits deriving its historical agreement
 key. Socket connections are disposable; protocol security does not depend on a
@@ -116,11 +143,15 @@ long-lived TCP session.
 | Store (3) | bytes signed record | empty |
 | Block (4) | bytes signed record, integer block index | bytes raw block, integer proof count, proof-count byte arrays |
 | Relay (5) | string destination node ID, bytes opaque envelope | bytes opaque response envelope |
-| Rendezvous (6) | byte action, optional string target node ID | observed endpoint and optional introduction, or target introduction |
+| Rendezvous (6) | byte action, action-specific fields | see assisted NAT traversal |
 | Punch (7) | raw 16-byte introduction ticket | empty |
+| Hello (8) | empty | string observed source address, integer observed source port |
+| Probe (9) | bytes 16-byte dial-back nonce, integer candidate-port index | empty |
 
 A contact list is an integer count (0..16), followed by that many signed-contact
-byte arrays. Each contact is independently verified. Find mode 0 searches nodes
+byte arrays. Each contact is independently verified. A responder writes at most
+26,000 bytes of contacts per list, so a Find response stays below the envelope
+limit even when contacts carry relay hints. Find mode 0 searches nodes
 near an identifier; mode 1 resolves a canonical key; mode 2 finds providers near
 a complete-file hash. Find includes a record only for mode 1 and only for the
 exact requested key. Mode 1 returns providers for the returned record; mode 2
@@ -137,10 +168,15 @@ server reauthenticates stored bytes before responding. A receiver verifies a
 proof against its original signed record, not server-supplied replacement
 metadata.
 
-Relay requires the server's Relay flag and an already authenticated known
-destination. It verifies that the visible inner header matches the destination,
-has no response bit, and uses Ping, Find, Store or Block. Relay, Rendezvous and
-Punch control requests cannot be forwarded. It forwards unchanged
+Hello lets a node learn the signed contact listening at a configured bootstrap
+endpoint. The response also reports the requester's observed source endpoint,
+which feeds the external-address vote.
+
+Relay requires the server's Relay flag and a destination that is either an
+already authenticated routed peer or a node holding a live rendezvous
+registration with the relay. It verifies that the visible inner header matches
+the destination, has no response bit, and uses Ping, Find, Store or Block.
+Relay, Rendezvous, Punch, Hello and Probe requests cannot be forwarded. It forwards unchanged
 ciphertext without opening the inner envelope. The inner response is opened and
 authenticated only by the original requester. A relay can reuse an unexpired
 source endpoint from the destination's authenticated rendezvous registration,
@@ -183,6 +219,58 @@ registrations and completed expired tickets are reclaimed during negotiation.
 Direct routes expire after five minutes or the signed peer lease, whichever
 comes first. A failed direct route is removed and normal route selection resumes.
 
+## Reachability and dial-back
+
+A node records every endpoint observed for it by an authenticated Rendezvous or
+Hello response for ten minutes. An address reported by observers in at least two
+distinct networks (IPv4 /24 or IPv6 /48 prefixes; loopback addresses compare
+exactly) becomes the confirmed external address of its family. Different
+observed ports for that address on one transport set the endpoint-dependent
+mapping bit. A change of a confirmed external address starts a new epoch, which
+discards that family's Verified endpoint and all recorded dial-back failures.
+
+Rendezvous action 2 asks the relay for a dial-back:
+`byte(2), integer(portCount 0..2), integer(port) × portCount`. The candidate
+ports are the observed source port followed by the requested ports, deduplicated,
+at most three. The dial-back address is always the observed source address. The
+relay selects a helper: an authenticated routed peer advertising Relay with
+Public reachability and a Verified or Configured endpoint for the transport and
+address family whose address is in a network distinct from the requester and the
+relay. It generates a random 16-byte nonce and an expiry no later than its
+traversal budget, and sends the helper Rendezvous action 3:
+`byte(3), bytes(requesterContact), byte(transport: 0 TCP, 1 UDP),
+string(targetAddress), integer(portCount 1..3), integer(port) × portCount,
+bytes(nonce), integer(expiryUnixMilliseconds)`. The relay tries at most three
+helpers. Once one accepts, it answers the requester with the observed endpoint,
+`string(helperNodeId), bytes(nonce), integer(expiryUnixMilliseconds),
+integer(portCount), integer(port) × portCount`; otherwise it rejects.
+
+A helper accepts action 3 only from a Relay-capable sender, rejects expired or
+distant expiries, link-local targets and loopback/private targets outside the
+scopes of its own listeners, and allows each relay ten delegations and each
+target address four dial-backs per minute. It answers immediately and then sends
+Probe requests, sealed to the requester's contact, from its own address to each
+candidate port until one is accepted or the expiry passes. TCP probes open new
+connections; UDP probes use the ordinary cookie exchange.
+
+The requester accepts a Probe only for a pending nonce whose helper identity,
+transport and port index match and whose expiry has not passed; the probed port
+becomes a Verified endpoint at the observed address, making the contact Public.
+A dial-back that times out records a failure for the relay's network. Without a
+Verified or Configured endpoint, failures from two distinct relay networks make
+the contact Private when at least one public relay with a live registration can
+be listed as a hint. Checks run after each new relay registration, after an epoch
+change and every `ReachabilityCheckInterval`. A relay rejection, such as no
+available helper, is inconclusive and is not a failure.
+
+A requester tries a contact's endpoints in the order Verified/Configured,
+unverified, Local, each with the preferred and then the other transport. It tries
+a Private contact's Local endpoints only when both share a confirmed external
+address. After direct failure it tries each relay hint, punching first only when
+it already holds a registration with that relay and the destination's mapping is
+not endpoint-dependent, and otherwise forwarding opaquely. Other known relays are
+tried afterwards.
+
 ## TCP
 
 Connections retain a stream of framed encrypted requests and responses. Prefix
@@ -199,8 +287,9 @@ sessions are bounded by MaxConcurrentRequests and expire after an idle period
 of at least 30 seconds or four request timeouts. Request cancellation closes
 its session so a delayed response cannot satisfy the next outbound request.
 
-The listener and outgoing sockets enable endpoint reuse and use the same bound
-source address and port. Successful punched sessions remain available for
+A dual-stack node binds one IPv6-only listener and one IPv4 listener on the same
+configured port numbers. The listener and outgoing sockets of an address family
+enable endpoint reuse and use the same bound source address and port. Successful punched sessions remain available for
 subsequent RPCs and file blocks. Platforms and middleboxes can reject reuse or
 simultaneous open; failure permits another transport or relay route.
 
@@ -233,9 +322,9 @@ Every retry retains the same bound UDP socket, sealed application request and
 request ID. Defaults: three attempts and a five-second timeout per attempt.
 Punching uses shorter retries within one request budget. Losing a response
 retransmits the cookie-bearing request and receives cached identical encrypted
-response bytes. Ordinary outbound UDP can allocate one shared socket when the
-UDP listener is disabled, but that socket cannot receive incoming requests or
-support UDP punching.
+response bytes. Each address family uses its own UDP socket. Ordinary outbound
+UDP can allocate one shared socket per address family without a UDP listener,
+but that socket cannot receive incoming requests or support UDP punching.
 
 The stateless cookie is HMAC-SHA256 with a per-running-node random 32-byte secret
 over the canonical sequence `bytes(sourceAddress.GetAddressBytes()),
@@ -259,7 +348,10 @@ Use 256 XOR-distance buckets indexed by the most significant set bit of
 `localNodeId XOR remoteNodeId`. Each bucket retains at most k live contacts
 (default k=8), ordered by recent authenticated observation. A full live bucket
 is retained; unsuccessful queries remove failed peers. Referrals are verified
-but admitted to routing buckets only after an authenticated exchange.
+but admitted to routing buckets only after an authenticated exchange. A higher
+contact sequence replaces the stored contact. Private contacts are never
+admitted and remove any earlier contact of the same node, so private nodes
+never appear as lookup referrals; they remain eligible as providers.
 
 Iterative lookups query the nearest unvisited k-set with alpha parallelism
 (default 3). Merge closer referrals, remove failed candidates, and terminate
@@ -269,9 +361,11 @@ records are replicated near both key routing IDs and file hashes. A node can
 serve Find and Store independently of its download/provide/relay roles, so any
 node can bootstrap a new participant.
 
-Maintenance refreshes contact signatures, prunes expired index entries, looks
-up the local node ID, and reannounces local content records. It does not extend
-publisher-signed record expiry. This v1 implementation does not perform
-per-bucket random refresh, live-bucket eviction probing or persistent routing
-storage; use multiple independently trusted bootstrap contacts when resilience
-to partitions or hostile peers is required.
+Maintenance refreshes contact signatures, prunes expired index entries, retries
+the configured bootstrap endpoints while the routing table is empty, schedules
+reachability checks, looks up the local node ID, and reannounces local content
+records. A changed advertisement triggers an extra reannouncement after five
+seconds. Maintenance does not extend publisher-signed record expiry. This v1
+implementation does not perform per-bucket random refresh, live-bucket eviction
+probing or persistent routing storage; use multiple independently trusted
+bootstrap endpoints when resilience to partitions or hostile peers is required.

@@ -119,7 +119,7 @@ namespace MajDHTNetwork.Tests
             await using var honest = new MajDHTNode(Options(DHTTransport.Tcp, DHTCapabilities.Provide));
             await using var client = new MajDHTNode(Options(DHTTransport.Tcp, DHTCapabilities.Download));
             await Task.WhenAll(honest.StartAsync(token), client.StartAsync(token));
-            await client.BootstrapAsync(honest.LocalPeer, token);
+            await client.JoinAsync(honest.LocalPeer, token);
             var input = Crypto.Random(40000);
             using var source = new MemoryStream(input);
             var record = await honest.PublishAsync("corruption", source, cancellationToken: token);

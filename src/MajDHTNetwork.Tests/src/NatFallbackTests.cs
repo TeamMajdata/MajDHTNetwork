@@ -36,7 +36,7 @@ namespace MajDHTNetwork.Tests
                     {
                         Interlocked.Increment(ref probes);
                     }
-                    else if (source.Port != relay.LocalPeer.UdpPort)
+                    else if (source.Port != relay.LocalPeer.UdpPort())
                     {
                         Interlocked.Increment(ref droppedDirectRequests);
                         return Task.FromException<ReadOnlyMemory<byte>>(new IOException("The simulated direct data path drops this request."));
@@ -63,8 +63,8 @@ namespace MajDHTNetwork.Tests
             providerPeer = DHTPeer.Create(identity, IPAddress.Parse("127.0.0.2"), 0, 1, DHTCapabilities.Provide);
             provider.Run();
             var registration = new Packet(providerPeer, Crypto.Random(16), (byte)Operation.Rendezvous, new byte[] { 0 });
-            var registrationBytes = await provider.ExchangeAtAsync(relay.LocalPeer, DHTTransport.Udp,
-                new IPEndPoint(IPAddress.Loopback, relay.LocalPeer.UdpPort), registration.Seal(identity, relay.LocalPeer), deadline.Token);
+            var registrationBytes = await provider.ExchangeAtAsync(DHTTransport.Udp,
+                new IPEndPoint(IPAddress.Loopback, relay.LocalPeer.UdpPort()), registration.Seal(identity, relay.LocalPeer), deadline.Token);
             var registered = Packet.Open(identity, registrationBytes);
             Assert.Equal(relay.NodeId, registered.Sender.NodeId);
             using (var reply = new Wire(registered.Body))
@@ -76,7 +76,7 @@ namespace MajDHTNetwork.Tests
             await using var client = new MajDHTNode(clientOptions);
             await client.StartAsync(deadline.Token);
             await client.RegisterRelayAsync(relay.LocalPeer, deadline.Token);
-            await client.BootstrapAsync(providerPeer, deadline.Token);
+            await client.JoinAsync(providerPeer, deadline.Token);
             Assert.True(Volatile.Read(ref probes) > 0, "The introduced path must first accept an authenticated probe.");
             Assert.True(Volatile.Read(ref droppedDirectRequests) > 0, "The subsequent ordinary direct RPC must fail.");
             Assert.True(Volatile.Read(ref forwardedRequests) > 0, "The same relay must still forward after the direct failure.");

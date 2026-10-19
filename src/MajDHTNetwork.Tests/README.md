@@ -68,6 +68,8 @@ and requires the DLL, XML documentation, README, protocol document and license.
 | `MajDHTNetwork.Tests.csproj`, `global.json`, `packages.lock.json`, `xunit.runner.json` | Test project, stable SDK selection, locked dependencies and runner parallelism. |
 | `ValidatePackage.ps1`, `ConsumerSmoke/Program.cs` | Isolated NuGet and loose-DLL consumption of distributed artifacts. |
 | `src/ProtocolTests.cs`, `src/UdpCookieTests.cs` | Identity, authenticated envelopes, malformed protocol input and address cookies. |
+| `src/ContactTests.cs`, `src/BootstrapTests.cs` | Contact reachability rules, Hello envelopes, address options, endpoint bootstrap and dual-stack listeners. |
+| `src/ReachabilityTests.cs` | External-address voting, independent dial-back verification and relay-hinted private nodes over distinct loopback hosts. |
 | `src/MemoryTests.cs`, `src/ContentStoreTests.cs` | Span APIs, borrowed/owned memory, immutable snapshots and bounded cache eviction. |
 | `src/RoutingTests.cs`, `src/LoggingTests.cs` | XOR distance ordering, routing removal and structured logging contracts. |
 | `src/MerkleTests.cs`, `src/NetworkTests.cs` | File geometry, signatures, discovery, aliases, relays and malicious-provider recovery. |
@@ -76,7 +78,7 @@ and requires the DLL, XML documentation, README, protocol document and license.
 | `src/NATTests.cs`, `src/NATProtocolPeer.cs`, `src/NatQuotaTests.cs`, `src/NatFallbackTests.cs` | Relay-assisted direct routes, adversarial probes, observed endpoints, registration recovery/quotas and opaque fallback after a successful punch. |
 | `src/ValueTypeTests.cs` | Key/Packet defaults, value semantics, input boundaries, ownership and zero-allocation operations. |
 | `src/AllocationTests.cs`, `src/AllocationCollection.cs` | Original allocation budgets and exclusive measurement scheduling. |
-| `src/SocketFixtures.cs`, `src/ThreeNodeNetwork.cs`, `src/TestSupport.cs`, `src/TestLogger.cs` | Shared real-socket fixtures, cancellation-aware storage, byte checks and diagnostic capture. |
+| `src/SocketFixtures.cs`, `src/ThreeNodeNetwork.cs`, `src/TestSupport.cs`, `src/TestLogger.cs` | Shared real-socket fixtures, cancellation-aware storage, byte checks, first-endpoint contact helpers and diagnostic capture. |
 
 ## Preserved coverage
 
@@ -85,7 +87,18 @@ and requires the DLL, XML documentation, README, protocol document and license.
 - RFC 8032 Ed25519 vectors, nonzero signature offsets, structured logger state,
   severity, private exception redaction, disabled events and provider failures.
 - Seven warmed allocation regressions with the original iteration counts/budgets.
-- Stable identity restoration, defensive seed exports and signed invitations.
+- Stable identity restoration, defensive seed exports and signed contact round trips.
+- Contact reachability rules: private contacts need relay hints and only local
+  endpoints, public contacts need verified or configured endpoints, hints must be
+  public relays without nested hints, and leases never outlive hints.
+- Signed plaintext Hello envelopes, their tamper detection and forwarding refusal;
+  dual-stack, advertised-address and bootstrap-endpoint option validation.
+- Background and explicit endpoint bootstrap over TCP and UDP, missing and
+  unreachable endpoints, and IPv4-only and IPv6-only clients of one dual-stack node.
+- External-address voting by relays on distinct loopback hosts, an independent
+  helper's dial-back verifying a public endpoint over TCP and UDP, and failed
+  dial-backs producing a private contact that never enters routing tables yet
+  serves a verified download through its relay hint.
 - Value-type key equality, hashing, dictionary/set use, safe default values,
   canonical publishers, UTF-8 boundaries and malformed text; Packet copy and
   nullable semantics, constructor validation and borrowed/owned memory contracts.

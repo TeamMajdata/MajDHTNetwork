@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Net;
 using System.Text;
 using System.Threading.Tasks;
 using MajDHTNetwork;
@@ -22,13 +23,15 @@ namespace MajDHTNetwork.Tests.PackageConsumer
                 UdpPort = null,
                 Logger = NullLogger.Instance
             }, identity);
+            await provider.StartAsync().ConfigureAwait(false);
             await using var consumer = new MajDHTNode(new DHTNodeOptions
             {
                 UdpPort = null,
-                Capabilities = DHTCapabilities.Download
+                Capabilities = DHTCapabilities.Download,
+                BootstrapEndpoints = { new IPEndPoint(IPAddress.Loopback, provider.LocalPeer.Endpoints[0].TcpPort) }
             });
-            await Task.WhenAll(provider.StartAsync(), consumer.StartAsync()).ConfigureAwait(false);
-            await consumer.BootstrapAsync(DHTPeer.ParseInvitation(provider.LocalPeer.ToInvitation())).ConfigureAwait(false);
+            await consumer.StartAsync().ConfigureAwait(false);
+            await consumer.BootstrapAsync().ConfigureAwait(false);
             var content = Encoding.UTF8.GetBytes("External package consumer verified content.");
             using var source = new MemoryStream(content);
             var record = await provider.PublishAsync("package-smoke", source).ConfigureAwait(false);

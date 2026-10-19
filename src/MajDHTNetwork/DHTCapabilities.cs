@@ -25,4 +25,29 @@ namespace MajDHTNetwork
         Udp
     }
 
+    /// <summary>Describes how other nodes can reach a signed contact.</summary>
+    public enum DHTReachability
+    {
+        /// <summary>Reachability has not been established; advertised endpoints are tried before relay hints.</summary>
+        Unknown = 0,
+        /// <summary>At least one advertised endpoint was configured or verified by an independent dial-back.</summary>
+        Public = 1,
+        /// <summary>The node is behind a NAT or firewall and is reached through its relay hints.</summary>
+        Private = 2
+    }
+
+    /// <summary>Describes the provenance and scope of one advertised contact endpoint.</summary>
+    [Flags]
+    public enum DHTEndpointFlags
+    {
+        /// <summary>The endpoint is an unverified listener address.</summary>
+        None = 0,
+        /// <summary>An independent node reached this endpoint during the current external-address epoch.</summary>
+        Verified = 1,
+        /// <summary>The endpoint is only reachable inside the owner's local network.</summary>
+        Local = 2,
+        /// <summary>The endpoint was configured by the application, for example after a router port mapping.</summary>
+        Configured = 4
+    }
+
 }

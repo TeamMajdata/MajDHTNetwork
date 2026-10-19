@@ -1,6 +1,7 @@
 #nullable enable
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -30,7 +31,7 @@ namespace MajDHTNetwork.Tests
             options.UdpPort = null;
             options.Capabilities = DHTCapabilities.Download;
             await server.StartAsync(token);
-            Assert.True(server.LocalPeer.TcpPort != 0 && server.LocalPeer.UdpPort != 0, "The node must snapshot options and bind both listeners.");
+            Assert.True(server.LocalPeer.TcpPort() != 0 && server.LocalPeer.UdpPort() != 0, "The node must snapshot options and bind both listeners.");
             await using var client = new MajDHTNode(new DHTNodeOptions
             {
                 RequestTimeout = TimeSpan.FromMilliseconds(350),
@@ -38,8 +39,8 @@ namespace MajDHTNetwork.Tests
                 MaintenanceInterval = TimeSpan.FromSeconds(1)
             });
             await client.StartAsync(token);
-            var fallback = DHTPeer.Create(identity, IPAddress.Loopback, 1, server.LocalPeer.UdpPort, DHTCapabilities.Provide);
-            await client.BootstrapAsync(fallback, token);
+            var fallback = DHTPeer.Create(identity, IPAddress.Loopback, 1, server.LocalPeer.UdpPort(), DHTCapabilities.Provide);
+            await client.JoinAsync(fallback, token);
             Assert.True(client.KnownPeers.Count == 1, "UDP must recover a failed TCP connection.");
             using var source = new MemoryStream(Encoding.UTF8.GetBytes("dual transport"));
             var record = await server.PublishAsync("dual", source, cancellationToken: token);
@@ -60,11 +61,11 @@ namespace MajDHTNetwork.Tests
             using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(90));
             var token = deadline.Token;
             Assert.SkipUnless(Socket.OSSupportsIPv6, "The host does not support IPv6 sockets.");
-            var options = new DHTNodeOptions { ListenAddress = IPAddress.IPv6Loopback, UdpPort = null };
+            var options = new DHTNodeOptions { ListenAddresses = new List<IPAddress> { IPAddress.IPv6Loopback }, UdpPort = null };
             await using var provider = new MajDHTNode(options);
             await using var client = new MajDHTNode(options);
             await Task.WhenAll(provider.StartAsync(token), client.StartAsync(token));
-            await client.BootstrapAsync(provider.LocalPeer, token);
+            await client.JoinAsync(provider.LocalPeer, token);
             using var source = new MemoryStream(Crypto.Random(2049));
             var record = await provider.PublishAsync("ipv6", source, cancellationToken: token);
             using var destination = new MemoryStream();
@@ -82,12 +83,12 @@ namespace MajDHTNetwork.Tests
             var identity = new DHTIdentity();
             await using var server = new MajDHTNode(Options(DHTTransport.Udp, DHTCapabilities.Download), identity);
             await server.StartAsync(token);
-            await using var proxy = new LossyUdpProxy(new IPEndPoint(server.LocalPeer.Address, server.LocalPeer.UdpPort));
+            await using var proxy = new LossyUdpProxy(new IPEndPoint(server.LocalPeer.Address(), server.LocalPeer.UdpPort()));
             var options = Options(DHTTransport.Udp, DHTCapabilities.Download);
             await using var client = new MajDHTNode(options);
             await client.StartAsync(token);
             var invitation = DHTPeer.Create(identity, IPAddress.Loopback, 0, proxy.Port, DHTCapabilities.Download);
-            await client.BootstrapAsync(invitation, token);
+            await client.JoinAsync(invitation, token);
             Assert.True(proxy.Responses >= 2 && proxy.DuplicateReplyMatched, "UDP retry must receive the same cached ciphertext after response loss.");
         }
     }

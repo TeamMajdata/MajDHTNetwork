@@ -44,6 +44,11 @@ The wire protocol is specified in [PROTOCOL.md](PROTOCOL.md)
 - **Relay-assisted traversal.** Peers advertising `Relay` observe real endpoints
   and coordinate TCP/UDP punching; when a direct path is impossible, the same
   relay can forward opaque encrypted envelopes.
+- **Reachability discovery for home networks.** Nodes behind NAT learn their
+  external address from independent relays, verify it with an independent
+  dial-back and otherwise advertise signed relay hints instead of an address.
+- **Dual-stack listeners and endpoint bootstrap.** One node can listen on IPv4 and
+  IPv6 at once and join the network through configured bootstrap endpoints.
 - **Pluggable storage.** Blocks live behind `IDHTContentStore`; the default
   `MemoryDHTContentStore` is a bounded LRU cache, and applications can supply a
   persistent store.
@@ -94,6 +99,7 @@ The application owns the cancellation token, the streams and any persistent
 identity storage. The following is the body of an async method.
 
 ```csharp
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Text;
@@ -101,26 +107,25 @@ using MajDHTNetwork;
 
 #nullable enable
 
-// Bind explicit ports; use 0 for OS-assigned ports, or null to disable a listener.
+// Bind explicit ports on IPv4 and IPv6; use 0 for OS-assigned ports, or null to disable a listener.
 await using var provider = new MajDHTNode(new DHTNodeOptions
 {
-    ListenAddress = IPAddress.Loopback,
+    ListenAddresses = new List<IPAddress> { IPAddress.Loopback, IPAddress.IPv6Loopback },
     TcpPort = 42000,
     UdpPort = 42000,
     Capabilities = DHTCapabilities.Download | DHTCapabilities.Provide | DHTCapabilities.Relay
 });
 await provider.StartAsync(cancellationToken);
 
-// This public invitation contains signed endpoints and public keys, never private keys.
-var invitation = provider.LocalPeer.ToInvitation();
-
+// Join through a known node's endpoint; the node returns its signed contact itself.
 await using var downloader = new MajDHTNode(new DHTNodeOptions
 {
     PreferredTransport = DHTTransport.Udp,
-    Capabilities = DHTCapabilities.Download
+    Capabilities = DHTCapabilities.Download,
+    BootstrapEndpoints = { new IPEndPoint(IPAddress.Loopback, 42000) }
 });
 await downloader.StartAsync(cancellationToken);
-await downloader.BootstrapAsync(DHTPeer.ParseInvitation(invitation), cancellationToken);
+await downloader.BootstrapAsync(cancellationToken);
 
 using var source = new MemoryStream(Encoding.UTF8.GetBytes("verified file content"));
 var record = await provider.PublishAsync("songs/example", source, cancellationToken: cancellationToken);
@@ -142,10 +147,10 @@ node ID and publisher namespace must survive restarts, and implement
 | Member | Purpose |
 | --- | --- |
 | `MajDHTNode(DHTNodeOptions?, DHTIdentity?, IDHTContentStore?)` | Creates a node; every argument is optional and defaults are created internally. |
-| `StartAsync(CancellationToken)` | Binds listeners once; the token is a lifetime token. |
+| `StartAsync(CancellationToken)` | Binds listeners once and starts a background bootstrap when endpoints are configured; the token is a lifetime token. |
 | `StopAsync()`, `DisposeAsync()`, `Dispose()` | Idempotent shutdown; a stopped instance cannot be restarted. |
 | `NodeId`, `LocalPeer`, `KnownPeers` | Local identity fingerprint, local signed contact and the current routing contacts. |
-| `BootstrapAsync(DHTPeer, CancellationToken)` | Introduces a trusted, unexpired contact. |
+| `BootstrapAsync(CancellationToken)` | Contacts every configured bootstrap endpoint and returns how many answered. |
 | `FindNodesAsync(string routingId, CancellationToken)` | Iterative XOR-distance lookup. |
 | `PublishAsync(string, Stream, long revision, CancellationToken)` | Publishes a stream under the local publisher namespace. |
 | `PublishAliasAsync(string, DHTRecord, long revision, CancellationToken)` | Publishes a second name for already published content. |
@@ -162,8 +167,9 @@ node ID and publisher namespace must survive restarts, and implement
 
 | Option | Default |
 | --- | --- |
-| `ListenAddress` | `IPAddress.Loopback` |
-| `AdvertisedAddress` | `null` (use `ListenAddress`; required for a wildcard listener) |
+| `ListenAddresses` | `{ IPAddress.Loopback }` (one or two entries, at most one per address family) |
+| `AdvertisedAddresses` | empty (advertise specific listen addresses and discover reachability; at most four) |
+| `BootstrapEndpoints` | empty (at most sixteen) |
 | `TcpPort`, `UdpPort` | `0` (OS-assigned); `null` disables that listener |
 | `PreferredTransport` | `DHTTransport.Tcp` |
 | `Capabilities` | `Download \| Provide` |
@@ -182,6 +188,7 @@ node ID and publisher namespace must survive restarts, and implement
 | `NatTraversalTimeout` | `5 s` |
 | `NatPollInterval` | `1 s` |
 | `NatRegistrationLifetime` | `30 s` (must cover at least three poll intervals) |
+| `ReachabilityCheckInterval` | `30 min` (1 min–1 day accepted) |
 | `MaxNatRegistrations` | `256` |
 | `MaxNatRelays` | `4` |
 | `Logger` | `NullLogger.Instance` |
@@ -191,7 +198,10 @@ node ID and publisher namespace must survive restarts, and implement
 | Type | Key members |
 | --- | --- |
 | `DHTIdentity` | `DHTIdentity()`, `DHTIdentity(ReadOnlySpan<byte> seed)`, `NodeId`, `PublicKey`, `ExportSeed()`, `ExportSeed(Span<byte>)` |
-| `DHTPeer` | `NodeId`, `Address`, `TcpPort`, `UdpPort`, `Capabilities`, `ExpiresAt`, `IsExpired`, `ToInvitation()`, `ParseInvitation(string)` |
+| `DHTPeer` | `NodeId`, `Endpoints`, `RelayHints`, `Reachability`, `HasEndpointDependentMapping`, `ExternalAddress`, `Capabilities`, `Sequence`, `ExpiresAt`, `IsExpired` |
+| `DHTEndpoint` | `DHTEndpoint(IPAddress, int tcpPort, int udpPort, DHTEndpointFlags)`, `Address`, `TcpPort`, `UdpPort`, `Flags` |
+| `DHTReachability` | `Unknown = 0`, `Public = 1`, `Private = 2` |
+| `DHTEndpointFlags` | `None = 0`, `Verified = 1`, `Local = 2`, `Configured = 4` |
 | `DHTKey` | `DHTKey(string publisherId, string name)`, `Parse(string)`, `IsValid`, `PublisherId`, `Name`, `RoutingId`, equality and hashing |
 | `DHTRecord` | `Key`, `FileHash`, `MerkleRoot`, `Length`, `BlockSize`, `BlockCount`, `Revision`, `ExpiresAt`, `IsExpired`, `EncodedLength`, `CopyTo(Span<byte>)`, `ToBytes()`, `Parse(ReadOnlySpan<byte>)` |
 | `IDHTContentStore` | `PutAsync(string blockHash, ReadOnlyMemory<byte>, CancellationToken)`, `GetAsync(string blockHash, CancellationToken)` |
@@ -204,7 +214,7 @@ node ID and publisher namespace must survive restarts, and implement
 A `DHTIdentity` owns a 32-byte secret seed. Construct it from a previously saved
 `ExportSeed()` to retain the node ID and publisher namespace across restarts. The
 caller must persist this secret securely using the application's storage layer.
-Public invitations contain only public material.
+Signed contacts contain only public material.
 
 A canonical key is `publisher-sha256-fingerprint:case-sensitive-name`. Names are
 nonempty, at most 256 strict UTF-8 bytes, and cannot contain control characters.
@@ -261,16 +271,18 @@ forward secrecy** against later compromise of an identity seed. Fresh ephemeral
 sender keys do not change this property. It has not undergone an independent
 cryptographic audit.
 
-When direct access fails, a node first asks known peers advertising `Relay` to
-introduce a direct TCP or UDP path. If traversal cannot establish a path, it
-attempts the existing opaque relay operation. The relay receives a separately
+When direct access fails, a node first uses the relay hints in the destination's
+signed contact, then asks other known peers advertising `Relay` to introduce a
+direct TCP or UDP path. If traversal cannot establish a path, it attempts the
+existing opaque relay operation. The relay receives a separately
 encrypted outer RPC containing the destination ID and an opaque inner envelope.
 It forwards the inner envelope unchanged and returns the opaque response. Only
 the original downloader and provider can open the file request and block
 response; the relay can observe endpoints, packet sizes, timing and the visible
 operation number. Corrupt relay responses are rejected and other known relays
-can be attempted. A relay only forwards to an already authenticated known peer
-and rejects explicit nested relay packets. A malicious participant can still
+can be attempted. A relay only forwards to an already authenticated known peer or
+to a node holding a live rendezvous registration with it, and rejects explicit
+nested relay packets. A malicious participant can still
 create multiple separate connections; this is not anonymous routing or
 protection against Sybil/eclipse attacks.
 
@@ -288,32 +300,39 @@ another provider after invalid or unavailable blocks.
 
 ## Bootstrap and discovery
 
-Every running node exports a bootstrap invitation. There is no privileged
-bootstrap role, central directory or built-in hardcoded server. A bootstrap
-introduces known contacts and a bounded iterative XOR-distance lookup discovers
-more nodes. An offline node can publish locally; `AnnounceAsync` or automatic
-maintenance replicates its record after peers become available. Publication
-returns a signed record even when no remote replica accepted it; a warning is
-reported through the optional logger. `AnnounceAsync` returns the remote replica
-count.
+Any running node can serve as a bootstrap node. There is no privileged bootstrap
+role, central directory or built-in hardcoded server. List the endpoints of known
+nodes in `DHTNodeOptions.BootstrapEndpoints`; `StartAsync` contacts them in the
+background, maintenance retries them while the routing table is empty, and
+`BootstrapAsync` contacts them explicitly and returns how many answered. Each
+endpoint answers a signed Hello request with its signed contact and the endpoint
+it observed for the caller. A bootstrap introduces known contacts and a bounded
+iterative XOR-distance lookup discovers more nodes. An offline node can publish
+locally; `AnnounceAsync` or automatic maintenance replicates its record after
+peers become available. Publication returns a signed record even when no remote
+replica accepted it; a warning is reported through the optional logger.
+`AnnounceAsync` returns the remote replica count.
 
-Bootstrap invitations expire after one day. Maintenance refreshes the running
-node's signed contact; distribute a fresh `LocalPeer.ToInvitation()` when needed.
-An invitation is self-authenticating, but its initial source still needs to be
-trusted if the application requires a particular bootstrap identity. Peers with
-the `Relay` capability also provide authenticated rendezvous assistance.
+An endpoint does not identify a node: whoever answers at a configured endpoint
+becomes the first contact. Configure bootstrap endpoints only from trusted
+sources. Peers with the `Relay` capability also provide authenticated rendezvous
+assistance and reachability checks.
 
-For LAN or Internet use, choose the listening interface and set
-`AdvertisedAddress` to the IP address reachable by other nodes. A wildcard
-listener requires an explicit advertised address in the same address family.
-IPv4 and IPv6 listeners, arbitrary TCP/UDP ports, equal TCP/UDP port numbers and
-separate TCP/UDP port numbers are supported. TCP and UDP listeners can be enabled
-independently. Outgoing requests try the preferred advertised transport and then
-the alternative.
+`ListenAddresses` takes one address, or one IPv4 and one IPv6 address for
+dual-stack listeners on the same configured ports; wildcard addresses are
+allowed. Arbitrary TCP/UDP ports, equal or separate TCP/UDP port numbers, and
+independently enabled TCP and UDP listeners are supported. A signed contact
+advertises up to four endpoints:
 
-Host names, external STUN servers, UPnP and router port configuration are outside
-this library. Signed contacts keep the configured advertised address; observed
-NAT endpoints are retained separately as authenticated direct routes.
+- every `AdvertisedAddresses` entry, flagged `Configured`, for a fixed public
+  address or a router port mapping configured by the application;
+- otherwise every specific (non-wildcard) listen address, flagged `Local` when
+  it is a loopback, private, carrier-grade NAT or link-local address;
+- an external endpoint flagged `Verified` after an independent dial-back.
+
+Outgoing requests try configured or verified endpoints first, then unverified
+and local endpoints, each with the preferred transport and then the alternative.
+Host names, external STUN servers and UPnP are outside this library.
 
 ## TCP, UDP and NAT traversal
 
@@ -355,6 +374,39 @@ reach the destination. It reuses live authenticated registrations, including the
 existing TCP session or observed UDP mapping when the signed contact advertises a
 private endpoint. If an introduced probe succeeds but the following RPC fails,
 the requester still tries that same relay's opaque forwarding path.
+
+### Reachability on home networks
+
+A node behind a home router usually has no fixed reachable address. Leave
+`AdvertisedAddresses` empty and keep `EnableNatTraversal` enabled; the node then
+determines its reachability itself:
+
+1. **External address.** Relay registrations and Hello responses report the
+   endpoint each remote node observed. An address reported by relays in at least
+   two distinct networks (different IPv4 /24 or IPv6 /48 prefixes) becomes the
+   confirmed `ExternalAddress`. When relays report different ports for it, the
+   contact sets `HasEndpointDependentMapping` and requesters skip hole punching.
+   A changed external address, for example after a PPPoE redial, starts a new
+   epoch that discards earlier verification and checks reachability again.
+2. **Dial-back.** After each new relay registration and every
+   `ReachabilityCheckInterval`, the node asks its relays to arrange a dial-back.
+   The relay delegates it to an independent public helper in another network,
+   which probes only the address the relay observed. An accepted probe adds a
+   `Verified` endpoint and makes the contact `Public`.
+3. **Private contacts.** When dial-backs through relays in two distinct networks
+   time out, the contact becomes `Private`: it drops unreachable endpoints and
+   embeds up to three public relays with live registrations as `RelayHints`.
+   Requesters skip its endpoints (local endpoints are only tried behind the same
+   external address) and reach it through a hinted relay, punching first when
+   they already hold a registration with that relay.
+
+Private nodes act as DHT clients: they search, download and provide content,
+but are never added to routing tables or returned as lookup hops. A contact
+change is re-signed immediately and local publications are reannounced five
+seconds later so provider indexes hold the new contact. Private and unverified
+contacts use a one-hour lease; public contacts use one day. A helper accepts at
+most ten delegations per relay and four dial-backs per target address each
+minute.
 
 ## Storage, quotas and lifecycle
 
@@ -472,8 +524,11 @@ are allocation regressions rather than throughput or cross-runtime claims.
   This is not anonymous routing and does not resist Sybil or eclipse attacks.
 - Provider advertisements are hints; only signed records, Merkle proofs and the
   complete-file hash are authoritative.
-- Applications must authenticate keys, publisher fingerprints and bootstrap
-  contacts out of band, and must persist identity seeds and revisions securely.
+- Applications must authenticate keys and publisher fingerprints out of band,
+  configure bootstrap endpoints only from trusted sources, and persist identity
+  seeds and revisions securely. A Hello request is signed but not encrypted.
+- Reachability evidence relies on independent relays and helpers; colluding relays
+  can make a node look private, which reduces efficiency but not integrity.
 - Freshness beyond a lease is the application's responsibility; pin a complete-file
   hash when content must never change.
 
@@ -490,8 +545,10 @@ dotnet test src/MajDHTNetwork.Tests/MajDHTNetwork.Tests.csproj --configuration R
 
 Coverage includes protocol vectors and malformed input, authenticated envelopes
 and impersonation, Merkle geometry, three-node discovery and downloads, relay
-fallback, dual-transport and IPv6 transfers, UDP loss/replay, NAT registration and
-punching, quota and lifecycle limits, and warmed allocation budgets.
+fallback, dual-transport, IPv6 and dual-stack transfers, endpoint bootstrap, UDP
+loss/replay, NAT registration and punching, external-address voting, dial-back
+and relay-hinted private nodes, quota and lifecycle limits, and warmed allocation
+budgets.
 
 .NET Standard is an API target, not evidence of successful Unity, Mono, IL2CPP,
 Player, mobile, NAT, WAN or hardware integration. Those hosts and network

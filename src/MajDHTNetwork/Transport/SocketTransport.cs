@@ -36,8 +36,6 @@ namespace MajDHTNetwork.Transport
         private readonly SemaphoreSlim _slots;
         /// <summary>The outgoing exchange and pending-state limiter.</summary>
         private readonly SemaphoreSlim _outgoingSlots;
-        /// <summary>Serializes sends on the shared UDP socket.</summary>
-        private readonly SemaphoreSlim _udpSend = new SemaphoreSlim(1, 1);
         /// <summary>The live handlers, exchanges and session loops.</summary>
         private readonly ConcurrentDictionary<long, Task> _requests = new ConcurrentDictionary<long, Task>();
         /// <summary>The bounded pending UDP exchanges indexed by pinned endpoint and request digest.</summary>
@@ -50,34 +48,32 @@ namespace MajDHTNetwork.Transport
         private readonly Dictionary<long, TcpSession> _sessions = new Dictionary<long, TcpSession>();
         /// <summary>The preferred live session for each exact remote endpoint.</summary>
         private readonly Dictionary<IPEndPoint, TcpSession> _sessionsByEndpoint = new Dictionary<IPEndPoint, TcpSession>();
-        /// <summary>The TCP acceptor when enabled.</summary>
-        private TcpListener? _tcp;
-        /// <summary>The immutable bound TCP address and port.</summary>
-        private IPEndPoint? _tcpEndpoint;
-        /// <summary>The single UDP socket, including an outbound-only fallback if needed.</summary>
-        private UdpClient? _udp;
-        /// <summary>The immutable bound UDP address and port.</summary>
-        private IPEndPoint? _udpEndpoint;
-        /// <summary>The accept loop task.</summary>
-        private Task _tcpLoop = Task.CompletedTask;
-        /// <summary>The datagram loop task.</summary>
-        private Task _udpLoop = Task.CompletedTask;
+        /// <summary>The TCP acceptors, at most one per address family.</summary>
+        private readonly List<TcpListener> _tcpListeners = new List<TcpListener>();
+        /// <summary>The immutable bound TCP endpoints indexed by address family.</summary>
+        private readonly ConcurrentDictionary<AddressFamily, IPEndPoint> _tcpEndpoints = new ConcurrentDictionary<AddressFamily, IPEndPoint>();
+        /// <summary>The UDP sockets indexed by address family, including outbound-only fallbacks.</summary>
+        private readonly ConcurrentDictionary<AddressFamily, UdpChannel> _udpChannels = new ConcurrentDictionary<AddressFamily, UdpChannel>();
+        /// <summary>The accept loop tasks.</summary>
+        private readonly List<Task> _tcpLoops = new List<Task>();
+        /// <summary>The address family of the first configured listener.</summary>
+        private readonly AddressFamily _primaryFamily;
         /// <summary>The request and session sequence.</summary>
         private long _sequence;
         /// <summary>Whether listener binding completed.</summary>
         private bool _bound;
         /// <summary>Whether new inbound UDP requests may be dispatched.</summary>
         private bool _acceptUdpRequests;
-        /// <summary>Whether the UDP receive loop has started.</summary>
+        /// <summary>Whether the UDP receive loops may start.</summary>
         private bool _udpRunning;
-        /// <summary>Whether the TCP accept loop has started.</summary>
+        /// <summary>Whether the TCP accept loops have started.</summary>
         private bool _tcpRunning;
         /// <summary>The idempotent stop marker.</summary>
         private int _stopped;
-        /// <summary>Gets the assigned TCP listener port or zero.</summary>
-        internal int TcpPort => _tcpEndpoint?.Port ?? 0;
-        /// <summary>Gets the assigned UDP listener port, excluding the outbound-only fallback.</summary>
-        internal int UdpPort => _bound && _options.UdpPort.HasValue ? _udpEndpoint?.Port ?? 0 : 0;
+        /// <summary>Gets the assigned TCP listener port of the first configured address family, or zero.</summary>
+        internal int TcpPort => TcpPortFor(_primaryFamily);
+        /// <summary>Gets the assigned UDP listener port of the first configured address family, excluding outbound-only sockets.</summary>
+        internal int UdpPort => UdpPortFor(_primaryFamily);
 
         /// <summary>Creates an unbound transport that exposes observed endpoints to its handler.</summary>
         /// <param name="options">The validated options.</param>
@@ -95,6 +91,7 @@ namespace MajDHTNetwork.Transport
             _responseClassifier = responseClassifier;
             _slots = new SemaphoreSlim(options.MaxConcurrentRequests, options.MaxConcurrentRequests);
             _outgoingSlots = new SemaphoreSlim(options.MaxConcurrentRequests, options.MaxConcurrentRequests);
+            _primaryFamily = options.ListenAddresses[0].AddressFamily;
         }
 
         /// <summary>Creates a transport for legacy handlers that do not consume endpoint metadata.</summary>
@@ -107,7 +104,32 @@ namespace MajDHTNetwork.Transport
         {
         }
 
-        /// <summary>Binds requested listeners with reusable TCP source ports.</summary>
+        /// <summary>Gets the assigned TCP listener port for an address family.</summary>
+        /// <param name="family">The address family.</param>
+        /// <returns>The bound port, or zero when no TCP listener exists for the family.</returns>
+        internal int TcpPortFor(AddressFamily family)
+        {
+            return _tcpEndpoints.TryGetValue(family, out var endpoint) ? endpoint.Port : 0;
+        }
+
+        /// <summary>Gets the assigned UDP listener port for an address family, excluding outbound-only sockets.</summary>
+        /// <param name="family">The address family.</param>
+        /// <returns>The bound port, or zero when no UDP listener exists for the family.</returns>
+        internal int UdpPortFor(AddressFamily family)
+        {
+            return _bound && _udpChannels.TryGetValue(family, out var channel) && channel.Listening ? channel.Endpoint.Port : 0;
+        }
+
+        /// <summary>Gets the assigned listener port for a transport and address family.</summary>
+        /// <param name="transport">The transport.</param>
+        /// <param name="family">The address family.</param>
+        /// <returns>The bound port, or zero when no listener exists.</returns>
+        internal int PortFor(DHTTransport transport, AddressFamily family)
+        {
+            return transport == DHTTransport.Tcp ? TcpPortFor(family) : UdpPortFor(family);
+        }
+
+        /// <summary>Binds requested listeners for every configured address family with reusable TCP source ports.</summary>
         /// <exception cref="InvalidOperationException">The listeners have already been bound.</exception>
         /// <exception cref="SocketException">A requested listener cannot bind.</exception>
         /// <exception cref="OperationCanceledException">The transport has stopped.</exception>
@@ -120,21 +142,25 @@ namespace MajDHTNetwork.Transport
                 {
                     throw new InvalidOperationException("The transport is already bound.");
                 }
-                if (_options.TcpPort.HasValue)
+                foreach (var address in _options.ListenAddresses)
                 {
-                    _tcp = new TcpListener(_options.ListenAddress, _options.TcpPort.Value);
-                    ConfigureReusableTcp(_tcp.Server);
-                    _tcp.Start(_options.MaxConcurrentRequests);
-                    _tcpEndpoint = CopyEndpoint((IPEndPoint)_tcp.LocalEndpoint);
-                }
-                if (_options.UdpPort.HasValue)
-                {
-                    if (_udp != null)
+                    if (_options.TcpPort.HasValue)
                     {
-                        throw new InvalidOperationException("Bind must precede outbound UDP exchanges when a UDP listener is configured.");
+                        var listener = new TcpListener(address, _options.TcpPort.Value);
+                        _tcpListeners.Add(listener);
+                        DisableDualMode(listener.Server);
+                        ConfigureReusableTcp(listener.Server);
+                        listener.Start(_options.MaxConcurrentRequests);
+                        _tcpEndpoints[address.AddressFamily] = CopyEndpoint((IPEndPoint)listener.LocalEndpoint);
                     }
-                    _udp = new UdpClient(new IPEndPoint(_options.ListenAddress, _options.UdpPort.Value));
-                    _udpEndpoint = CopyEndpoint((IPEndPoint)_udp.Client.LocalEndPoint!);
+                    if (_options.UdpPort.HasValue)
+                    {
+                        if (_udpChannels.ContainsKey(address.AddressFamily))
+                        {
+                            throw new InvalidOperationException("Bind must precede outbound UDP exchanges when a UDP listener is configured.");
+                        }
+                        _udpChannels[address.AddressFamily] = CreateUdpChannel(new IPEndPoint(address, _options.UdpPort.Value), true);
+                    }
                 }
                 _bound = true;
             }
@@ -147,53 +173,99 @@ namespace MajDHTNetwork.Transport
             lock (_lifecycleSync)
             {
                 _shutdownToken.ThrowIfCancellationRequested();
-                if (_tcp != null && !_tcpRunning)
+                if (!_tcpRunning)
                 {
                     _tcpRunning = true;
-                    _tcpLoop = AcceptAsync();
+                    foreach (var listener in _tcpListeners)
+                    {
+                        _tcpLoops.Add(AcceptAsync(listener));
+                    }
                 }
                 _acceptUdpRequests = _bound && _options.UdpPort.HasValue;
-                StartUdpLoop();
-            }
-        }
-
-        /// <summary>Starts the single receiver if its socket exists and is not already running.</summary>
-        private void StartUdpLoop()
-        {
-            if (_udp != null && !_udpRunning)
-            {
                 _udpRunning = true;
-                _udpLoop = ReceiveAsync();
+                foreach (var channel in _udpChannels.Values)
+                {
+                    StartUdpLoop(channel);
+                }
             }
         }
 
-        /// <summary>Ensures ordinary outbound UDP works even when no UDP listener was requested.</summary>
+        /// <summary>Creates and binds one UDP socket without accepting IPv4-mapped traffic on IPv6 sockets.</summary>
+        /// <param name="endpoint">The local endpoint.</param>
+        /// <param name="listening">Whether the socket is a configured listener.</param>
+        /// <returns>The bound socket state.</returns>
+        /// <exception cref="SocketException">The socket cannot bind.</exception>
+        private static UdpChannel CreateUdpChannel(IPEndPoint endpoint, bool listening)
+        {
+            var client = new UdpClient(endpoint.AddressFamily);
+            try
+            {
+                DisableDualMode(client.Client);
+                client.Client.Bind(endpoint);
+                return new UdpChannel(client, CopyEndpoint((IPEndPoint)client.Client.LocalEndPoint!), listening);
+            }
+            catch
+            {
+                client.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>Keeps IPv6 sockets IPv6-only so that separate IPv4 and IPv6 listeners can share a port number.</summary>
+        /// <param name="socket">The unbound socket.</param>
+        private static void DisableDualMode(Socket socket)
+        {
+            if (socket.AddressFamily == AddressFamily.InterNetworkV6)
+            {
+                socket.DualMode = false;
+            }
+        }
+
+        /// <summary>Starts a socket's receiver once loops are allowed and it is not already running.</summary>
+        /// <param name="channel">The UDP socket state.</param>
+        private void StartUdpLoop(UdpChannel channel)
+        {
+            if (_udpRunning && !channel.Running)
+            {
+                channel.Running = true;
+                channel.Loop = ReceiveAsync(channel);
+            }
+        }
+
+        /// <summary>Ensures ordinary outbound UDP works for an address family even when no UDP listener exists for it.</summary>
+        /// <param name="family">The destination address family.</param>
+        /// <returns>The listener or outbound-only socket for the family.</returns>
         /// <exception cref="SocketException">The outbound-only socket cannot bind.</exception>
         /// <exception cref="OperationCanceledException">The transport has stopped.</exception>
-        private void EnsureUdpSocket()
+        private UdpChannel EnsureUdpSocket(AddressFamily family)
         {
             lock (_lifecycleSync)
             {
                 _shutdownToken.ThrowIfCancellationRequested();
-                if (_udp == null)
+                if (!_udpChannels.TryGetValue(family, out var channel))
                 {
-                    _udp = new UdpClient(new IPEndPoint(_options.ListenAddress, 0));
-                    _udpEndpoint = CopyEndpoint((IPEndPoint)_udp.Client.LocalEndPoint!);
+                    var address = _options.ListenAddress(family)
+                        ?? (family == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any);
+                    channel = CreateUdpChannel(new IPEndPoint(address, 0), false);
+                    _udpChannels[family] = channel;
                     DHTLog.Write(_logger, LogLevel.Debug, "Created a shared outbound-only UDP socket; inbound UDP punching is unavailable.");
                 }
-                StartUdpLoop();
+                _udpRunning = true;
+                StartUdpLoop(channel);
+                return channel;
             }
         }
 
         /// <summary>Accepts persistent TCP sessions within the bounded cache.</summary>
+        /// <param name="listener">The bound listener.</param>
         /// <returns>Completion when the listener closes.</returns>
-        private async Task AcceptAsync()
+        private async Task AcceptAsync(TcpListener listener)
         {
             try
             {
                 while (!_shutdown.IsCancellationRequested)
                 {
-                    var client = await _tcp!.AcceptTcpClientAsync().ConfigureAwait(false);
+                    var client = await listener.AcceptTcpClientAsync().ConfigureAwait(false);
                     if (!(client.Client.RemoteEndPoint is IPEndPoint endpoint))
                     {
                         client.Dispose();
@@ -220,8 +292,9 @@ namespace MajDHTNetwork.Transport
         }
 
         /// <summary>Demultiplexes replies before applying incoming request concurrency limits.</summary>
-        /// <returns>Completion when the shared socket closes.</returns>
-        private async Task ReceiveAsync()
+        /// <param name="channel">The receiving UDP socket.</param>
+        /// <returns>Completion when the socket closes.</returns>
+        private async Task ReceiveAsync(UdpChannel channel)
         {
             try
             {
@@ -230,7 +303,7 @@ namespace MajDHTNetwork.Transport
                     UdpReceiveResult packet;
                     try
                     {
-                        packet = await _udp!.ReceiveAsync().ConfigureAwait(false);
+                        packet = await channel.Client.ReceiveAsync().ConfigureAwait(false);
                     }
                     catch (SocketException) when (!_shutdown.IsCancellationRequested)
                     {
@@ -242,7 +315,7 @@ namespace MajDHTNetwork.Transport
                     {
                         continue;
                     }
-                    if (!_acceptUdpRequests || (!IsUdpRequestFrame(packet.Buffer)) || !_slots.Wait(0))
+                    if (!_acceptUdpRequests || !channel.Listening || (!IsUdpRequestFrame(packet.Buffer)) || !_slots.Wait(0))
                     {
                         continue;
                     }
@@ -430,75 +503,45 @@ namespace MajDHTNetwork.Transport
             return AwaitCancellableAsync(handling, cancellationToken);
         }
 
-        /// <summary>Sends every UDP frame through the same unconnected bound socket.</summary>
+        /// <summary>Sends a UDP frame through the bound socket of the destination's address family.</summary>
         /// <param name="packet">The complete transport frame.</param>
         /// <param name="destination">The pinned or observed endpoint.</param>
         /// <param name="cancellationToken">The exchange lifetime.</param>
         /// <returns>Completion after the datagram send.</returns>
+        /// <exception cref="IOException">No socket exists for the destination address family.</exception>
         private async Task SendUdpAsync(ReadOnlyMemory<byte> packet, IPEndPoint destination, CancellationToken cancellationToken)
         {
-            await _udpSend.WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (!_udpChannels.TryGetValue(destination.AddressFamily, out var channel))
+            {
+                throw new IOException("No UDP socket exists for the destination address family.");
+            }
+            await channel.Send.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                await _udp!.Client.SendToAsync(Crypto.Array(packet), SocketFlags.None, destination).ConfigureAwait(false);
+                await channel.Client.Client.SendToAsync(Crypto.Array(packet), SocketFlags.None, destination).ConfigureAwait(false);
             }
             finally
             {
-                _udpSend.Release();
+                channel.Send.Release();
             }
         }
 
-        /// <summary>Attempts the preferred protocol and then any other advertised protocol.</summary>
-        /// <param name="peer">The destination contact.</param>
-        /// <param name="packet">The opaque encrypted request.</param>
-        /// <param name="cancellationToken">Cancels all connection attempts.</param>
-        /// <returns>The opaque encrypted response.</returns>
-        /// <exception cref="IOException">No advertised transport returned a response.</exception>
-        /// <exception cref="OperationCanceledException">The request or transport was cancelled.</exception>
-        internal async Task<ReadOnlyMemory<byte>> ExchangeAsync(DHTPeer peer, ReadOnlyMemory<byte> packet, CancellationToken cancellationToken)
-        {
-            Exception? last = null;
-            for (var attempt = 0; attempt < 2; attempt++)
-            {
-                var udp = (_options.PreferredTransport == DHTTransport.Udp) == (attempt == 0);
-                var port = udp ? peer.UdpPort : peer.TcpPort;
-                if (port == 0)
-                {
-                    continue;
-                }
-                try
-                {
-                    return await ExchangeAtAsync(peer, udp ? DHTTransport.Udp : DHTTransport.Tcp,
-                        new IPEndPoint(peer.NetworkAddress, port), packet, cancellationToken).ConfigureAwait(false);
-                }
-                catch (Exception exception) when (IsTransportFailure(exception))
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    _shutdownToken.ThrowIfCancellationRequested();
-                    last = exception;
-                }
-            }
-            throw new IOException("No advertised transport responded.", last);
-        }
-
-        /// <summary>Exchanges directly through one protocol at an explicitly observed endpoint.</summary>
-        /// <param name="peer">The destination identity used by the caller to authenticate the response.</param>
+        /// <summary>Exchanges directly through one protocol at an explicitly selected endpoint.</summary>
         /// <param name="transport">The single protocol to use.</param>
         /// <param name="endpoint">The exact pinned remote endpoint.</param>
-        /// <param name="packet">The encrypted request.</param>
+        /// <param name="packet">The sealed request.</param>
         /// <param name="cancellationToken">Cancels queueing and exchange.</param>
         /// <returns>The response; the caller must authenticate its sender and request identifier.</returns>
-        /// <exception cref="IOException">The packet, contact, endpoint or transport is invalid, or no response arrives.</exception>
+        /// <exception cref="IOException">The packet, endpoint or transport is invalid, or no response arrives.</exception>
         /// <exception cref="OperationCanceledException">The exchange or transport was cancelled.</exception>
-        internal Task<ReadOnlyMemory<byte>> ExchangeAtAsync(DHTPeer peer, DHTTransport transport, IPEndPoint endpoint,
+        internal Task<ReadOnlyMemory<byte>> ExchangeAtAsync(DHTTransport transport, IPEndPoint endpoint,
             ReadOnlyMemory<byte> packet, CancellationToken cancellationToken)
         {
-            return StartExchange(peer, transport, endpoint, packet, cancellationToken, false);
+            return StartExchange(transport, endpoint, packet, cancellationToken, false);
         }
 
         /// <summary>Retries direct punching within one request budget and retains a successful TCP session.</summary>
-        /// <param name="peer">The peer identity authenticated by the caller.</param>
         /// <param name="transport">The protocol whose local listener port must be reused.</param>
         /// <param name="endpoint">The pinned remote endpoint observed by the rendezvous peer.</param>
         /// <param name="packet">The identical signed encrypted punch request on every retry.</param>
@@ -506,14 +549,13 @@ namespace MajDHTNetwork.Transport
         /// <returns>The encrypted response, requiring caller authentication and token correlation.</returns>
         /// <exception cref="IOException">A matching listener is unavailable or punching fails.</exception>
         /// <exception cref="OperationCanceledException">The exchange or transport was cancelled.</exception>
-        internal Task<ReadOnlyMemory<byte>> PunchAsync(DHTPeer peer, DHTTransport transport, IPEndPoint endpoint,
+        internal Task<ReadOnlyMemory<byte>> PunchAsync(DHTTransport transport, IPEndPoint endpoint,
             ReadOnlyMemory<byte> packet, CancellationToken cancellationToken)
         {
-            return StartExchange(peer, transport, endpoint, packet, cancellationToken, true);
+            return StartExchange(transport, endpoint, packet, cancellationToken, true);
         }
 
         /// <summary>Registers outgoing work before shutdown can start draining it.</summary>
-        /// <param name="peer">The destination contact.</param>
         /// <param name="transport">The selected protocol.</param>
         /// <param name="endpoint">The explicitly pinned endpoint.</param>
         /// <param name="packet">The immutable request for the lifetime of the task.</param>
@@ -521,20 +563,19 @@ namespace MajDHTNetwork.Transport
         /// <param name="punch">Whether a listener and a single short retry budget are required.</param>
         /// <returns>The tracked exchange task.</returns>
         /// <exception cref="OperationCanceledException">The transport has stopped.</exception>
-        private Task<ReadOnlyMemory<byte>> StartExchange(DHTPeer peer, DHTTransport transport, IPEndPoint endpoint,
+        private Task<ReadOnlyMemory<byte>> StartExchange(DHTTransport transport, IPEndPoint endpoint,
             ReadOnlyMemory<byte> packet, CancellationToken cancellationToken, bool punch)
         {
             lock (_lifecycleSync)
             {
                 _shutdownToken.ThrowIfCancellationRequested();
-                var task = ExchangeCoreAsync(peer, transport, CopyEndpoint(endpoint), packet, cancellationToken, punch);
+                var task = ExchangeCoreAsync(transport, CopyEndpoint(endpoint), packet, cancellationToken, punch);
                 Track(task, false);
                 return task;
             }
         }
 
         /// <summary>Bounds outgoing state and applies the requested exchange or punching budget.</summary>
-        /// <param name="peer">The destination contact.</param>
         /// <param name="transport">The selected protocol.</param>
         /// <param name="endpoint">The pinned endpoint snapshot.</param>
         /// <param name="packet">The immutable encrypted request.</param>
@@ -543,13 +584,13 @@ namespace MajDHTNetwork.Transport
         /// <returns>The opaque response.</returns>
         /// <exception cref="IOException">Validation, connection or response retrieval fails.</exception>
         /// <exception cref="OperationCanceledException">The caller, budget or transport was cancelled.</exception>
-        private async Task<ReadOnlyMemory<byte>> ExchangeCoreAsync(DHTPeer peer, DHTTransport transport,
+        private async Task<ReadOnlyMemory<byte>> ExchangeCoreAsync(DHTTransport transport,
             IPEndPoint endpoint, ReadOnlyMemory<byte> packet, CancellationToken cancellationToken, bool punch)
         {
-            if (peer.IsExpired || packet.Length == 0 || packet.Length > Wire.MaxPacket || endpoint.Port == 0
+            if (packet.Length == 0 || packet.Length > Wire.MaxPacket || endpoint.Port == 0
                 || (transport != DHTTransport.Tcp && transport != DHTTransport.Udp))
             {
-                throw new IOException("Invalid destination, expired contact or invalid encrypted packet size.");
+                throw new IOException("Invalid destination or invalid encrypted packet size.");
             }
             using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _shutdownToken);
             if (punch || transport == DHTTransport.Tcp)
@@ -565,18 +606,14 @@ namespace MajDHTNetwork.Transport
             {
                 if (transport == DHTTransport.Udp)
                 {
-                    if (punch && (!_bound || !_options.UdpPort.HasValue || !_acceptUdpRequests))
+                    if (punch && (!_acceptUdpRequests || UdpPortFor(endpoint.AddressFamily) == 0))
                     {
-                        throw new IOException("UDP punching requires an active UDP listener.");
+                        throw new IOException("UDP punching requires an active UDP listener of the destination address family.");
                     }
-                    EnsureUdpSocket();
-                    if (_udpEndpoint!.AddressFamily != endpoint.AddressFamily)
-                    {
-                        throw new IOException("The shared UDP socket cannot reach this address family.");
-                    }
+                    EnsureUdpSocket(endpoint.AddressFamily);
                     return await ExchangeUdpAsync(endpoint, packet, lifetime.Token, punch).ConfigureAwait(false);
                 }
-                if (punch && (_tcpEndpoint == null || !_tcpRunning || _tcpEndpoint.AddressFamily != endpoint.AddressFamily))
+                if (punch && (!_tcpRunning || TcpPortFor(endpoint.AddressFamily) == 0))
                 {
                     throw new IOException("TCP punching requires an active TCP listener of the destination address family.");
                 }
@@ -798,8 +835,14 @@ namespace MajDHTNetwork.Transport
                     return;
                 }
                 _shutdown.Cancel();
-                _tcp?.Stop();
-                _udp?.Dispose();
+                foreach (var listener in _tcpListeners)
+                {
+                    listener.Stop();
+                }
+                foreach (var channel in _udpChannels.Values)
+                {
+                    channel.Client.Dispose();
+                }
                 lock (_sessionSync)
                 {
                     foreach (var session in new List<TcpSession>(_sessions.Values))
@@ -815,7 +858,12 @@ namespace MajDHTNetwork.Transport
         public async ValueTask DisposeAsync()
         {
             Stop();
-            await Task.WhenAll(_tcpLoop, _udpLoop).ConfigureAwait(false);
+            var loops = new List<Task>(_tcpLoops);
+            foreach (var channel in _udpChannels.Values)
+            {
+                loops.Add(channel.Loop);
+            }
+            await Task.WhenAll(loops).ConfigureAwait(false);
             while (!_requests.IsEmpty)
             {
                 try
@@ -829,8 +877,39 @@ namespace MajDHTNetwork.Transport
             }
             _slots.Dispose();
             _outgoingSlots.Dispose();
-            _udpSend.Dispose();
+            foreach (var channel in _udpChannels.Values)
+            {
+                channel.Send.Dispose();
+            }
             _shutdown.Dispose();
+        }
+
+        /// <summary>Owns one bound UDP socket, its send serialization and its receive loop.</summary>
+        private sealed class UdpChannel
+        {
+            /// <summary>Gets the owned bound socket.</summary>
+            internal UdpClient Client { get; }
+            /// <summary>Gets the immutable bound local endpoint.</summary>
+            internal IPEndPoint Endpoint { get; }
+            /// <summary>Gets whether the socket is a configured listener rather than an outbound-only fallback.</summary>
+            internal bool Listening { get; }
+            /// <summary>Gets the serialization of sends on this socket.</summary>
+            internal SemaphoreSlim Send { get; } = new SemaphoreSlim(1, 1);
+            /// <summary>Gets or sets whether the receive loop has started.</summary>
+            internal bool Running { get; set; }
+            /// <summary>Gets or sets the receive loop task.</summary>
+            internal Task Loop { get; set; } = Task.CompletedTask;
+
+            /// <summary>Takes ownership of a bound socket.</summary>
+            /// <param name="client">The bound socket.</param>
+            /// <param name="endpoint">The bound local endpoint.</param>
+            /// <param name="listening">Whether the socket accepts inbound requests.</param>
+            internal UdpChannel(UdpClient client, IPEndPoint endpoint, bool listening)
+            {
+                Client = client;
+                Endpoint = endpoint;
+                Listening = listening;
+            }
         }
     }
 }

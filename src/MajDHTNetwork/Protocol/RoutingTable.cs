@@ -51,7 +51,7 @@ namespace MajDHTNetwork.Protocol
             return -1;
         }
 
-        /// <summary>Records an authenticated contact without displacing a live full bucket.</summary>
+        /// <summary>Records an authenticated contact without displacing a live full bucket; a higher sequence replaces a known contact.</summary>
         /// <param name="peer">The verified contact.</param>
         internal void Observe(DHTPeer peer)
         {
@@ -67,7 +67,7 @@ namespace MajDHTNetwork.Protocol
                 {
                     if (bucket[i].NodeId == peer.NodeId)
                     {
-                        if (bucket[i].ExpiresAt > peer.ExpiresAt)
+                        if (bucket[i].Sequence > peer.Sequence)
                         {
                             peer = bucket[i];
                         }
