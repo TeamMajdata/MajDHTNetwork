@@ -60,6 +60,65 @@ namespace MajDHTNetwork.Tests
             await Assert.ThrowsAnyAsync<IOException>(() => unreachable.BootstrapAsync(token));
         }
 
+        /// <summary>Adds nodes by address and port, trying the requested transport first and falling back to the other one.</summary>
+        /// <param name="transport">The transport requested first, which is not the adding node's preferred transport.</param>
+        /// <returns>Completion after both added nodes entered the routing table.</returns>
+        [Theory]
+        [InlineData(DHTTransport.Tcp)]
+        [InlineData(DHTTransport.Udp)]
+        public async Task ManuallyAddedPeersUseTheRequestedTransportFirst(DHTTransport transport)
+        {
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            var token = deadline.Token;
+            var other = transport == DHTTransport.Tcp ? DHTTransport.Udp : DHTTransport.Tcp;
+            // Both nodes listen on both transports at independently assigned ports; the adding node prefers the other transport.
+            var targetOptions = Options(transport, DHTCapabilities.Download);
+            targetOptions.TcpPort = 0;
+            targetOptions.UdpPort = 0;
+            var nodeOptions = Options(other, DHTCapabilities.Download);
+            nodeOptions.TcpPort = 0;
+            nodeOptions.UdpPort = 0;
+            await using var target = new MajDHTNode(targetOptions);
+            await using var tcpOnly = new MajDHTNode(Options(DHTTransport.Tcp, DHTCapabilities.Download));
+            await using var node = new MajDHTNode(nodeOptions);
+            await Task.WhenAll(target.StartAsync(token), tcpOnly.StartAsync(token), node.StartAsync(token));
+            var endpoint = new IPEndPoint(IPAddress.Loopback, transport == DHTTransport.Tcp ? target.LocalPeer.TcpPort() : target.LocalPeer.UdpPort());
+            var added = await node.AddPeerAsync(endpoint, transport, token);
+            Assert.Equal(target.NodeId, added.NodeId);
+            Assert.True(ContainsNode(node.KnownPeers, target.NodeId), "An added node must enter the routing table.");
+            var statistics = node.GetPeerStatistics(target.NodeId);
+            Assert.NotNull(statistics);
+            Assert.NotNull(statistics!.GetRoute(endpoint, transport));
+            Assert.Null(statistics.GetRoute(endpoint, other));
+            // A node without the requested transport is still added through the other transport at the same port.
+            var fallback = new IPEndPoint(IPAddress.Loopback, tcpOnly.LocalPeer.TcpPort());
+            Assert.Equal(tcpOnly.NodeId, (await node.AddPeerAsync(fallback, DHTTransport.Udp, token)).NodeId);
+            Assert.True(ContainsNode(node.KnownPeers, tcpOnly.NodeId), "The fallback transport must admit the node.");
+            Assert.NotNull(node.GetPeerStatistics(tcpOnly.NodeId)!.GetRoute(fallback, DHTTransport.Tcp));
+        }
+
+        /// <summary>Rejects invalid endpoints and transports, unstarted nodes and endpoints that do not answer.</summary>
+        /// <returns>Completion after every rejection.</returns>
+        [Fact]
+        public async Task ManualPeerAdditionReportsInvalidAndUnreachableEndpoints()
+        {
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            var token = deadline.Token;
+            using var closed = new TcpListener(IPAddress.Loopback, 0);
+            closed.Start();
+            var closedPort = ((IPEndPoint)closed.LocalEndpoint).Port;
+            closed.Stop();
+            await using var node = new MajDHTNode(Options(DHTTransport.Tcp, DHTCapabilities.Download));
+            await Assert.ThrowsAnyAsync<InvalidOperationException>(() => node.AddPeerAsync(new IPEndPoint(IPAddress.Loopback, closedPort), null, token));
+            await node.StartAsync(token);
+            await Assert.ThrowsAnyAsync<ArgumentException>(() => node.AddPeerAsync(null!, null, token));
+            await Assert.ThrowsAnyAsync<ArgumentException>(() => node.AddPeerAsync(new IPEndPoint(IPAddress.Loopback, 0), null, token));
+            await Assert.ThrowsAnyAsync<ArgumentException>(() => node.AddPeerAsync(new IPEndPoint(IPAddress.Parse("224.0.0.1"), closedPort), null, token));
+            await Assert.ThrowsAnyAsync<ArgumentException>(() => node.AddPeerAsync(new IPEndPoint(IPAddress.Loopback, closedPort), (DHTTransport)7, token));
+            await Assert.ThrowsAnyAsync<IOException>(() => node.AddPeerAsync(new IPEndPoint(IPAddress.Loopback, closedPort), DHTTransport.Tcp, token));
+            Assert.Empty(node.KnownPeers);
+        }
+
         /// <summary>Serves IPv4-only and IPv6-only clients from one dual-stack node.</summary>
         /// <param name="transport">The only transport enabled on every node.</param>
         /// <returns>Completion after both clients downloaded the verified file.</returns>

@@ -148,6 +148,7 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | `StopAsync()`、`DisposeAsync()`、`Dispose()` | 幂等的关闭流程；已停止的实例不能重启。 |
 | `NodeId`、`LocalPeer`、`KnownPeers` | 本地身份指纹、本地签名联系人与当前路由中的联系人。 |
 | `BootstrapAsync(CancellationToken)` | 联系所有配置的引导端点，返回作出应答的端点数量。 |
+| `AddPeerAsync(IPEndPoint, DHTTransport? preferredTransport, CancellationToken)` | 按地址与端口联系一个节点，先尝试指定的传输，准入该节点并返回其签名联系人。 |
 | `ExportRoutingTable()` | 导出当前路由联系人的身份与端点以便持久化；随时可用。 |
 | `RestoreRoutingTableAsync(ReadOnlyMemory<byte>, CancellationToken)` | 重新联系导出路由表中的节点，准入仍以保存的身份作出应答的节点，并返回准入数量。 |
 | `FindNodesAsync(string routingId, CancellationToken)` | 迭代式 XOR 距离查找。 |
@@ -424,8 +425,13 @@ var block = await downloader.ReadBlockAsync(record, provider.LocalPeer, 0,
 可用后，`AnnounceAsync` 或自动维护会复制其记录。即使没有任何远端副本接受，发布也会返回签名
 记录，并通过可选日志上报一条警告。`AnnounceAsync` 返回远端副本数量。
 
-端点并不标识某个节点：在配置的端点上作出应答的任何一方都会成为第一个联系人。请只从可信来源
-配置引导端点。声明 `Relay` 能力的节点还会提供可认证的会合协助与可达性检查。
+`AddPeerAsync(endpoint, preferredTransport)` 对运行时得到的单个端点做同样的事，例如用户输入的
+地址或应用通过自己的渠道收到的地址：先通过指定的传输发送 Hello（为 null 时使用节点的
+`PreferredTransport`），若无应答再在同一端口上尝试另一种传输，准入作出应答的节点，若它是中继
+则向其登记，随后发现邻居，并返回该节点的签名联系人。两种传输都无应答时抛出 `IOException`。
+
+端点并不标识某个节点：在配置或手动添加的端点上作出应答的任何一方都会成为第一个联系人。请只从
+可信来源配置引导端点和添加节点。声明 `Relay` 能力的节点还会提供可认证的会合协助与可达性检查。
 
 ### 持久化路由表
 

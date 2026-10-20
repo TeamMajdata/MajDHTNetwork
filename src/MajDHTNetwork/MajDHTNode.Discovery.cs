@@ -41,7 +41,7 @@ namespace MajDHTNetwork
             {
                 try
                 {
-                    var peer = await HelloAsync(endpoint, cancellation.Token).ConfigureAwait(false);
+                    var peer = await HelloAsync(endpoint, _options.PreferredTransport, cancellation.Token).ConfigureAwait(false);
                     await RegisterBootstrapRelayAsync(peer, cancellation.Token).ConfigureAwait(false);
                     joined++;
                 }
@@ -59,6 +59,47 @@ namespace MajDHTNetwork
             await LookupAsync(0, NodeId, cancellation.Token).ConfigureAwait(false);
             Log(LogLevel.Information, "Bootstrap and neighbor discovery completed.");
             return joined;
+        }
+
+        /// <summary>
+        /// Adds the node listening at an address and port, for example one a user typed or the application learned through
+        /// its own channel: sends a signed Hello request through the transport to try first and, when that fails, through
+        /// the other transport at the same port, admits the authenticated responder to the routing table, registers with it
+        /// when it is a relay and NAT traversal is enabled, and then discovers this node's neighbors through it.
+        /// </summary>
+        /// <param name="endpoint">The unicast address and port the node listens on.</param>
+        /// <param name="preferredTransport">
+        /// The transport to try first, or null for <see cref="DHTNodeOptions.PreferredTransport"/>; the other transport is
+        /// tried at the same port when the first one does not answer.
+        /// </param>
+        /// <param name="cancellationToken">Cancels the exchange and the neighbor discovery.</param>
+        /// <returns>The authenticated contact of the node that answered.</returns>
+        /// <remarks>
+        /// An endpoint does not identify a node: whoever answers at it becomes a contact, exactly as with a bootstrap
+        /// endpoint, so add endpoints from trusted sources only. The node that answered is also returned, so the application
+        /// can check or remember its identity.
+        /// </remarks>
+        /// <exception cref="ArgumentException">The endpoint is null, not unicast or has a zero port, or the transport is invalid.</exception>
+        /// <exception cref="InvalidOperationException">The node is not running.</exception>
+        /// <exception cref="IOException">The endpoint did not answer through either transport.</exception>
+        /// <exception cref="OperationCanceledException">The operation was cancelled.</exception>
+        public async Task<DHTPeer> AddPeerAsync(IPEndPoint endpoint, DHTTransport? preferredTransport = null, CancellationToken cancellationToken = default)
+        {
+            if (endpoint == null || endpoint.Port < 1 || endpoint.Port > 65535 || !NetworkScope.IsUnicast(endpoint.Address))
+            {
+                throw new ArgumentException("A unicast address and a non-zero port are required.", nameof(endpoint));
+            }
+            var first = preferredTransport ?? _options.PreferredTransport;
+            if (first != DHTTransport.Tcp && first != DHTTransport.Udp)
+            {
+                throw new ArgumentException("A TCP or UDP transport is required.", nameof(preferredTransport));
+            }
+            using var cancellation = OperationCancellation(cancellationToken);
+            var peer = await HelloAsync(NetworkScope.CopyEndpoint(endpoint), first, cancellation.Token).ConfigureAwait(false);
+            await RegisterBootstrapRelayAsync(peer, cancellation.Token).ConfigureAwait(false);
+            await LookupAsync(0, NodeId, cancellation.Token).ConfigureAwait(false);
+            Log(LogLevel.Information, "Peer added and neighbor discovery completed.");
+            return peer;
         }
 
         /// <summary>Joins the network through an already known signed contact.</summary>
@@ -104,17 +145,18 @@ namespace MajDHTNetwork
         }
 
         /// <summary>Learns the signed contact listening at an endpoint and the endpoint it observed for this node.</summary>
-        /// <param name="endpoint">The remote endpoint, tried with the preferred transport and then with the other one.</param>
+        /// <param name="endpoint">The remote endpoint, tried with one transport and then with the other one at the same port.</param>
+        /// <param name="first">The transport to try first.</param>
         /// <param name="cancellationToken">Cancels the exchange.</param>
         /// <returns>The authenticated remote contact.</returns>
         /// <exception cref="IOException">Neither transport answered.</exception>
         /// <exception cref="OperationCanceledException">The exchange was cancelled.</exception>
-        private async Task<DHTPeer> HelloAsync(IPEndPoint endpoint, CancellationToken cancellationToken)
+        private async Task<DHTPeer> HelloAsync(IPEndPoint endpoint, DHTTransport first, CancellationToken cancellationToken)
         {
             Exception? last = null;
             for (var attempt = 0; attempt < 2; attempt++)
             {
-                var transport = attempt == 0 ? _options.PreferredTransport : OtherTransport(_options.PreferredTransport);
+                var transport = attempt == 0 ? first : OtherTransport(first);
                 try
                 {
                     return await HelloAtAsync(transport, endpoint, null, cancellationToken).ConfigureAwait(false);

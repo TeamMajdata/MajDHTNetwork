@@ -160,6 +160,7 @@ process.
 | `StopAsync()`, `DisposeAsync()`, `Dispose()` | Idempotent shutdown; a stopped instance cannot be restarted. |
 | `NodeId`, `LocalPeer`, `KnownPeers` | Local identity fingerprint, local signed contact and the current routing contacts. |
 | `BootstrapAsync(CancellationToken)` | Contacts every configured bootstrap endpoint and returns how many answered. |
+| `AddPeerAsync(IPEndPoint, DHTTransport? preferredTransport, CancellationToken)` | Contacts one node at an address and port, trying the given transport first, admits it and returns its signed contact. |
 | `ExportRoutingTable()` | Exports the identities and endpoints of the current routing contacts for persistence; usable at any time. |
 | `RestoreRoutingTableAsync(ReadOnlyMemory<byte>, CancellationToken)` | Re-contacts the nodes of an exported routing table, admits those that still answer under their saved identity and returns how many did. |
 | `FindNodesAsync(string routingId, CancellationToken)` | Iterative XOR-distance lookup. |
@@ -496,10 +497,19 @@ peers become available. Publication returns a signed record even when no remote
 replica accepted it; a warning is reported through the optional logger.
 `AnnounceAsync` returns the remote replica count.
 
-An endpoint does not identify a node: whoever answers at a configured endpoint
-becomes the first contact. Configure bootstrap endpoints only from trusted
-sources. Peers with the `Relay` capability also provide authenticated rendezvous
-assistance and reachability checks.
+`AddPeerAsync(endpoint, preferredTransport)` does the same for one endpoint
+learned at run time, for example an address a user typed or one the application
+received through its own channel: it sends the Hello through the given transport
+first (the node's `PreferredTransport` when null), then through the other
+transport at the same port if the first does not answer, admits the node that
+answered, registers with it when it is a relay, discovers neighbors and returns
+the node's signed contact. It throws `IOException` when neither transport
+answers.
+
+An endpoint does not identify a node: whoever answers at a configured or added
+endpoint becomes the first contact. Configure bootstrap endpoints and add peers
+only from trusted sources. Peers with the `Relay` capability also provide
+authenticated rendezvous assistance and reachability checks.
 
 ### Persisting the routing table
 
