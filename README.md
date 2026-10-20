@@ -160,6 +160,8 @@ process.
 | `StopAsync()`, `DisposeAsync()`, `Dispose()` | Idempotent shutdown; a stopped instance cannot be restarted. |
 | `NodeId`, `LocalPeer`, `KnownPeers` | Local identity fingerprint, local signed contact and the current routing contacts. |
 | `BootstrapAsync(CancellationToken)` | Contacts every configured bootstrap endpoint and returns how many answered. |
+| `ExportRoutingTable()` | Exports the identities and endpoints of the current routing contacts for persistence; usable at any time. |
+| `RestoreRoutingTableAsync(ReadOnlyMemory<byte>, CancellationToken)` | Re-contacts the nodes of an exported routing table, admits those that still answer under their saved identity and returns how many did. |
 | `FindNodesAsync(string routingId, CancellationToken)` | Iterative XOR-distance lookup. |
 | `PublishAsync(string, Stream, long revision, CancellationToken)` | Publishes a stream under the local publisher namespace. |
 | `PublishAliasAsync(string, DHTRecord, long revision, CancellationToken)` | Publishes a second name for already published content. |
@@ -498,6 +500,37 @@ An endpoint does not identify a node: whoever answers at a configured endpoint
 becomes the first contact. Configure bootstrap endpoints only from trusted
 sources. Peers with the `Relay` capability also provide authenticated rendezvous
 assistance and reachability checks.
+
+### Persisting the routing table
+
+`ExportRoutingTable()` returns a small snapshot of the identities and advertised
+endpoints of the current routing contacts, nearest first; it works before the
+node starts and after it stopped, and the library never writes it anywhere
+itself. After a restart, `RestoreRoutingTableAsync(snapshot)` on a running node
+sends a Hello to every saved endpoint, at most sixteen contacts at a time, admits
+each node that still answers under its saved identity, registers with the
+answering relays when NAT traversal is enabled, and then discovers the current
+neighbors; it returns how many contacts were admitted. Endpoints that no longer
+answer, or now answer under another identity, are skipped, so an old snapshot
+costs a few request timeouts and nothing else. A malformed snapshot throws
+`InvalidDataException`. Contact leases last at most a day, which is why the
+snapshot keeps endpoints rather than signed contacts. Restoring and bootstrapping
+combine freely: a node with a snapshot and bootstrap endpoints contacts both.
+
+### Publishing many files
+
+Publications read, hash and store their streams concurrently; only the moment a
+signed record is registered is serialized per node, and a revision that another
+publication or withdrawal advanced meanwhile is rejected with
+`ArgumentException`. Each replication looks up the nodes near the key and near
+the file hash at once and sends its Store requests in parallel. Replications are
+admitted one slot at a time so that their requests, together with those of other
+work, stay within `MaxConcurrentRequests` outgoing exchanges: the two lookups
+run at once only when both fit, and the number of replications in flight is
+`MaxConcurrentRequests` divided by that footprint, at least one (one with the
+defaults, raise `MaxConcurrentRequests` for more). Maintenance reannounces
+records with the same bound, so the maintenance of many publications also runs
+in parallel where the budget allows.
 
 `ListenAddresses` takes one address, or one IPv4 and one IPv6 address for
 dual-stack listeners on the same configured ports; wildcard addresses are

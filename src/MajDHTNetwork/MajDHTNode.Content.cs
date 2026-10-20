@@ -30,27 +30,24 @@ namespace MajDHTNetwork
             }
             RequireProvider();
             using var cancellation = OperationCancellation(cancellationToken);
-            await _publishing.WaitAsync(cancellation.Token).ConfigureAwait(false);
-            DHTRecord record;
-            try
+            // A stale revision fails before the stream is read; the check is repeated when the signed record is registered.
+            ValidateRevision(name, revision);
+            // Reading, hashing and storing run outside the publication gate, so several publications proceed at once.
+            MerkleTree tree;
+            (string FileHash, long Length)? content;
+            using (var leaves = new Wire())
             {
-                ValidateRevision(name, revision);
-                using var leaves = new Wire();
-                var content = await StoreContentAsync(source, _options.BlockSize, _options.MaxFileSize, leaves, cancellation.Token)
+                content = await StoreContentAsync(source, _options.BlockSize, _options.MaxFileSize, leaves, cancellation.Token)
                     .ConfigureAwait(false);
                 if (content == null)
                 {
                     throw new ArgumentException("Content exceeds the configured file or Merkle metadata limit.", nameof(source));
                 }
-                var tree = new MerkleTree(leaves.WrittenSpan);
-                record = DHTRecord.Create(_identity, name, content.Value.FileHash, tree.Root,
-                    content.Value.Length, _options.BlockSize, revision, DateTimeOffset.UtcNow.Add(_options.RecordLifetime));
-                RegisterContent(record, tree);
+                tree = new MerkleTree(leaves.WrittenSpan);
             }
-            finally
-            {
-                _publishing.Release();
-            }
+            var record = DHTRecord.Create(_identity, name, content.Value.FileHash, tree.Root,
+                content.Value.Length, _options.BlockSize, revision, DateTimeOffset.UtcNow.Add(_options.RecordLifetime));
+            await RegisterPublicationAsync(record, tree, cancellation.Token).ConfigureAwait(false);
             await AnnounceRecordAsync(record, cancellation.Token).ConfigureAwait(false);
             Log(LogLevel.Information, "Content publication completed.");
             return record;
@@ -73,30 +70,46 @@ namespace MajDHTNetwork
             }
             RequireProvider();
             using var cancellation = OperationCancellation(cancellationToken);
-            await _publishing.WaitAsync(cancellation.Token).ConfigureAwait(false);
-            DHTRecord record;
+            ValidateRevision(name, revision);
+            MerkleTree tree;
+            lock (_gate)
+            {
+                if (!_contents.TryGetValue(ContentId(content), out var local) || !local.Record.SameContent(content))
+                {
+                    throw new ArgumentException("The specified content geometry is not registered locally.", nameof(content));
+                }
+                tree = local.Tree;
+            }
+            var record = DHTRecord.Create(_identity, name, content.FileHash, content.MerkleRoot, content.Length,
+                content.BlockSize, revision, DateTimeOffset.UtcNow.Add(_options.RecordLifetime));
+            await RegisterPublicationAsync(record, tree, cancellation.Token).ConfigureAwait(false);
+            await AnnounceRecordAsync(record, cancellation.Token).ConfigureAwait(false);
+            return record;
+        }
+
+        /// <summary>
+        /// Registers a newly signed local publication while its revision still advances the key, holding the publication
+        /// gate so concurrent publications and withdrawals of one key cannot interleave between the check and the registration.
+        /// </summary>
+        /// <param name="record">The signed publication.</param>
+        /// <param name="tree">The verified tree of its content.</param>
+        /// <param name="cancellationToken">Cancels waiting for the publication gate.</param>
+        /// <returns>Completion after registration.</returns>
+        /// <exception cref="ArgumentException">Another publication or withdrawal advanced the key revision meanwhile.</exception>
+        /// <exception cref="IOException">The metadata or record quota is exhausted.</exception>
+        /// <exception cref="OperationCanceledException">Registration was cancelled.</exception>
+        private async Task RegisterPublicationAsync(DHTRecord record, MerkleTree tree, CancellationToken cancellationToken)
+        {
+            await _publishing.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                ValidateRevision(name, revision);
-                MerkleTree tree;
-                lock (_gate)
-                {
-                    if (!_contents.TryGetValue(ContentId(content), out var local) || !local.Record.SameContent(content))
-                    {
-                        throw new ArgumentException("The specified content geometry is not registered locally.", nameof(content));
-                    }
-                    tree = local.Tree;
-                }
-                record = DHTRecord.Create(_identity, name, content.FileHash, content.MerkleRoot, content.Length,
-                    content.BlockSize, revision, DateTimeOffset.UtcNow.Add(_options.RecordLifetime));
+                ValidateRevision(record.Key.Name, record.Revision);
                 RegisterContent(record, tree);
             }
             finally
             {
                 _publishing.Release();
             }
-            await AnnounceRecordAsync(record, cancellation.Token).ConfigureAwait(false);
-            return record;
         }
 
         /// <summary>
@@ -456,38 +469,107 @@ namespace MajDHTNetwork
         {
             RequireProvider();
             CacheRecord(record, LocalPeer);
-            var byKey = await LookupAsync(0, record.Key.RoutingId, cancellationToken).ConfigureAwait(false);
-            var byHash = await LookupAsync(0, record.FileHash, cancellationToken).ConfigureAwait(false);
-            var peers = new Dictionary<string, DHTPeer>();
-            foreach (var peer in byKey.Peers)
-            {
-                peers[peer.NodeId] = peer;
-            }
-            foreach (var peer in byHash.Peers)
-            {
-                peers[peer.NodeId] = peer;
-            }
-            var accepted = 0;
-            using var body = new Wire();
-            StoreMessage.WriteRequest(body, record);
-            foreach (var peer in peers.Values)
-            {
-                try
-                {
-                    using var acceptance = await RequestAsync(peer, Operation.Store, body.WrittenMemory, cancellationToken).ConfigureAwait(false);
-                    accepted++;
-                }
-                catch (Exception exception) when (IsPeerFailure(exception))
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    Log(LogLevel.Debug, "Replica announcement failed: ", exception);
-                }
-            }
+            var accepted = await ReplicateAsync(record, record.Key.RoutingId, record.FileHash, cancellationToken).ConfigureAwait(false);
             if (accepted == 0)
             {
                 Log(LogLevel.Warning, "Publication is available locally; no remote replica accepted the announcement.");
             }
             return accepted;
+        }
+
+        /// <summary>Gets the outgoing requests one lookup issues at once: every path at full parallelism.</summary>
+        private int LookupFootprint => _options.DisjointLookupPaths * _options.LookupParallelism;
+
+        /// <summary>
+        /// Gets whether the two lookups of a replication run at once, which they only do when both fit into the outgoing
+        /// exchange budget together, so a replication never bursts beyond what one lookup already needs.
+        /// </summary>
+        private bool ConcurrentReplicationLookups => 2 * LookupFootprint <= _options.MaxConcurrentRequests;
+
+        /// <summary>
+        /// Gets the outgoing requests one replication issues at once, which is also the parallelism of its store requests: both
+        /// lookups when they run at once, otherwise one.
+        /// </summary>
+        private int ReplicationFootprint => ConcurrentReplicationLookups ? 2 * LookupFootprint : LookupFootprint;
+
+        /// <summary>
+        /// Gets how many replications fit into the outgoing exchange budget at once, at least one; it also bounds the records
+        /// that maintenance reannounces at once.
+        /// </summary>
+        private int MaxConcurrentReplications => Math.Max(1, _options.MaxConcurrentRequests / ReplicationFootprint);
+
+        /// <summary>
+        /// Stores a signed record on the nodes nearest one or two routing identifiers. The lookups run at once and the store
+        /// requests run in parallel, while the whole replication occupies one of the <see cref="MaxConcurrentReplications"/>
+        /// slots, so the outgoing exchange budget is never exceeded by many replications at once.
+        /// </summary>
+        /// <param name="record">The signed publication or withdrawal.</param>
+        /// <param name="routingId">The routing identifier of the record's key.</param>
+        /// <param name="secondaryId">A file hash whose nearby nodes also index the record, or null.</param>
+        /// <param name="cancellationToken">Cancels waiting for a slot, lookup and replication.</param>
+        /// <returns>The number of remote nodes accepting the record.</returns>
+        /// <exception cref="OperationCanceledException">Replication was cancelled.</exception>
+        private async Task<int> ReplicateAsync(DHTRecord record, string routingId, string? secondaryId, CancellationToken cancellationToken)
+        {
+            await _replications.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                var lookups = new List<Task<LookupResult>> { LookupAsync(0, routingId, cancellationToken) };
+                if (secondaryId != null)
+                {
+                    if (!ConcurrentReplicationLookups)
+                    {
+                        await lookups[0].ConfigureAwait(false);
+                    }
+                    lookups.Add(LookupAsync(0, secondaryId, cancellationToken));
+                }
+                var peers = new Dictionary<string, DHTPeer>(StringComparer.Ordinal);
+                foreach (var result in await Task.WhenAll(lookups).ConfigureAwait(false))
+                {
+                    foreach (var peer in result.Peers)
+                    {
+                        peers[peer.NodeId] = peer;
+                    }
+                }
+                using var body = new Wire();
+                StoreMessage.WriteRequest(body, record);
+                var request = body.WrittenMemory;
+                var accepted = 0;
+                await ForEachAsync(new List<DHTPeer>(peers.Values), Math.Min(ReplicationFootprint, _options.MaxConcurrentRequests), async peer =>
+                {
+                    if (await StoreAsync(peer, record, request, cancellationToken).ConfigureAwait(false))
+                    {
+                        Interlocked.Increment(ref accepted);
+                    }
+                }).ConfigureAwait(false);
+                return accepted;
+            }
+            finally
+            {
+                _replications.Release();
+            }
+        }
+
+        /// <summary>Asks one node to store a signed record, treating a peer failure as a declined replica.</summary>
+        /// <param name="peer">The node.</param>
+        /// <param name="record">The record, used to describe a failure.</param>
+        /// <param name="request">The encoded store request, shared read-only by every replica of one replication.</param>
+        /// <param name="cancellationToken">Cancels the request.</param>
+        /// <returns>Whether the node accepted the record.</returns>
+        /// <exception cref="OperationCanceledException">Replication was cancelled.</exception>
+        private async Task<bool> StoreAsync(DHTPeer peer, DHTRecord record, ReadOnlyMemory<byte> request, CancellationToken cancellationToken)
+        {
+            try
+            {
+                using var acceptance = await RequestAsync(peer, Operation.Store, request, cancellationToken).ConfigureAwait(false);
+                return true;
+            }
+            catch (Exception exception) when (IsPeerFailure(exception))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Log(LogLevel.Debug, record.IsWithdrawn ? "Withdrawal replication failed: " : "Replica announcement failed: ", exception);
+                return false;
+            }
         }
 
         /// <summary>Reads a stream into blocks of one geometry, storing every block and appending its Merkle leaf.</summary>

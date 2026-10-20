@@ -204,10 +204,7 @@ namespace MajDHTNetwork
             payload.PutLong(endpoints.Count);
             foreach (var endpoint in endpoints)
             {
-                payload.PutText(endpoint.NetworkAddress.ToString());
-                payload.PutLong(endpoint.TcpPort);
-                payload.PutLong(endpoint.UdpPort);
-                payload.PutByte((byte)endpoint.Flags);
+                WriteEndpoint(payload, endpoint);
             }
             payload.PutLong(relayHints.Count);
             foreach (var hint in relayHints)
@@ -310,11 +307,22 @@ namespace MajDHTNetwork
             }
         }
 
-        /// <summary>Reads one canonical advertised endpoint.</summary>
+        /// <summary>Writes one advertised endpoint in its canonical encoding: address text, TCP port, UDP port and flags.</summary>
+        /// <param name="writer">The payload encoder.</param>
+        /// <param name="endpoint">The endpoint.</param>
+        internal static void WriteEndpoint(Wire writer, DHTEndpoint endpoint)
+        {
+            writer.PutText(endpoint.NetworkAddress.ToString());
+            writer.PutLong(endpoint.TcpPort);
+            writer.PutLong(endpoint.UdpPort);
+            writer.PutByte((byte)endpoint.Flags);
+        }
+
+        /// <summary>Reads one canonical advertised endpoint written by <see cref="WriteEndpoint"/>.</summary>
         /// <param name="reader">The payload decoder.</param>
         /// <returns>The validated endpoint.</returns>
         /// <exception cref="InvalidDataException">The endpoint is malformed.</exception>
-        private static DHTEndpoint ReadEndpoint(Wire reader)
+        internal static DHTEndpoint ReadEndpoint(Wire reader)
         {
             var address = ParseAddress(reader.Text(96));
             var tcp = reader.Long();

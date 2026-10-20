@@ -32,6 +32,12 @@ namespace MajDHTNetwork
         private readonly SemaphoreSlim _lifecycle = new SemaphoreSlim(1, 1);
         /// <summary>Serializes local publication revisions and tree registration.</summary>
         private readonly SemaphoreSlim _publishing = new SemaphoreSlim(1, 1);
+        /// <summary>
+        /// Bounds the record replications in flight to <see cref="MaxConcurrentReplications"/>, so many publications, imports
+        /// and maintenance announcements at once stay within the outgoing exchange budget of
+        /// <see cref="DHTNodeOptions.MaxConcurrentRequests"/> instead of failing requests and evicting routing contacts.
+        /// </summary>
+        private readonly SemaphoreSlim _replications;
         /// <summary>The node shutdown token, also linked to all public operations.</summary>
         private readonly CancellationTokenSource _lifetime = new CancellationTokenSource();
         /// <summary>The signed records keyed by canonical lookup key.</summary>
@@ -109,6 +115,7 @@ namespace MajDHTNetwork
             _routing.Initialize(NodeId, _options.BucketSize);
             _routeSelector = routeSelector ?? new DefaultDHTRouteSelector();
             _contentFallback = contentFallback;
+            _replications = new SemaphoreSlim(MaxConcurrentReplications, MaxConcurrentReplications);
             _transport = new SocketTransport(_options, HandleAsync, _options.Logger);
         }
 
@@ -241,6 +248,36 @@ namespace MajDHTNetwork
         private static string ContentId(DHTRecord record)
         {
             return record.ContentId;
+        }
+
+        /// <summary>Applies an asynchronous operation to every item in order, keeping at most a given number in flight.</summary>
+        /// <typeparam name="T">The item type.</typeparam>
+        /// <param name="items">The items.</param>
+        /// <param name="parallelism">The maximum operations in flight, at least one.</param>
+        /// <param name="operation">The operation applied to one item; it must handle the failures it wants to tolerate.</param>
+        /// <returns>Completion after every operation ended; an escaping failure propagates once the other workers ended.</returns>
+        private static async Task ForEachAsync<T>(IReadOnlyList<T> items, int parallelism, Func<T, Task> operation)
+        {
+            var next = -1;
+            var workers = new Task[Math.Min(Math.Max(1, parallelism), items.Count)];
+            for (var index = 0; index < workers.Length; index++)
+            {
+                workers[index] = RunAsync();
+            }
+            await Task.WhenAll(workers).ConfigureAwait(false);
+
+            async Task RunAsync()
+            {
+                while (true)
+                {
+                    var index = Interlocked.Increment(ref next);
+                    if (index >= items.Count)
+                    {
+                        return;
+                    }
+                    await operation(items[index]).ConfigureAwait(false);
+                }
+            }
         }
 
         /// <summary>Keeps the signed content geometry with its Merkle authentication tree.</summary>

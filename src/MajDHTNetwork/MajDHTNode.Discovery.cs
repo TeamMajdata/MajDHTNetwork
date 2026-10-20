@@ -104,7 +104,7 @@ namespace MajDHTNetwork
         }
 
         /// <summary>Learns the signed contact listening at an endpoint and the endpoint it observed for this node.</summary>
-        /// <param name="endpoint">The remote endpoint.</param>
+        /// <param name="endpoint">The remote endpoint, tried with the preferred transport and then with the other one.</param>
         /// <param name="cancellationToken">Cancels the exchange.</param>
         /// <returns>The authenticated remote contact.</returns>
         /// <exception cref="IOException">Neither transport answered.</exception>
@@ -115,27 +115,9 @@ namespace MajDHTNetwork
             for (var attempt = 0; attempt < 2; attempt++)
             {
                 var transport = attempt == 0 ? _options.PreferredTransport : OtherTransport(_options.PreferredTransport);
-                var request = new Packet(LocalPeer, Crypto.Random(16), (byte)Operation.Hello, ReadOnlyMemory<byte>.Empty);
-                var counter = new TransmissionCounter();
                 try
                 {
-                    using var encoded = await _transport.ExchangeAtAsync(transport, endpoint, request.SealHello(_identity), cancellationToken, counter)
-                        .ConfigureAwait(false);
-                    // The contact and endpoint read below are copies, so the frame is released when this attempt ends.
-                    var response = Packet.Open(_identity, encoded.Bytes);
-                    if (response.Sender.NodeId == NodeId || !HasRequiredWork(response.Sender) || response.Kind != (request.Kind | 128)
-                        || !CryptographicOperations.FixedTimeEquals(response.RequestId.Span, request.RequestId.Span))
-                    {
-                        throw new CryptographicException("Hello response sender, operation or correlation mismatch.");
-                    }
-                    using var reader = new Wire(ResponseStatus.ReadResult(response.Body));
-                    var observed = HelloMessage.ReadResponse(reader);
-                    // The configured endpoint answered authentically, which proves the responder is reachable there.
-                    ObservePeer(response.Sender, endpoint.Address);
-                    RecordObservation(response.Sender, endpoint.Address, transport, observed);
-                    // The responder is unknown until it answers, so only answered Hello exchanges enter its statistics.
-                    RecordTransmissions(response.Sender.NodeId, transport, endpoint, counter);
-                    return response.Sender;
+                    return await HelloAtAsync(transport, endpoint, null, cancellationToken).ConfigureAwait(false);
                 }
                 catch (Exception exception) when (IsPeerFailure(exception) || exception is OperationCanceledException)
                 {
@@ -144,6 +126,43 @@ namespace MajDHTNetwork
                 }
             }
             throw new IOException("The endpoint did not answer a Hello request.", last);
+        }
+
+        /// <summary>
+        /// Sends one signed Hello request through one transport and admits the authenticated responder as reachable at that
+        /// endpoint.
+        /// </summary>
+        /// <param name="transport">The transport.</param>
+        /// <param name="endpoint">The remote endpoint.</param>
+        /// <param name="expectedNodeId">The identity that must answer, or null to accept any identity other than this node's.</param>
+        /// <param name="cancellationToken">Cancels the exchange.</param>
+        /// <returns>The authenticated remote contact.</returns>
+        /// <exception cref="IOException">The endpoint did not answer.</exception>
+        /// <exception cref="CryptographicException">The response was forged, miscorrelated or signed by another identity.</exception>
+        /// <exception cref="OperationCanceledException">The exchange was cancelled.</exception>
+        private async Task<DHTPeer> HelloAtAsync(DHTTransport transport, IPEndPoint endpoint, string? expectedNodeId,
+            CancellationToken cancellationToken)
+        {
+            var request = new Packet(LocalPeer, Crypto.Random(16), (byte)Operation.Hello, ReadOnlyMemory<byte>.Empty);
+            var counter = new TransmissionCounter();
+            using var encoded = await _transport.ExchangeAtAsync(transport, endpoint, request.SealHello(_identity), cancellationToken, counter)
+                .ConfigureAwait(false);
+            // The contact and endpoint read below are copies, so the frame is released when this method ends.
+            var response = Packet.Open(_identity, encoded.Bytes);
+            if (response.Sender.NodeId == NodeId || !HasRequiredWork(response.Sender) || response.Kind != (request.Kind | 128)
+                || !CryptographicOperations.FixedTimeEquals(response.RequestId.Span, request.RequestId.Span)
+                || (expectedNodeId != null && response.Sender.NodeId != expectedNodeId))
+            {
+                throw new CryptographicException("Hello response sender, operation or correlation mismatch.");
+            }
+            using var reader = new Wire(ResponseStatus.ReadResult(response.Body));
+            var observed = HelloMessage.ReadResponse(reader);
+            // The endpoint answered authentically, which proves the responder is reachable there.
+            ObservePeer(response.Sender, endpoint.Address);
+            RecordObservation(response.Sender, endpoint.Address, transport, observed);
+            // The responder is unknown until it answers, so only answered Hello exchanges enter its statistics.
+            RecordTransmissions(response.Sender.NodeId, transport, endpoint, counter);
+            return response.Sender;
         }
 
         /// <summary>Runs the initial bootstrap without failing node startup.</summary>
@@ -761,7 +780,10 @@ namespace MajDHTNetwork
             }
         }
 
-        /// <summary>Reannounces every unexpired locally available publication and this publisher's own withdrawals.</summary>
+        /// <summary>
+        /// Reannounces every unexpired locally available publication and this publisher's own withdrawals, as many at once as
+        /// <see cref="MaxConcurrentReplications"/> allows.
+        /// </summary>
         /// <param name="cancellationToken">The node lifetime.</param>
         /// <returns>Completion after every announcement attempt.</returns>
         /// <exception cref="OperationCanceledException">The node stopped.</exception>
@@ -779,13 +801,13 @@ namespace MajDHTNetwork
                     }
                 }
             }
-            foreach (var record in publications)
+            await ForEachAsync(publications, MaxConcurrentReplications, async record =>
             {
                 try
                 {
                     if (record.IsExpired)
                     {
-                        continue;
+                        return;
                     }
                     if (record.IsWithdrawn)
                     {
@@ -801,7 +823,7 @@ namespace MajDHTNetwork
                     cancellationToken.ThrowIfCancellationRequested();
                     Log(LogLevel.Warning, "Maintenance announcement failed: ", exception);
                 }
-            }
+            }).ConfigureAwait(false);
         }
 
         /// <summary>Associates an authenticated provider claim with the source address of its announcement.</summary>

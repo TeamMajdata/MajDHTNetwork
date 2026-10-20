@@ -148,6 +148,8 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | `StopAsync()`、`DisposeAsync()`、`Dispose()` | 幂等的关闭流程；已停止的实例不能重启。 |
 | `NodeId`、`LocalPeer`、`KnownPeers` | 本地身份指纹、本地签名联系人与当前路由中的联系人。 |
 | `BootstrapAsync(CancellationToken)` | 联系所有配置的引导端点，返回作出应答的端点数量。 |
+| `ExportRoutingTable()` | 导出当前路由联系人的身份与端点以便持久化；随时可用。 |
+| `RestoreRoutingTableAsync(ReadOnlyMemory<byte>, CancellationToken)` | 重新联系导出路由表中的节点，准入仍以保存的身份作出应答的节点，并返回准入数量。 |
 | `FindNodesAsync(string routingId, CancellationToken)` | 迭代式 XOR 距离查找。 |
 | `PublishAsync(string, Stream, long revision, CancellationToken)` | 在本地发布者命名空间下发布一个流。 |
 | `PublishAliasAsync(string, DHTRecord, long revision, CancellationToken)` | 为已发布内容再发布一个名称。 |
@@ -424,6 +426,27 @@ var block = await downloader.ReadBlockAsync(record, provider.LocalPeer, 0,
 
 端点并不标识某个节点：在配置的端点上作出应答的任何一方都会成为第一个联系人。请只从可信来源
 配置引导端点。声明 `Relay` 能力的节点还会提供可认证的会合协助与可达性检查。
+
+### 持久化路由表
+
+`ExportRoutingTable()` 返回一份小型快照，包含当前路由联系人的身份与通告端点，按离本节点由近到远
+排列；它在节点启动前和停止后都可以调用，本库自身从不把它写到任何地方。重启后，在运行中的节点上
+调用 `RestoreRoutingTableAsync(snapshot)`：它向每个保存的端点发送 Hello（同时最多联系十六个
+联系人），准入仍以保存的身份作出应答的节点，在启用 NAT 穿透时向作出应答的中继登记，然后发现
+当前的邻居，并返回准入的联系人数量。不再应答的端点，或者现在以另一身份应答的端点，都会被跳过，
+因此一份过期快照只会耗费几次请求超时。格式错误的快照会抛出 `InvalidDataException`。联系人租约
+最多一天，所以快照保存的是端点而不是签名联系人。恢复与引导可以同时使用：同时拥有快照和引导
+端点的节点会联系两者。
+
+### 批量发布
+
+多个发布会并发地读取、哈希并存储各自的流；每个节点只在登记签名记录的那一刻串行化，若此时有另一个
+发布或撤销已经推进了该密钥的修订号，则以 `ArgumentException` 拒绝。每次复制会同时查找密钥附近
+与文件哈希附近的节点，并并行发送 Store 请求。复制按槽位准入，使其请求连同其他工作一起不超过
+`MaxConcurrentRequests` 个出站交换：只有两次查找合计不超出预算时才会同时进行，同时进行的复制
+数量为 `MaxConcurrentRequests` 除以该占用量，至少为一（默认值下为一；需要更多时请调高
+`MaxConcurrentRequests`）。维护流程以同样的上限重新宣告记录，因此大量发布的维护也会在预算允许
+的范围内并行进行。
 
 `ListenAddresses` 接受一个地址，或者一个 IPv4 地址加一个 IPv6 地址，以便在相同的配置端口上
 双栈监听；允许使用通配地址。支持任意 TCP/UDP 端口、相同或不同的 TCP/UDP 端口号，TCP 与

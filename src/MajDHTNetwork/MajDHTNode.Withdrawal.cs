@@ -125,37 +125,9 @@ namespace MajDHTNetwork
         /// <param name="cancellationToken">Cancels lookup and replication.</param>
         /// <returns>The number of remote replicas accepting the withdrawal.</returns>
         /// <exception cref="OperationCanceledException">Replication was cancelled.</exception>
-        private async Task<int> AnnounceWithdrawalAsync(DHTRecord withdrawal, string? fileHash, CancellationToken cancellationToken)
+        private Task<int> AnnounceWithdrawalAsync(DHTRecord withdrawal, string? fileHash, CancellationToken cancellationToken)
         {
-            var peers = new Dictionary<string, DHTPeer>();
-            foreach (var peer in (await LookupAsync(0, withdrawal.Key.RoutingId, cancellationToken).ConfigureAwait(false)).Peers)
-            {
-                peers[peer.NodeId] = peer;
-            }
-            if (fileHash != null)
-            {
-                foreach (var peer in (await LookupAsync(0, fileHash, cancellationToken).ConfigureAwait(false)).Peers)
-                {
-                    peers[peer.NodeId] = peer;
-                }
-            }
-            var accepted = 0;
-            using var body = new Wire();
-            StoreMessage.WriteRequest(body, withdrawal);
-            foreach (var peer in peers.Values)
-            {
-                try
-                {
-                    using var acceptance = await RequestAsync(peer, Operation.Store, body.WrittenMemory, cancellationToken).ConfigureAwait(false);
-                    accepted++;
-                }
-                catch (Exception exception) when (IsPeerFailure(exception))
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    Log(LogLevel.Debug, "Withdrawal replication failed: ", exception);
-                }
-            }
-            return accepted;
+            return ReplicateAsync(withdrawal, withdrawal.Key.RoutingId, fileHash, cancellationToken);
         }
 
         /// <summary>Selects the higher revision of two optional records.</summary>

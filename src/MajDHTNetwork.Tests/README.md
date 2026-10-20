@@ -71,6 +71,8 @@ and requires the DLL, XML documentation, README, protocol document and license.
 | `src/ProtocolMessageTests.cs` | Round trips and rejection rules of the public operation codecs: response status, contact lists, Find, Store, Block, Relay, Hello, Punch, Probe and every Rendezvous action. |
 | `src/CustomNodeTests.cs`, `src/MinimalProtocolNode.cs` | A node written only against the public protocol API that serves, indexes, downloads from and is downloaded from by reference nodes. |
 | `src/ContactTests.cs`, `src/BootstrapTests.cs` | Contact reachability rules, Hello envelopes, address options, endpoint bootstrap and dual-stack listeners. |
+| `src/RoutingSnapshotTests.cs` | Exporting the routing table and restoring it on another node over TCP and UDP, skipping unreachable and re-identified endpoints, and rejecting malformed snapshots. |
+| `src/PublicationConcurrencyTests.cs` | Publications that read their streams concurrently, exactly one winner among concurrent publications of one key, and many concurrent publications that stay within the outgoing request budget without losing routing contacts. |
 | `src/ReachabilityTests.cs` | External-address voting, independent dial-back verification and relay-hinted private nodes over distinct loopback hosts. |
 | `src/RoutingCustomizationTests.cs` | Default route ordering, custom routing-table initialization and result filtering, and a custom route selector forcing a relay path. |
 | `src/DownloadStatisticsTests.cs` | Per-peer and per-route packet-loss statistics through a lossy UDP proxy, loss-ranked default routes and relays, concurrent two-provider downloads within per-peer limits, and download option validation. |
