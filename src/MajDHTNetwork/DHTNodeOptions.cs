@@ -58,6 +58,11 @@ namespace MajDHTNetwork
         /// <summary>Gets or sets the block size for new publications, between 1 KiB and 32 KiB.</summary>
         public int BlockSize { get; set; } = 16384;
         /// <summary>
+        /// Gets or sets the total number of Merkle leaves this node keeps for locally served content, from 1 to 16,777,216;
+        /// it bounds tree metadata (about 64 bytes per leaf) and, with the block size, the total content a node can serve.
+        /// </summary>
+        public int MaxLocalLeaves { get; set; } = 131072;
+        /// <summary>
         /// Gets or sets the identity work difficulty in leading zero bits of Argon2id over the node digest, from 0 to 20. This
         /// node's identity must reach it, and contacts below it are rejected; every node of one network must use the same value.
         /// Each extra bit doubles the one-time cost of creating an identity.
@@ -120,7 +125,8 @@ namespace MajDHTNetwork
                 || MaxLookupQueries < BucketSize || MaxLookupQueries > 1024
                 || MaxConcurrentRequests < 1 || MaxConcurrentRequests > 1024
                 || MaxRecords < 1 || MaxRecords > 65536 || MaxFileSize < 0 || MaxFileSize > 1024L * 1024 * 1024
-                || BlockSize < 1024 || BlockSize > 32768 || UdpAttempts < 1 || UdpAttempts > 5
+                || BlockSize < 1024 || BlockSize > 32768 || MaxLocalLeaves < 1 || MaxLocalLeaves > 16777216
+                || UdpAttempts < 1 || UdpAttempts > 5
                 || IdentityWorkBits < 0 || IdentityWorkBits > 20 || DisjointLookupPaths < 1 || DisjointLookupPaths > 8
                 || MaxConcurrentBlockRequests < 1 || MaxConcurrentBlockRequests > 64
                 || MaxBlockRequestsPerPeer < 1 || MaxBlockRequestsPerPeer > 16

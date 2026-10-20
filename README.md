@@ -150,7 +150,7 @@ process.
 
 | Member | Purpose |
 | --- | --- |
-| `MajDHTNode(DHTNodeOptions?, DHTIdentity?, IDHTContentStore?, IDHTRoutingTable?, IDHTRouteSelector?)` | Creates a node; every argument is optional and defaults are created internally. |
+| `MajDHTNode(DHTNodeOptions?, DHTIdentity?, IDHTContentStore?, IDHTRoutingTable?, IDHTRouteSelector?, IDHTContentFallback?)` | Creates a node; every argument is optional and defaults are created internally. |
 | `StartAsync(CancellationToken)` | Binds listeners once and starts a background bootstrap when endpoints are configured; the token is a lifetime token. |
 | `StopAsync()`, `DisposeAsync()`, `Dispose()` | Idempotent shutdown; a stopped instance cannot be restarted. |
 | `NodeId`, `LocalPeer`, `KnownPeers` | Local identity fingerprint, local signed contact and the current routing contacts. |
@@ -161,6 +161,7 @@ process.
 | `AnnounceAsync(DHTRecord, CancellationToken)` | Replicates an existing signature or any withdrawal; returns the remote replica count. |
 | `UnpublishAsync(string name, long revision, CancellationToken)` | Signs and replicates a withdrawal of a key in the local publisher namespace; revision 0 picks the next one. |
 | `StopProviding(string fileHash)` | Stops serving a file locally without withdrawing any key. |
+| `ImportContentAsync(DHTRecord, Stream, CancellationToken)` | Verifies a local copy against an existing signed record, of any publisher, serves it and returns the remote replica count. |
 | `ResolveAsync(DHTKey, CancellationToken)` | Looks up a signed publication for a key. |
 | `FindProvidersAsync(string fileHash, CancellationToken)` | Finds providers of a complete-file hash, independently of keys. |
 | `DownloadAsync(DHTKey, Stream, string? expectedFileHash, CancellationToken)` | Resolves, downloads and verifies the complete file. |
@@ -187,6 +188,7 @@ process.
 | `MaxRecords` | `1024` |
 | `MaxFileSize` | `1 GiB` |
 | `BlockSize` | `16384` (1 KiB–32 KiB accepted) |
+| `MaxLocalLeaves` | `131072` total Merkle leaves of served content (1–16,777,216 accepted) |
 | `IdentityWorkBits` | `12` (0–20 accepted; must match across the network) |
 | `DisjointLookupPaths` | `3` (1–8 accepted) |
 | `MaxConcurrentBlockRequests` | `8` (1–64 accepted) |
@@ -216,6 +218,7 @@ process.
 | `DHTKey` | `DHTKey(string publisherId, string name)`, `Parse(string)`, `IsValid`, `PublisherId`, `Name`, `RoutingId`, equality and hashing |
 | `DHTRecord` | `Key`, `IsWithdrawn`, `FileHash`, `MerkleRoot`, `Length`, `BlockSize`, `BlockCount`, `Revision`, `ExpiresAt`, `IsExpired`, `EncodedLength`, `CopyTo(Span<byte>)`, `ToBytes()`, `Parse(ReadOnlySpan<byte>)` |
 | `IDHTContentStore` | `PutAsync(string blockHash, ReadOnlyMemory<byte>, CancellationToken)`, `GetAsync(string blockHash, CancellationToken)` |
+| `IDHTContentFallback` | `TryAcquireAsync(DHTRecord, CancellationToken)`; makes requested but locally unavailable content available on demand |
 | `MemoryDHTContentStore` | `MemoryDHTContentStore(long capacity = 64 MiB, int maxEntries = 65536)` |
 | `IDHTRoutingTable` | `Initialize(string localNodeId, int bucketSize)`, `Observe(DHTPeer, IPAddress? verifiedAddress)`, `Remove(string nodeId)`, `Closest(string routingId, int count)` |
 | `KademliaDHTRoutingTable` | `KademliaDHTRoutingTable(int maxPerNetworkInBucket = 2, int maxPerNetwork = 10)`; default table of 256 XOR buckets with per-network limits |
@@ -296,6 +299,22 @@ bind the same file hash, and dishonest nodes can ignore the withdrawal.
 `StopProviding(fileHash)` only stops this node from serving a file; other nodes
 keep its earlier provider claims until they expire and fail over to other
 providers.
+
+### Serving another publisher's content
+
+A node can provide content it did not publish itself. `ImportContentAsync(record,
+stream)` reads a local copy, for example a file kept by a replica across restarts,
+checks it against the signed length, Merkle root and complete-file hash of an
+existing publication, registers it and announces this node as a provider, without
+downloading anything. A node constructed with an `IDHTContentFallback` asks it
+whenever a peer requests a block of signed content that is not registered locally;
+the fallback can import a local copy or download the file, after which the block is
+served. A peer can address such a pull-through replica directly with
+`ReadBlockAsync(record, replicaPeer, index)`. The request waits only within its own
+timeout, so the fallback should bound its wait and let longer work continue in the
+background; the peer otherwise fails over to other providers. Implementations must
+be thread-safe and should coalesce concurrent requests for the same content, and
+must decide which publishers they trust.
 
 ## Encryption and relays
 
@@ -575,7 +594,7 @@ application's retained identity and next revision after a restart.
 
 Other defaults include 256 distance buckets with eight peers each, three parallel
 lookup queries, 64 queried peers per lookup, 32 concurrent incoming handlers,
-1,024 live records, at most 16 providers per content hash, and 131,072 total
+1,024 live records, at most 16 providers per content hash, and 131,072 total (`MaxLocalLeaves`)
 locally indexed Merkle leaves. The configured file limit is at most 1 GiB;
 smaller blocks may hit the leaf quota first. All encrypted envelopes are bounded
 to 60,000 bytes. The 16 KiB default blocks and 32 KiB maximum leave room for

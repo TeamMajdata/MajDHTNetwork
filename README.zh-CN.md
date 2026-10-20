@@ -139,7 +139,7 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 
 | 成员 | 用途 |
 | --- | --- |
-| `MajDHTNode(DHTNodeOptions?, DHTIdentity?, IDHTContentStore?, IDHTRoutingTable?, IDHTRouteSelector?)` | 创建节点；所有参数都可选，缺省时在内部创建默认实现。 |
+| `MajDHTNode(DHTNodeOptions?, DHTIdentity?, IDHTContentStore?, IDHTRoutingTable?, IDHTRouteSelector?, IDHTContentFallback?)` | 创建节点；所有参数都可选，缺省时在内部创建默认实现。 |
 | `StartAsync(CancellationToken)` | 只绑定一次监听器；配置了引导端点时在后台开始引导；该令牌是生命周期令牌。 |
 | `StopAsync()`、`DisposeAsync()`、`Dispose()` | 幂等的关闭流程；已停止的实例不能重启。 |
 | `NodeId`、`LocalPeer`、`KnownPeers` | 本地身份指纹、本地签名联系人与当前路由中的联系人。 |
@@ -150,6 +150,7 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | `AnnounceAsync(DHTRecord, CancellationToken)` | 复制已有签名或任意撤销记录；返回远端副本数量。 |
 | `UnpublishAsync(string name, long revision, CancellationToken)` | 签名并复制本地发布者命名空间中某个密钥的撤销记录；修订号为 0 时自动取下一个。 |
 | `StopProviding(string fileHash)` | 本节点停止提供某个文件，不撤销任何密钥。 |
+| `ImportContentAsync(DHTRecord, Stream, CancellationToken)` | 用已有签名记录（可来自任意发布者）校验本地副本并开始提供，返回接受提供者声明的远端副本数。 |
 | `ResolveAsync(DHTKey, CancellationToken)` | 按密钥查找签名发布记录。 |
 | `FindProvidersAsync(string fileHash, CancellationToken)` | 按完整文件哈希查找提供者，与密钥无关。 |
 | `DownloadAsync(DHTKey, Stream, string? expectedFileHash, CancellationToken)` | 解析、下载并校验完整文件。 |
@@ -176,6 +177,7 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | `MaxRecords` | `1024` |
 | `MaxFileSize` | `1 GiB` |
 | `BlockSize` | `16384`（允许 1 KiB–32 KiB） |
+| `MaxLocalLeaves` | 本地提供内容的 Merkle 叶子总数 `131072`（允许 1–16,777,216） |
 | `IdentityWorkBits` | `12`（允许 0–20；同一网络必须一致） |
 | `DisjointLookupPaths` | `3`（允许 1–8） |
 | `MaxConcurrentBlockRequests` | `8`（允许 1–64） |
@@ -205,6 +207,7 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | `DHTKey` | `DHTKey(string publisherId, string name)`、`Parse(string)`、`IsValid`、`PublisherId`、`Name`、`RoutingId`、相等比较与哈希 |
 | `DHTRecord` | `Key`、`IsWithdrawn`、`FileHash`、`MerkleRoot`、`Length`、`BlockSize`、`BlockCount`、`Revision`、`ExpiresAt`、`IsExpired`、`EncodedLength`、`CopyTo(Span<byte>)`、`ToBytes()`、`Parse(ReadOnlySpan<byte>)` |
 | `IDHTContentStore` | `PutAsync(string blockHash, ReadOnlyMemory<byte>, CancellationToken)`、`GetAsync(string blockHash, CancellationToken)` |
+| `IDHTContentFallback` | `TryAcquireAsync(DHTRecord, CancellationToken)`；在本地尚无被请求内容时按需取得该内容 |
 | `MemoryDHTContentStore` | `MemoryDHTContentStore(long capacity = 64 MiB, int maxEntries = 65536)` |
 | `IDHTRoutingTable` | `Initialize(string localNodeId, int bucketSize)`、`Observe(DHTPeer, IPAddress? verifiedAddress)`、`Remove(string nodeId)`、`Closest(string routingId, int count)` |
 | `KademliaDHTRoutingTable` | `KademliaDHTRoutingTable(int maxPerNetworkInBucket = 2, int maxPerNetwork = 10)`；默认路由表，256 个 XOR 距离桶，带按网络限额 |
@@ -264,6 +267,17 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 撤销针对的是"密钥 → 内容"的绑定，而不是内容本身：已下载文件的节点仍保有副本，其他密钥或发布者
 可以绑定同一个文件哈希，不诚实的节点也可以无视撤销。`StopProviding(fileHash)` 只是让本节点停止
 提供某个文件；其他节点会保留它之前的提供者声明直到过期，并改由其他提供者获取。
+
+### 提供其他发布者的内容
+
+节点可以提供并非由自己发布的内容。`ImportContentAsync(record, stream)` 读取本地副本（例如
+副本节点跨重启保留的文件），按已有发布记录中签名的长度、Merkle 根与完整文件哈希进行校验，
+注册后宣告本节点为提供者，整个过程无需下载。构造节点时传入 `IDHTContentFallback` 后，每当
+对端请求本地尚未注册的已签名内容的数据块时，节点都会询问它；回退实现可以导入本地副本或下载
+文件，之后节点即提供该数据块。对端可以用 `ReadBlockAsync(record, replicaPeer, index)` 直接向
+这种回源副本请求。请求只在自身超时内等待，因此回退实现应限制等待时间、让较长的工作在后台
+继续，否则对端会切换到其他提供者。实现必须线程安全，应合并同一内容的并发请求，并自行决定
+信任哪些发布者。
 
 ## 加密与中继
 
@@ -457,7 +471,7 @@ await using var node = new MajDHTNode(options, identity, store,
 
 其他默认值包括：256 个距离桶、每桶八个节点、三次并行查找查询、每次查找查询 64 个节点、
 32 个并发入站处理、1,024 条活跃记录、每个内容哈希最多 16 个提供者、本地索引的 Merkle 叶子
-总数 131,072。可配置的文件上限为最多 1 GiB；使用较小数据块时可能先触及叶子配额。所有加密
+总数 131,072（`MaxLocalLeaves`）。可配置的文件上限为最多 1 GiB；使用较小数据块时可能先触及叶子配额。所有加密
 信封上限为 60,000 字节。16 KiB 的默认块与 32 KiB 的最大块为证明与嵌套加密留出余量。较大的
 UDP 数据报依赖 IP 分片；丢包会重传整个请求。v1 没有 MTU 感知的应用层分片、拥塞控制、流式
 多路复用或带宽调度。数据报分片不适用时请使用 TCP。

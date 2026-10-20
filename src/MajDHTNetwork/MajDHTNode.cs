@@ -24,6 +24,8 @@ namespace MajDHTNetwork
         private readonly IDHTRoutingTable _routing;
         /// <summary>The caller-supplied or default route selection.</summary>
         private readonly IDHTRouteSelector _routeSelector;
+        /// <summary>The optional caller-supplied source of content that is requested but not served locally.</summary>
+        private readonly IDHTContentFallback? _contentFallback;
         /// <summary>Serializes state and in-memory index updates.</summary>
         private readonly object _gate = new object();
         /// <summary>Serializes start and stop operations.</summary>
@@ -86,10 +88,14 @@ namespace MajDHTNetwork
         /// An unbound thread-safe routing table that this node initializes and owns, or a new <see cref="KademliaDHTRoutingTable"/>.
         /// </param>
         /// <param name="routeSelector">A thread-safe route selection, or a <see cref="DefaultDHTRouteSelector"/>; it may be shared.</param>
+        /// <param name="contentFallback">
+        /// An optional thread-safe source that can make requested but locally unavailable content available on demand, or null
+        /// to refuse such block requests.
+        /// </param>
         /// <exception cref="ArgumentException">The supplied options are invalid, or the identity does not reach the required work.</exception>
         /// <exception cref="InvalidOperationException">The routing table is already bound to another node.</exception>
         public MajDHTNode(DHTNodeOptions? options = null, DHTIdentity? identity = null, IDHTContentStore? contentStore = null,
-            IDHTRoutingTable? routingTable = null, IDHTRouteSelector? routeSelector = null)
+            IDHTRoutingTable? routingTable = null, IDHTRouteSelector? routeSelector = null, IDHTContentFallback? contentFallback = null)
         {
             _options = (options ?? new DHTNodeOptions()).Snapshot();
             _identity = identity ?? DHTIdentity.Create(_options.IdentityWorkBits);
@@ -102,6 +108,7 @@ namespace MajDHTNetwork
             _routing = routingTable ?? new KademliaDHTRoutingTable();
             _routing.Initialize(NodeId, _options.BucketSize);
             _routeSelector = routeSelector ?? new DefaultDHTRouteSelector();
+            _contentFallback = contentFallback;
             _transport = new SocketTransport(_options, HandleAsync, _options.Logger);
         }
 

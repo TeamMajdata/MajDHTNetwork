@@ -13,9 +13,6 @@ namespace MajDHTNetwork
 {
     public sealed partial class MajDHTNode
     {
-        /// <summary>The total number of locally retained Merkle leaves, bounding tree metadata independently of raw storage.</summary>
-        private const int MaxLocalLeaves = 131072;
-
         /// <summary>Reads a caller-owned stream, signs its manifest and announces it to nearby DHT nodes.</summary>
         /// <param name="name">The case-sensitive name in this identity's key namespace.</param>
         /// <param name="source">A readable stream positioned at the beginning of the intended content; remains open.</param>
@@ -39,42 +36,15 @@ namespace MajDHTNetwork
             {
                 ValidateRevision(name, revision);
                 using var leaves = new Wire();
-                using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-                using var bufferOwner = new PooledBuffer(_options.BlockSize);
-                var buffer = bufferOwner.Memory;
-                long length = 0;
-                while (true)
+                var content = await StoreContentAsync(source, _options.BlockSize, _options.MaxFileSize, leaves, cancellation.Token)
+                    .ConfigureAwait(false);
+                if (content == null)
                 {
-                    var count = 0;
-                    while (count < buffer.Length)
-                    {
-                        var read = await source.ReadAsync(buffer.Slice(count), cancellation.Token).ConfigureAwait(false);
-                        if (read == 0)
-                        {
-                            break;
-                        }
-                        count += read;
-                    }
-                    if (count == 0 && leaves.Length != 0)
-                    {
-                        break;
-                    }
-                    if (length + count > _options.MaxFileSize || (leaves.Length / 32) >= MaxLocalLeaves)
-                    {
-                        throw new ArgumentException("Content exceeds the configured file or Merkle metadata limit.", nameof(source));
-                    }
-                    digest.AppendData(buffer.Span.Slice(0, count));
-                    length += count;
-                    var leafId = MerkleTree.AppendLeaf(leaves, buffer.Span.Slice(0, count));
-                    await _store.PutAsync(leafId, buffer.Slice(0, count), cancellation.Token).ConfigureAwait(false);
-                    if (count < buffer.Length)
-                    {
-                        break;
-                    }
+                    throw new ArgumentException("Content exceeds the configured file or Merkle metadata limit.", nameof(source));
                 }
                 var tree = new MerkleTree(leaves.WrittenSpan);
-                record = DHTRecord.Create(_identity, name, Crypto.Hex(digest.GetHashAndReset()), tree.Root,
-                    length, _options.BlockSize, revision, DateTimeOffset.UtcNow.Add(_options.RecordLifetime));
+                record = DHTRecord.Create(_identity, name, content.Value.FileHash, tree.Root,
+                    content.Value.Length, _options.BlockSize, revision, DateTimeOffset.UtcNow.Add(_options.RecordLifetime));
                 RegisterContent(record, tree);
             }
             finally
@@ -165,6 +135,53 @@ namespace MajDHTNetwork
             return await AnnounceRecordAsync(record, cancellation.Token).ConfigureAwait(false);
         }
 
+        /// <summary>
+        /// Serves locally available content under an existing signed publication, typically another publisher's: reads the
+        /// stream into the content store, verifies it against the signed length, Merkle root and complete-file hash, registers
+        /// it and announces this node as a provider. Use it to resume serving files that outlived the process, for example a
+        /// replica's cache directory, without downloading them again.
+        /// </summary>
+        /// <param name="record">The publisher-signed, unexpired content manifest.</param>
+        /// <param name="source">A readable stream positioned at the beginning of the content; remains open.</param>
+        /// <param name="cancellationToken">Cancels reading, storing and announcing content.</param>
+        /// <returns>The number of remote nodes accepting this node's provider announcement.</returns>
+        /// <remarks>Blocks of rejected content may remain in the caller-owned content store.</remarks>
+        /// <exception cref="ArgumentNullException">The record is null.</exception>
+        /// <exception cref="ArgumentException">The record is a withdrawal or the source is not readable.</exception>
+        /// <exception cref="InvalidOperationException">The local Provide capability is disabled.</exception>
+        /// <exception cref="InvalidDataException">
+        /// The record is expired, exceeds configured limits or is below a retained revision, or the content differs from it.
+        /// </exception>
+        /// <exception cref="IOException">Storage or metadata quotas prevent registration.</exception>
+        /// <exception cref="OperationCanceledException">The import was cancelled.</exception>
+        public async Task<int> ImportContentAsync(DHTRecord record, Stream source, CancellationToken cancellationToken = default)
+        {
+            if (record == null)
+            {
+                throw new ArgumentNullException(nameof(record));
+            }
+            if (source == null || !source.CanRead || record.IsWithdrawn)
+            {
+                throw new ArgumentException("A signed content manifest, not a withdrawal, and a readable source are required.");
+            }
+            RequireProvider();
+            if (record.IsExpired || record.Length > _options.MaxFileSize || record.BlockCount > _options.MaxLocalLeaves)
+            {
+                throw new InvalidDataException("The manifest is expired or exceeds configured resource limits.");
+            }
+            using var cancellation = OperationCancellation(cancellationToken);
+            using var leaves = new Wire();
+            var content = await StoreContentAsync(source, record.BlockSize, record.Length, leaves, cancellation.Token).ConfigureAwait(false);
+            if (content == null || content.Value.Length != record.Length || content.Value.FileHash != record.FileHash)
+            {
+                throw new InvalidDataException("The local content differs from the signed manifest.");
+            }
+            RegisterContent(record, new MerkleTree(leaves.WrittenSpan));
+            var replicas = await AnnounceRecordAsync(record, cancellation.Token).ConfigureAwait(false);
+            Log(LogLevel.Information, "Local content import completed.");
+            return replicas;
+        }
+
         /// <summary>Resolves a key and downloads its fully verified file to a caller-owned stream.</summary>
         /// <param name="key">The trusted publisher-scoped key.</param>
         /// <param name="destination">A writable stream; remains open and may contain partial bytes on failure.</param>
@@ -211,7 +228,7 @@ namespace MajDHTNetwork
             {
                 throw new ArgumentException("A signed content manifest, not a withdrawal, and a writable destination are required.");
             }
-            if (record.IsExpired || record.Length > _options.MaxFileSize || record.BlockCount > MaxLocalLeaves)
+            if (record.IsExpired || record.Length > _options.MaxFileSize || record.BlockCount > _options.MaxLocalLeaves)
             {
                 throw new InvalidDataException("The manifest is expired or exceeds configured resource limits.");
             }
@@ -358,6 +375,46 @@ namespace MajDHTNetwork
             return bytes;
         }
 
+        /// <summary>
+        /// Reads a block requested by a peer, first asking the content fallback once when the requested geometry is not
+        /// registered locally.
+        /// </summary>
+        /// <param name="record">The requested signed geometry.</param>
+        /// <param name="index">The requested block index.</param>
+        /// <param name="cancellationToken">The bounded request lifetime.</param>
+        /// <returns>The raw block and its authentication path.</returns>
+        /// <exception cref="IOException">The content is not available locally, even after the fallback.</exception>
+        /// <exception cref="InvalidDataException">The stored block no longer matches its signed geometry.</exception>
+        /// <exception cref="OperationCanceledException">The request lifetime ended.</exception>
+        private async Task<(ReadOnlyMemory<byte> Bytes, MerkleTree Tree)> ReadServedBlockAsync(DHTRecord record, int index,
+            CancellationToken cancellationToken)
+        {
+            if (_contentFallback != null && !IsContentRegistered(record))
+            {
+                try
+                {
+                    var acquired = await _contentFallback.TryAcquireAsync(record, cancellationToken).ConfigureAwait(false);
+                    Log(LogLevel.Debug, acquired ? "Content fallback made requested content available." : "Content fallback declined a request.");
+                }
+                catch (Exception exception) when (exception is not OperationCanceledException)
+                {
+                    Log(LogLevel.Warning, "Content fallback failed: ", exception);
+                }
+            }
+            return await ReadLocalBlockAsync(record, index, cancellationToken).ConfigureAwait(false);
+        }
+
+        /// <summary>Checks whether the exact signed content geometry is registered locally.</summary>
+        /// <param name="record">The signed content geometry.</param>
+        /// <returns>Whether blocks of this geometry can be served from the local store.</returns>
+        private bool IsContentRegistered(DHTRecord record)
+        {
+            lock (_gate)
+            {
+                return _contents.TryGetValue(ContentId(record), out var found) && found.Record.SameContent(record);
+            }
+        }
+
         /// <summary>Reads and reauthenticates a stored block before serving it.</summary>
         /// <param name="record">The requested signed geometry.</param>
         /// <param name="index">The requested block index.</param>
@@ -411,7 +468,7 @@ namespace MajDHTNetwork
                         leaves += entry.Value.Tree.Count;
                     }
                 }
-                if (leaves > MaxLocalLeaves)
+                if (leaves > _options.MaxLocalLeaves)
                 {
                     throw new IOException("The local Merkle metadata quota is full.");
                 }
@@ -460,6 +517,54 @@ namespace MajDHTNetwork
                 Log(LogLevel.Warning, "Publication is available locally; no remote replica accepted the announcement.");
             }
             return accepted;
+        }
+
+        /// <summary>Reads a stream into blocks of one geometry, storing every block and appending its Merkle leaf.</summary>
+        /// <param name="source">The readable content stream.</param>
+        /// <param name="blockSize">The block size of the content geometry.</param>
+        /// <param name="maxLength">The maximum accepted content length in bytes.</param>
+        /// <param name="leaves">Receives the contiguous leaf digests in block order.</param>
+        /// <param name="cancellationToken">Cancels reading and storing.</param>
+        /// <returns>The complete-file SHA-256 and length, or null when the content exceeds the length or Merkle metadata limit.</returns>
+        /// <exception cref="IOException">The stream or content store failed.</exception>
+        /// <exception cref="OperationCanceledException">The operation was cancelled.</exception>
+        private async Task<(string FileHash, long Length)?> StoreContentAsync(Stream source, int blockSize, long maxLength, Wire leaves,
+            CancellationToken cancellationToken)
+        {
+            using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            using var bufferOwner = new PooledBuffer(blockSize);
+            var buffer = bufferOwner.Memory;
+            long length = 0;
+            while (true)
+            {
+                var count = 0;
+                while (count < buffer.Length)
+                {
+                    var read = await source.ReadAsync(buffer.Slice(count), cancellationToken).ConfigureAwait(false);
+                    if (read == 0)
+                    {
+                        break;
+                    }
+                    count += read;
+                }
+                if (count == 0 && leaves.Length != 0)
+                {
+                    break;
+                }
+                if (length + count > maxLength || (leaves.Length / 32) >= _options.MaxLocalLeaves)
+                {
+                    return null;
+                }
+                digest.AppendData(buffer.Span.Slice(0, count));
+                length += count;
+                var leafId = MerkleTree.AppendLeaf(leaves, buffer.Span.Slice(0, count));
+                await _store.PutAsync(leafId, buffer.Slice(0, count), cancellationToken).ConfigureAwait(false);
+                if (count < buffer.Length)
+                {
+                    break;
+                }
+            }
+            return (Crypto.Hex(digest.GetHashAndReset()), length);
         }
 
         /// <summary>Validates a new locally signed key revision before reading its content.</summary>

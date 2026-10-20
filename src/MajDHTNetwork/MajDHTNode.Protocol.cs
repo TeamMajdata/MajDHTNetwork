@@ -208,7 +208,7 @@ namespace MajDHTNetwork
                     {
                         throw new InvalidDataException("Invalid requested block geometry.");
                     }
-                    var result = await ReadLocalBlockAsync(record, (int)index, cancellationToken).ConfigureAwait(false);
+                    var result = await ReadServedBlockAsync(record, (int)index, cancellationToken).ConfigureAwait(false);
                     response.Put(result.Bytes.Span);
                     result.Tree.WriteProof(response, (int)index);
                     return;

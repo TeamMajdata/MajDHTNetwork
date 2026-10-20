@@ -77,6 +77,7 @@ and requires the DLL, XML documentation, README, protocol document and license.
 | `src/TestDefaults.cs` | Module initializer that disables the default identity work for short-lived test nodes; Sybil tests set `IdentityWorkBits` explicitly. |
 | `src/IdentityPuzzleTests.cs` | Exclusive check that floods of uncached identities beyond the per-second Argon2id budget are not evaluated. |
 | `src/WithdrawalTests.cs` | Signed withdrawals without content, key withdrawal with resolution, download refusal, provider and content pruning, replay refusal and republication, and local `StopProviding`. |
+| `src/ContentFallbackTests.cs` | Importing a local copy of another publisher's record, rejected imports, the configurable local leaf quota, and pull-through serving through `IDHTContentFallback`, including declining and failing fallbacks. |
 | `src/MemoryTests.cs`, `src/ContentStoreTests.cs` | Span APIs, borrowed/owned memory, owned frame views, immutable snapshots and bounded cache eviction. |
 | `src/FrameOwnershipTests.cs` | Pooled receive frames released only after their consumers copied what they keep: stored, written and publicly read blocks survive array-pool churn after TCP and UDP downloads. |
 | `src/RoutingTests.cs`, `src/LoggingTests.cs` | Default Kademlia table XOR distance ordering, routing removal and structured logging contracts. |
