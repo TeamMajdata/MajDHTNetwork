@@ -136,8 +136,7 @@ namespace MajDHTNetwork
                 try
                 {
                     return DHTPeer.Create(_identity, endpoints, _options.Capabilities, reachability, HasEndpointDependentMappingLocked(),
-                        PreferredExternalAddressLocked(), hints, reachable ? s_publicContactLifetime : s_relayedContactLifetime,
-                        _options.IdentityWorkBits);
+                        PreferredExternalAddressLocked(), hints, reachable ? s_publicContactLifetime : s_relayedContactLifetime);
                 }
                 catch (InvalidDataException) when (hints.Count > 1)
                 {

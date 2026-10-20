@@ -77,19 +77,27 @@ namespace MajDHTNetwork
 
         /// <summary>Constructs an unstarted node without performing filesystem access.</summary>
         /// <param name="options">Listener, resource and protocol limits, or defaults.</param>
-        /// <param name="identity">A stable identity, or a newly generated identity.</param>
+        /// <param name="identity">
+        /// A stable identity reaching <see cref="DHTNodeOptions.IdentityWorkBits"/>, or null to create one with
+        /// <see cref="DHTIdentity.Create"/>, which can take seconds; create and persist identities ahead of time instead.
+        /// </param>
         /// <param name="contentStore">A concurrent caller-owned block store, or a bounded 64 MiB memory cache.</param>
         /// <param name="routingTable">
         /// An unbound thread-safe routing table that this node initializes and owns, or a new <see cref="KademliaDHTRoutingTable"/>.
         /// </param>
         /// <param name="routeSelector">A thread-safe route selection, or a <see cref="DefaultDHTRouteSelector"/>; it may be shared.</param>
-        /// <exception cref="ArgumentException">The supplied options are invalid.</exception>
+        /// <exception cref="ArgumentException">The supplied options are invalid, or the identity does not reach the required work.</exception>
         /// <exception cref="InvalidOperationException">The routing table is already bound to another node.</exception>
         public MajDHTNode(DHTNodeOptions? options = null, DHTIdentity? identity = null, IDHTContentStore? contentStore = null,
             IDHTRoutingTable? routingTable = null, IDHTRouteSelector? routeSelector = null)
         {
             _options = (options ?? new DHTNodeOptions()).Snapshot();
-            _identity = identity ?? new DHTIdentity();
+            _identity = identity ?? DHTIdentity.Create(_options.IdentityWorkBits);
+            if (_options.IdentityWorkBits != 0 && _identity.IdentityWork < _options.IdentityWorkBits)
+            {
+                throw new ArgumentException("The identity does not reach the configured identity work; create it with DHTIdentity.Create.",
+                    nameof(identity));
+            }
             _store = contentStore ?? new MemoryDHTContentStore();
             _routing = routingTable ?? new KademliaDHTRoutingTable();
             _routing.Initialize(NodeId, _options.BucketSize);
@@ -115,8 +123,6 @@ namespace MajDHTNetwork
                 {
                     throw new InvalidOperationException("A MajDHTNode instance can only be started once.");
                 }
-                // Prove the identity work once before taking the state lock; contacts reuse the cached nonce.
-                _identity.ComputeProofOfWork(_options.IdentityWorkBits);
                 _transport.Bind();
                 lock (_gate)
                 {

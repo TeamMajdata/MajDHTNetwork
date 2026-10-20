@@ -28,7 +28,7 @@ namespace MajDHTNetwork.Tests
         private Func<Packet, IPEndPoint, (byte Status, byte[] Body)> _script = (packet, source) => (0, Array.Empty<byte>());
 
         /// <summary>Gets the peer identity.</summary>
-        internal DHTIdentity Identity { get; } = new DHTIdentity();
+        internal DHTIdentity Identity { get; }
         /// <summary>Gets the signed contact for the listener.</summary>
         internal DHTPeer Peer { get; }
         /// <summary>Gets the bound listener endpoint.</summary>
@@ -38,10 +38,11 @@ namespace MajDHTNetwork.Tests
         /// <param name="address">The loopback listener address.</param>
         /// <param name="capabilities">The advertised capabilities.</param>
         /// <param name="reachability">The advertised reachability; Public advertises a configured endpoint.</param>
-        /// <param name="workBits">The identity proof-of-work difficulty the contact proves.</param>
+        /// <param name="identity">The peer identity, or null for a random identity.</param>
         internal ScriptedPeer(IPAddress address, DHTCapabilities capabilities, DHTReachability reachability = DHTReachability.Public,
-            int workBits = 0)
+            DHTIdentity? identity = null)
         {
+            Identity = identity ?? new DHTIdentity();
             var options = new DHTNodeOptions
             {
                 ListenAddresses = new List<IPAddress> { address },
@@ -53,7 +54,7 @@ namespace MajDHTNetwork.Tests
             Endpoint = new IPEndPoint(address, _transport.TcpPort);
             var flags = reachability == DHTReachability.Public ? DHTEndpointFlags.Configured : DHTEndpointFlags.None;
             Peer = DHTPeer.Create(Identity, new[] { new DHTEndpoint(address, _transport.TcpPort, 0, flags) }, capabilities, reachability,
-                false, null, Array.Empty<DHTPeer>(), TimeSpan.FromHours(1), workBits);
+                false, null, Array.Empty<DHTPeer>(), TimeSpan.FromHours(1));
             _transport.Run();
         }
 

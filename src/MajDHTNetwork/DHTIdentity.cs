@@ -18,12 +18,10 @@ namespace MajDHTNetwork
         private readonly byte[] _publicKey;
         /// <summary>The last contact sequence issued by this process for this identity.</summary>
         private long _lastSequence;
-        /// <summary>Protects the cached proof of work.</summary>
+        /// <summary>Protects the cached identity work.</summary>
         private readonly object _workGate = new object();
-        /// <summary>The cached proof-of-work nonce, or minus one before any work was computed.</summary>
-        private long _workNonce = -1;
-        /// <summary>The proof-of-work bits achieved by the cached nonce.</summary>
-        private int _workBits;
+        /// <summary>The cached identity work, or minus one before it was evaluated.</summary>
+        private int _work = -1;
         /// <summary>The agreement private key.</summary>
         internal X25519PrivateKeyParameters Agreement { get; }
         /// <summary>Gets the SHA-256 signing-key fingerprint used as the node identifier.</summary>
@@ -76,28 +74,52 @@ namespace MajDHTNetwork
         }
 
         /// <summary>
-        /// Computes, once per process and difficulty, a nonce proving that this identity cost work to create; contacts carry it
-        /// so that minting many identities is expensive.
+        /// Gets the identity work of this identity: the leading zero bits of Argon2id over its node digest. It is a property of
+        /// the seed, so it is computed once per process and survives restarts together with the persisted seed.
         /// </summary>
-        /// <param name="bits">The required number of leading zero bits, from 0 to 32; each extra bit doubles the expected cost.</param>
-        /// <returns>A nonce whose proof of work reaches at least <paramref name="bits"/>.</returns>
-        /// <exception cref="ArgumentOutOfRangeException">The difficulty is outside 0 to 32.</exception>
-        public long ComputeProofOfWork(int bits)
+        public int IdentityWork
         {
-            if (bits < 0 || bits > 32)
+            get
             {
-                throw new ArgumentOutOfRangeException(nameof(bits));
-            }
-            lock (_workGate)
-            {
-                if (_workNonce < 0 || _workBits < bits)
+                lock (_workGate)
                 {
-                    var nodeHash = Crypto.ParseHash(NodeId);
-                    _workNonce = Crypto.FindIdentityWork(nodeHash, bits);
-                    _workBits = Crypto.IdentityWork(nodeHash, _workNonce);
+                    if (_work < 0)
+                    {
+                        _work = IdentityPuzzle.Evaluate(Crypto.ParseHash(NodeId));
+                        IdentityPuzzle.Remember(NodeId, _work);
+                    }
+                    return _work;
                 }
-                return _workNonce;
             }
+        }
+
+        /// <summary>
+        /// Creates a new random identity whose identity work reaches a difficulty, searching seeds on every processor. Each
+        /// extra bit doubles the expected cost; at the default of 12 bits expect seconds to tens of seconds. Persist the
+        /// seed with <see cref="ExportSeed()"/> so the cost is paid only once.
+        /// </summary>
+        /// <param name="workBits">The required identity work, from 0 to 20; normally <see cref="DHTNodeOptions.IdentityWorkBits"/>.</param>
+        /// <param name="cancellationToken">Cancels the search.</param>
+        /// <returns>The qualifying identity.</returns>
+        /// <exception cref="ArgumentOutOfRangeException">The difficulty is outside 0 to 20.</exception>
+        /// <exception cref="OperationCanceledException">The search was cancelled.</exception>
+        public static DHTIdentity Create(int workBits, CancellationToken cancellationToken = default)
+        {
+            if (workBits < 0 || workBits > 20)
+            {
+                throw new ArgumentOutOfRangeException(nameof(workBits));
+            }
+            var (seed, work) = IdentityPuzzle.Search(workBits, cancellationToken);
+            var identity = new DHTIdentity(seed);
+            if (workBits > 0)
+            {
+                lock (identity._workGate)
+                {
+                    identity._work = work;
+                }
+                IdentityPuzzle.Remember(identity.NodeId, work);
+            }
+            return identity;
         }
 
         /// <summary>Issues a strictly increasing contact sequence based on the current Unix time in milliseconds.</summary>

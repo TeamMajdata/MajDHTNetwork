@@ -27,17 +27,22 @@ namespace MajDHTNetwork.Tests
         {
             using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
             var token = deadline.Token;
+            const int bits = 4;
             var options = Options(DHTTransport.Tcp, DHTCapabilities.Download);
-            options.IdentityWorkBits = 12;
+            options.IdentityWorkBits = bits;
             await using var node = new MajDHTNode(options);
             await node.StartAsync(token);
-            Assert.True(node.LocalPeer.IdentityWork >= 12, "A node must prove its own configured identity work.");
-            await using var cheap = new ScriptedPeer(IPAddress.Parse("127.0.0.6"), DHTCapabilities.Download, DHTReachability.Unknown);
-            Assert.True(cheap.Peer.IdentityWork < 12, "The test identity must not prove the work by chance.");
+            Assert.True(node.LocalPeer.IdentityWork >= bits, "A node must create an identity reaching its configured work.");
+            Assert.ThrowsAny<ArgumentException>(() => new MajDHTNode(options, CheapIdentity(bits)));
+            await using var cheap = new ScriptedPeer(IPAddress.Parse("127.0.0.6"), DHTCapabilities.Download, DHTReachability.Unknown,
+                CheapIdentity(bits));
             await Assert.ThrowsAnyAsync<IOException>(() => cheap.SendAsync(node.LocalPeer, Operation.Ping, ReadOnlyMemory<byte>.Empty, token));
-            await using var worthy = new ScriptedPeer(IPAddress.Parse("127.0.0.7"), DHTCapabilities.Download, DHTReachability.Unknown, workBits: 12);
-            await using var referred = new ScriptedPeer(IPAddress.Parse("127.0.0.8"), DHTCapabilities.Download, DHTReachability.Unknown, workBits: 12);
-            await using var unproven = new ScriptedPeer(IPAddress.Parse("127.0.0.9"), DHTCapabilities.Download, DHTReachability.Unknown);
+            await using var worthy = new ScriptedPeer(IPAddress.Parse("127.0.0.7"), DHTCapabilities.Download, DHTReachability.Unknown,
+                DHTIdentity.Create(bits, token));
+            await using var referred = new ScriptedPeer(IPAddress.Parse("127.0.0.8"), DHTCapabilities.Download, DHTReachability.Unknown,
+                DHTIdentity.Create(bits, token));
+            await using var unproven = new ScriptedPeer(IPAddress.Parse("127.0.0.9"), DHTCapabilities.Download, DHTReachability.Unknown,
+                CheapIdentity(bits));
             worthy.Script((packet, source) =>
                 packet.Kind == (byte)Operation.Find ? ((byte)0, FindReply(new[] { referred.Peer, unproven.Peer })) : ((byte)0, Array.Empty<byte>()));
             Assert.Equal(0, (await worthy.SendAsync(node.LocalPeer, Operation.Ping, ReadOnlyMemory<byte>.Empty, token)).Status);
@@ -45,6 +50,24 @@ namespace MajDHTNetwork.Tests
             await node.FindNodesAsync(NodeHash(), token);
             Assert.True(referred.Received(Operation.Find) > 0, "A referral proving the work must be queried.");
             Assert.Equal(0, unproven.Received(Operation.Find));
+        }
+
+        /// <summary>
+        /// Binds the work to the identity itself: a key's work is fixed by its node digest and survives a restore from the
+        /// seed, so grinding a node identifier towards a position costs a full puzzle per candidate key.
+        /// </summary>
+        [Fact]
+        public void IdentityWorkIsBoundToTheKeyAndSurvivesRestores()
+        {
+            var identity = DHTIdentity.Create(6, TestContext.Current.CancellationToken);
+            Assert.True(identity.IdentityWork >= 6);
+            var restored = new DHTIdentity(identity.ExportSeed());
+            Assert.Equal(identity.NodeId, restored.NodeId);
+            Assert.Equal(identity.IdentityWork, restored.IdentityWork);
+            var contact = DHTPeer.Create(restored, IPAddress.Loopback, 1000, 0, DHTCapabilities.Download);
+            Assert.Equal(identity.IdentityWork, new DHTPeer(contact.Encoded.ToArray()).IdentityWork);
+            Assert.ThrowsAny<ArgumentOutOfRangeException>(() => DHTIdentity.Create(21, TestContext.Current.CancellationToken));
+            Assert.ThrowsAny<ArgumentException>(() => new DHTNodeOptions { IdentityWorkBits = 21 }.Snapshot());
         }
 
         /// <summary>Limits verified contacts per globally routed network while leaving LAN peers and other networks unaffected.</summary>
@@ -56,12 +79,15 @@ namespace MajDHTNetwork.Tests
             var sybils = Observe(table, 10, index => "203.0.113." + (index + 1));
             var others = Observe(table, 3, index => "198.51." + (100 + index) + ".7");
             var lan = Observe(table, 5, index => "192.168.1." + (index + 1));
+            // Distinct /48 networks inside one IPv6 /32 allocation still count as one operator network.
+            var allocation = Observe(table, 6, index => "2001:db8:" + (index + 1).ToString("x") + "::1");
             var unverified = DHTPeer.Create(new DHTIdentity(), IPAddress.Parse("198.18.0.1"), 1000, 0, DHTCapabilities.Download);
             table.Observe(unverified, null);
             var routed = table.Closest(NodeHash(), 1000);
             Assert.InRange(CountIn(routed, sybils), 1, 3);
             Assert.Equal(3, CountIn(routed, others));
             Assert.Equal(5, CountIn(routed, lan));
+            Assert.InRange(CountIn(routed, allocation), 1, 3);
             Assert.Equal(0, CountIn(routed, new HashSet<string> { unverified.NodeId }));
             var narrow = new KademliaDHTRoutingTable(maxPerNetworkInBucket: 1, maxPerNetwork: 100);
             narrow.Initialize(new DHTIdentity().NodeId, 16);
@@ -180,6 +206,21 @@ namespace MajDHTNetwork.Tests
             await client.JoinAsync(gateway.LocalPeer, token);
             var resolved = await client.ResolveAsync(record.Key, token);
             Assert.Equal(expectFound, resolved != null);
+        }
+
+        /// <summary>Creates a random identity whose work stays below a difficulty.</summary>
+        /// <param name="bits">The difficulty the identity must not reach.</param>
+        /// <returns>The identity.</returns>
+        private static DHTIdentity CheapIdentity(int bits)
+        {
+            while (true)
+            {
+                var identity = new DHTIdentity();
+                if (identity.IdentityWork < bits)
+                {
+                    return identity;
+                }
+            }
         }
 
         /// <summary>Encodes a Find result without a record, with the given nearest contacts and no providers.</summary>

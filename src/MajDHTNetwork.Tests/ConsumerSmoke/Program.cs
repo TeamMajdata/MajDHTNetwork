@@ -17,7 +17,8 @@ namespace MajDHTNetwork.Tests.PackageConsumer
         /// <returns>Completion of the consumer smoke test.</returns>
         private static async Task Main()
         {
-            var identity = new DHTIdentity();
+            // Identities must reach the network's identity work; real applications create one once and persist its seed.
+            var identity = DHTIdentity.Create(new DHTNodeOptions().IdentityWorkBits);
             await using var provider = new MajDHTNode(new DHTNodeOptions
             {
                 UdpPort = null,

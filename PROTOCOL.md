@@ -25,7 +25,6 @@ Payload fields, in order:
 | Domain | string `MajDHT/1/contact` |
 | Signing key | bytes, exactly 32 |
 | Agreement key | bytes, exactly 32 |
-| Work nonce | integer, non-negative identity proof-of-work nonce |
 | Capabilities | byte flags: Download=1, Provide=2, Relay=4 |
 | Reachability | byte: bits 0–1 state (0 Unknown, 1 Public, 2 Private; 3 is rejected), bit 2 endpoint-dependent mapping, other bits zero |
 | Sequence | integer, the owner's issue time in Unix **milliseconds**, strictly increasing per identity |
@@ -35,12 +34,15 @@ Payload fields, in order:
 | Relay hint count | integer 0..3, followed by that many byte arrays of at most 1,024 bytes, each a signed contact |
 
 The identity work of a contact is the number of leading zero bits of
-SHA-256 over the concatenation, without length prefixes, of the ASCII bytes of
-`MajDHT/1/identity-work`, the 32-byte node digest and the big-endian 64-bit work
-nonce. Nodes reject requests, responses, lookup referrals, provider entries, relay
-routes, introductions and dial-back delegations whose contact proves less than
-their configured `IdentityWorkBits` (default 22); every node of a network must
-use the same value.
+Argon2id (version 0x13, 1,024 KiB memory, one iteration, parallelism one, 32-byte
+output) with the 32-byte node digest as password and the ASCII bytes of
+`MajDHT/1/identity-work` as salt. The work is a property of the signing key, so
+the contact carries no proof field. Nodes reject requests, responses, lookup
+referrals, provider entries, relay routes, introductions and dial-back
+delegations whose identity work is below their configured `IdentityWorkBits`
+(default 12); every node of a network must use the same value. A node evaluates
+each identity once per process and at most 128 unknown identities per second; an
+identity beyond that budget counts as having no work until it is evaluated later.
 
 Each endpoint is a canonical IP string (max 96 UTF-8 bytes), an integer TCP port
 (0..65535, zero means no TCP), an integer UDP port (0..65535, zero means no UDP)
@@ -172,7 +174,7 @@ size quotas, expiry, monotonic revisions and equal-revision content consistency.
 Receivers retain bounded revision floors past record expiry. Store success is
 not proof that the provider owns every block. For each file, a node keeps at most
 three provider claims whose announcements came from one globally routed IPv4 /24
-or IPv6 /48, by observed source address; loopback, private and link-local sources
+or IPv6 /32, by observed source address; loopback, private and link-local sources
 are not limited.
 
 Block requires the server's Provide flag and exact local Merkle geometry. The
@@ -235,7 +237,7 @@ comes first. A failed direct route is removed and normal route selection resumes
 
 A node records every endpoint observed for it by an authenticated Rendezvous or
 Hello response for ten minutes. An address reported by observers in at least two
-distinct networks (IPv4 /24 or IPv6 /48 prefixes; loopback addresses compare
+distinct networks (IPv4 /24 or IPv6 /32 prefixes; loopback addresses compare
 exactly) becomes the confirmed external address of its family. Different
 observed ports for that address on one transport set the endpoint-dependent
 mapping bit. A change of a confirmed external address starts a new epoch, which
@@ -372,7 +374,7 @@ inbound senders refresh an existing entry only and are verified by a direct Ping
 to their advertised endpoints, at most 16 at a time and eight per source network
 per minute. Responses over punched routes, registrations or relays never admit a
 contact. A bucket admits at most two contacts and the table at most ten whose
-verified addresses share one globally routed IPv4 /24 or IPv6 /48. A higher
+verified addresses share one globally routed IPv4 /24 or IPv6 /32. A higher
 contact sequence replaces the stored contact. Private contacts are never
 admitted and remove any earlier contact of the same node, so private nodes
 never appear as lookup referrals; they remain eligible as providers.

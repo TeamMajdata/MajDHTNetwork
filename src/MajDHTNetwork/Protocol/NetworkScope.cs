@@ -92,7 +92,7 @@ namespace MajDHTNetwork.Protocol
 
         /// <summary>Gets a stable key for the operator network of an address, matching <see cref="SameNetwork"/>.</summary>
         /// <param name="address">The address.</param>
-        /// <returns>The IPv4 /24 or IPv6 /48 prefix for non-loopback addresses, or the exact loopback address.</returns>
+        /// <returns>The IPv4 /24 or IPv6 /32 prefix for non-loopback addresses, or the exact loopback address.</returns>
         internal static string NetworkKey(IPAddress address)
         {
             if (address.IsIPv4MappedToIPv6)
@@ -104,9 +104,9 @@ namespace MajDHTNetwork.Protocol
                 return address.ToString();
             }
             var bytes = address.GetAddressBytes();
-            var prefix = address.AddressFamily == AddressFamily.InterNetwork ? 3 : 6;
+            var prefix = PrefixBytes(address.AddressFamily);
             Array.Clear(bytes, prefix, bytes.Length - prefix);
-            return new IPAddress(bytes) + (address.AddressFamily == AddressFamily.InterNetwork ? "/24" : "/48");
+            return new IPAddress(bytes) + (address.AddressFamily == AddressFamily.InterNetwork ? "/24" : "/32");
         }
 
         /// <summary>Checks whether Sybil diversity limits apply to an address.</summary>
@@ -124,7 +124,7 @@ namespace MajDHTNetwork.Protocol
         /// <param name="left">The first address.</param>
         /// <param name="right">The second address.</param>
         /// <returns>
-        /// Whether the addresses share an IPv4 /24 or IPv6 /48 prefix; loopback addresses compare exactly so that
+        /// Whether the addresses share an IPv4 /24 or IPv6 /32 prefix; loopback addresses compare exactly so that
         /// distinct loopback hosts can model distinct networks.
         /// </returns>
         internal static bool SameNetwork(IPAddress left, IPAddress right)
@@ -147,8 +147,19 @@ namespace MajDHTNetwork.Protocol
             }
             var a = left.GetAddressBytes();
             var b = right.GetAddressBytes();
-            var prefix = left.AddressFamily == AddressFamily.InterNetwork ? 3 : 6;
+            var prefix = PrefixBytes(left.AddressFamily);
             return a.AsSpan(0, prefix).SequenceEqual(b.AsSpan(0, prefix));
+        }
+
+        /// <summary>Gets the length of the operator-network prefix of an address family.</summary>
+        /// <param name="family">The address family.</param>
+        /// <returns>
+        /// Three bytes (/24) for IPv4, and four bytes (/32) for IPv6, because a single IPv6 allocation commonly spans a /32 and
+        /// would otherwise provide tens of thousands of distinct /48 networks.
+        /// </returns>
+        private static int PrefixBytes(AddressFamily family)
+        {
+            return family == AddressFamily.InterNetwork ? 3 : 4;
         }
     }
 }

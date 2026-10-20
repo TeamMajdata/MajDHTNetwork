@@ -31,7 +31,7 @@ namespace MajDHTNetwork
 
         /// <summary>Creates an unbound table.</summary>
         /// <param name="maxPerNetworkInBucket">
-        /// The maximum contacts whose verified addresses share one IPv4 /24 or IPv6 /48 in a bucket, from 1; loopback, private and
+        /// The maximum contacts whose verified addresses share one IPv4 /24 or IPv6 /32 in a bucket, from 1; loopback, private and
         /// link-local addresses are not limited.
         /// </param>
         /// <param name="maxPerNetwork">The maximum contacts from one such network in the whole table, from 1.</param>

@@ -29,7 +29,7 @@ namespace MajDHTNetwork
         /// <returns>Whether the contact's proof of work reaches <see cref="DHTNodeOptions.IdentityWorkBits"/>.</returns>
         private bool HasRequiredWork(DHTPeer peer)
         {
-            return peer.IdentityWork >= _options.IdentityWorkBits;
+            return _options.IdentityWorkBits == 0 || peer.IdentityWork >= _options.IdentityWorkBits;
         }
 
         /// <summary>Queries the routing table and discards entries that must never be used as lookup hops.</summary>

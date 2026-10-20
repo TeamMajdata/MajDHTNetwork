@@ -137,9 +137,12 @@ using var destination = new MemoryStream();
 await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancellationToken);
 ```
 
-Publish locally with `DHTIdentity(seed)` restored through `ExportSeed()` when the
-node ID and publisher namespace must survive restarts, and implement
-`IDHTContentStore` when blocks must outlive the process.
+Create an identity once with `DHTIdentity.Create(options.IdentityWorkBits)`, which
+searches for a key meeting the network's identity work and can take seconds, and
+restore it with `DHTIdentity(seed)` from `ExportSeed()` so the node ID, publisher
+namespace and work survive restarts. A node constructed without an identity
+creates one itself. Implement `IDHTContentStore` when blocks must outlive the
+process.
 
 ## Public API
 
@@ -182,7 +185,7 @@ node ID and publisher namespace must survive restarts, and implement
 | `MaxRecords` | `1024` |
 | `MaxFileSize` | `1 GiB` |
 | `BlockSize` | `16384` (1 KiB–32 KiB accepted) |
-| `IdentityWorkBits` | `22` (0–28 accepted; must match across the network) |
+| `IdentityWorkBits` | `12` (0–20 accepted; must match across the network) |
 | `DisjointLookupPaths` | `3` (1–8 accepted) |
 | `MaxConcurrentBlockRequests` | `8` (1–64 accepted) |
 | `MaxBlockRequestsPerPeer` | `2` (1–16 accepted) |
@@ -203,8 +206,8 @@ node ID and publisher namespace must survive restarts, and implement
 
 | Type | Key members |
 | --- | --- |
-| `DHTIdentity` | `DHTIdentity()`, `DHTIdentity(ReadOnlySpan<byte> seed)`, `NodeId`, `PublicKey`, `ExportSeed()`, `ExportSeed(Span<byte>)`, `ComputeProofOfWork(int bits)` |
-| `DHTPeer` | `NodeId`, `Endpoints`, `RelayHints`, `Reachability`, `HasEndpointDependentMapping`, `ExternalAddress`, `Capabilities`, `WorkNonce`, `IdentityWork`, `Sequence`, `ExpiresAt`, `IsExpired` |
+| `DHTIdentity` | `DHTIdentity()`, `DHTIdentity(ReadOnlySpan<byte> seed)`, `NodeId`, `PublicKey`, `ExportSeed()`, `ExportSeed(Span<byte>)`, `IdentityWork`, `Create(int workBits, CancellationToken)` |
+| `DHTPeer` | `NodeId`, `Endpoints`, `RelayHints`, `Reachability`, `HasEndpointDependentMapping`, `ExternalAddress`, `Capabilities`, `IdentityWork`, `Sequence`, `ExpiresAt`, `IsExpired` |
 | `DHTEndpoint` | `DHTEndpoint(IPAddress, int tcpPort, int udpPort, DHTEndpointFlags)`, `Address`, `TcpPort`, `UdpPort`, `Flags` |
 | `DHTReachability` | `Unknown = 0`, `Public = 1`, `Private = 2` |
 | `DHTEndpointFlags` | `None = 0`, `Verified = 1`, `Local = 2`, `Configured = 4` |
@@ -375,13 +378,17 @@ Host names, external STUN servers and UPnP are outside this library.
 An open DHT cannot stop one party from creating many identities, but MajDHT
 makes them costly and limits what they can reach:
 
-- **Identity proof of work.** Every contact carries a signed nonce; the leading
-  zero bits of SHA-256("MajDHT/1/identity-work", node digest, nonce) are its
-  `IdentityWork`. A node proves `IdentityWorkBits` (default 22, about half a
-  second of CPU once per start) and rejects requests, responses, referrals,
-  relays and introductions that prove less. Each extra bit doubles the cost of
-  minting identities, including identities ground to sit next to a key. All nodes
-  of one network must use the same value.
+- **Identity work.** An identity's `IdentityWork` is the number of leading zero
+  bits of a memory-hard Argon2id hash (1 MiB) of its node digest. There is no
+  separate nonce: the work belongs to the key, so creating an identity means
+  generating keys until one qualifies, and grinding a node ID towards a chosen key
+  costs a full puzzle for every candidate. A node's identity must reach
+  `IdentityWorkBits` (default 12, a one-time cost of seconds to tens of seconds
+  that persists with the seed), and nodes reject requests, responses, referrals,
+  relays and introductions below it. Each identity is evaluated once per process;
+  at most 128 unknown identities are evaluated per second, so floods of fresh
+  identities cannot exhaust the CPU. All nodes of one network must use the same
+  value.
 - **Verified admission.** A contact enters the routing table only after it
   answered at one of its advertised endpoints: an inbound request admits it at
   once when it came from that endpoint, otherwise the node pings the advertised
@@ -389,7 +396,7 @@ makes them costly and limits what they can reach:
   Peers reachable only through relays or punched routes are used but never
   referred to others.
 - **Network diversity.** The routing table keeps at most two contacts per IPv4
-  /24 or IPv6 /48 in a bucket and ten in total, and each file keeps at most three
+  /24 or IPv6 /32 in a bucket and ten in total, and each file keeps at most three
   provider claims per such network, counted by observed source addresses.
   Loopback, private and link-local peers are exempt, so LANs keep working.
 - **Randomized selection.** Dial-back helpers are drawn at random, one per
@@ -450,7 +457,7 @@ determines its reachability itself:
 
 1. **External address.** Relay registrations and Hello responses report the
    endpoint each remote node observed. An address reported by relays in at least
-   two distinct networks (different IPv4 /24 or IPv6 /48 prefixes) becomes the
+   two distinct networks (different IPv4 /24 or IPv6 /32 prefixes) becomes the
    confirmed `ExternalAddress`. When relays report different ports for it, the
    contact sets `HasEndpointDependentMapping` and requesters skip hole punching.
    A changed external address, for example after a PPPoE redial, starts a new

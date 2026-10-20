@@ -18,9 +18,9 @@ namespace MajDHTNetwork
 
         /// <summary>
         /// Gets or sets the initial <see cref="IdentityWorkBits"/> of new option instances. Only test hosts change it, to avoid
-        /// computing proofs of work for every short-lived test identity.
+        /// searching qualifying identities for every short-lived test node.
         /// </summary>
-        internal static int DefaultIdentityWorkBits { get; set; } = 22;
+        internal static int DefaultIdentityWorkBits { get; set; } = 12;
 
         /// <summary>
         /// Gets or sets one or two local interfaces, at most one per address family; wildcard interfaces are allowed.
@@ -58,8 +58,9 @@ namespace MajDHTNetwork
         /// <summary>Gets or sets the block size for new publications, between 1 KiB and 32 KiB.</summary>
         public int BlockSize { get; set; } = 16384;
         /// <summary>
-        /// Gets or sets the identity proof-of-work difficulty in leading zero bits, from 0 to 28. This node proves it in its own
-        /// contact and rejects contacts that prove less; every node of one network must use the same value.
+        /// Gets or sets the identity work difficulty in leading zero bits of Argon2id over the node digest, from 0 to 20. This
+        /// node's identity must reach it, and contacts below it are rejected; every node of one network must use the same value.
+        /// Each extra bit doubles the one-time cost of creating an identity.
         /// </summary>
         public int IdentityWorkBits { get; set; } = DefaultIdentityWorkBits;
         /// <summary>Gets or sets the number of disjoint paths each iterative lookup follows, from 1 to 8.</summary>
@@ -120,7 +121,7 @@ namespace MajDHTNetwork
                 || MaxConcurrentRequests < 1 || MaxConcurrentRequests > 1024
                 || MaxRecords < 1 || MaxRecords > 65536 || MaxFileSize < 0 || MaxFileSize > 1024L * 1024 * 1024
                 || BlockSize < 1024 || BlockSize > 32768 || UdpAttempts < 1 || UdpAttempts > 5
-                || IdentityWorkBits < 0 || IdentityWorkBits > 28 || DisjointLookupPaths < 1 || DisjointLookupPaths > 8
+                || IdentityWorkBits < 0 || IdentityWorkBits > 20 || DisjointLookupPaths < 1 || DisjointLookupPaths > 8
                 || MaxConcurrentBlockRequests < 1 || MaxConcurrentBlockRequests > 64
                 || MaxBlockRequestsPerPeer < 1 || MaxBlockRequestsPerPeer > 16
                 || RequestTimeout < TimeSpan.FromMilliseconds(50) || RequestTimeout > TimeSpan.FromMinutes(2)

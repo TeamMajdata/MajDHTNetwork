@@ -128,9 +128,10 @@ using var destination = new MemoryStream();
 await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancellationToken);
 ```
 
-当节点 ID 与发布者命名空间需要跨重启保持时，用 `DHTIdentity(seed)` 从
-`ExportSeed()` 的结果恢复身份；当数据块需要比进程活得更久时，实现
-`IDHTContentStore`。
+用 `DHTIdentity.Create(options.IdentityWorkBits)` 创建一次身份（它会搜索满足网络身份工作量的
+密钥，可能需要数秒），再用 `DHTIdentity(seed)` 从 `ExportSeed()` 的结果恢复，使节点 ID、发布者
+命名空间与工作量跨重启保持。构造节点时若不提供身份，节点会自行创建。当数据块需要比进程活得更久时，
+实现 `IDHTContentStore`。
 
 ## 公共 API
 
@@ -173,7 +174,7 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | `MaxRecords` | `1024` |
 | `MaxFileSize` | `1 GiB` |
 | `BlockSize` | `16384`（允许 1 KiB–32 KiB） |
-| `IdentityWorkBits` | `22`（允许 0–28；同一网络必须一致） |
+| `IdentityWorkBits` | `12`（允许 0–20；同一网络必须一致） |
 | `DisjointLookupPaths` | `3`（允许 1–8） |
 | `MaxConcurrentBlockRequests` | `8`（允许 1–64） |
 | `MaxBlockRequestsPerPeer` | `2`（允许 1–16） |
@@ -194,8 +195,8 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 
 | 类型 | 主要成员 |
 | --- | --- |
-| `DHTIdentity` | `DHTIdentity()`、`DHTIdentity(ReadOnlySpan<byte> seed)`、`NodeId`、`PublicKey`、`ExportSeed()`、`ExportSeed(Span<byte>)`、`ComputeProofOfWork(int bits)` |
-| `DHTPeer` | `NodeId`、`Endpoints`、`RelayHints`、`Reachability`、`HasEndpointDependentMapping`、`ExternalAddress`、`Capabilities`、`WorkNonce`、`IdentityWork`、`Sequence`、`ExpiresAt`、`IsExpired` |
+| `DHTIdentity` | `DHTIdentity()`、`DHTIdentity(ReadOnlySpan<byte> seed)`、`NodeId`、`PublicKey`、`ExportSeed()`、`ExportSeed(Span<byte>)`、`IdentityWork`、`Create(int workBits, CancellationToken)` |
+| `DHTPeer` | `NodeId`、`Endpoints`、`RelayHints`、`Reachability`、`HasEndpointDependentMapping`、`ExternalAddress`、`Capabilities`、`IdentityWork`、`Sequence`、`ExpiresAt`、`IsExpired` |
 | `DHTEndpoint` | `DHTEndpoint(IPAddress, int tcpPort, int udpPort, DHTEndpointFlags)`、`Address`、`TcpPort`、`UdpPort`、`Flags` |
 | `DHTReachability` | `Unknown = 0`、`Public = 1`、`Private = 2` |
 | `DHTEndpointFlags` | `None = 0`、`Verified = 1`、`Local = 2`、`Configured = 4` |
@@ -320,14 +321,16 @@ UDP 监听器也可以独立启用。签名联系人最多通告四个端点：
 
 开放的 DHT 无法阻止一方创建大量身份，但 MajDHT 会提高其成本并限制其影响范围：
 
-- **身份工作量证明。** 每个联系人都携带一个签名的 nonce；SHA-256("MajDHT/1/identity-work"、节点摘要、
-  nonce) 的前导零位数就是它的 `IdentityWork`。节点会证明 `IdentityWorkBits`（默认 22，每次启动约
-  耗费半秒 CPU），并拒绝工作量不足的请求、响应、推荐联系人、中继与引入。每多一位，批量创建身份
-  （包括为靠近某个密钥而刷出的身份）的成本就翻一倍。同一网络的所有节点必须使用相同的值。
+- **身份工作量。** 身份的 `IdentityWork` 是对其节点摘要做内存困难的 Argon2id 哈希（1 MiB）后的前导
+  零位数。这里没有独立的 nonce：工作量属于密钥本身，因此创建身份就是不断生成密钥直到某个合格；
+  想把节点 ID 刷到某个密钥附近，每个候选密钥都要付出一次完整的谜题成本。节点自身的身份必须达到
+  `IdentityWorkBits`（默认 12，一次性耗时数秒到数十秒，并随种子持久保存），节点也会拒绝低于该值的
+  请求、响应、推荐联系人、中继与引入。每个身份在一个进程内只计算一次；每秒最多计算 128 个未知身份，
+  因此大量新身份的洪泛无法耗尽 CPU。同一网络的所有节点必须使用相同的值。
 - **经验证的准入。** 联系人只有在某个通告端点上作出应答之后才会进入路由表：入站请求若来自该端点
   则立即准入，否则节点会去 Ping 它的通告端点，同时最多 16 个、每个源网络每分钟最多八次。只能经
   中继或打洞路径访问的节点可以使用，但不会推荐给其他节点。
-- **网络多样性。** 路由表中同一 IPv4 /24 或 IPv6 /48 在每个桶内最多两个联系人、整张表最多十个；
+- **网络多样性。** 路由表中同一 IPv4 /24 或 IPv6 /32 在每个桶内最多两个联系人、整张表最多十个；
   每个文件按观测到的源地址，同一网络最多保留三个提供者声明。回环、私有与链路本地地址不受限，
   局域网可以照常工作。
 - **随机化选择。** 回拨协助者在每个网络中随机抽取一个；路由中的中继从最近的候选中随机抽取；下载
@@ -371,7 +374,7 @@ var connected = await downloader.TryPunchAsync(provider.LocalPeer, relayPeer,
 `EnableNatTraversal` 开启，节点会自行判定可达性：
 
 1. **外部地址。** 中继登记与 Hello 响应会报告每个远端节点观测到的端点。若至少两个处于不同
-   网络（IPv4 /24 或 IPv6 /48 前缀不同）的中继报告同一地址，它就成为已确认的
+   网络（IPv4 /24 或 IPv6 /32 前缀不同）的中继报告同一地址，它就成为已确认的
    `ExternalAddress`。若中继为该地址观测到不同端口，联系人会置位
    `HasEndpointDependentMapping`，请求方随之跳过打洞。外部地址变化（例如 PPPoE 重拨）会开启
    新纪元，丢弃之前的验证结果并重新检查可达性。
