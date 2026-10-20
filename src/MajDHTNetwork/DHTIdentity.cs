@@ -16,14 +16,24 @@ namespace MajDHTNetwork
         private readonly Ed25519PrivateKeyParameters _signingKey;
         /// <summary>The signing public key.</summary>
         private readonly byte[] _publicKey;
+        /// <summary>The cached node digest, so envelope recipients compare 32 bytes instead of strings.</summary>
+        private readonly byte[] _nodeHash;
+        /// <summary>The private X25519 scalar derived from the seed.</summary>
+        private readonly byte[] _agreementScalar;
+        /// <summary>The cached X25519 public key advertised in signed contacts.</summary>
+        private readonly byte[] _agreementPublicKey;
         /// <summary>The last contact sequence issued by this process for this identity.</summary>
         private long _lastSequence;
         /// <summary>Protects the cached identity work.</summary>
         private readonly object _workGate = new object();
         /// <summary>The cached identity work, or minus one before it was evaluated.</summary>
         private int _work = -1;
-        /// <summary>The agreement private key.</summary>
-        internal X25519PrivateKeyParameters Agreement { get; }
+        /// <summary>Gets the private agreement scalar for envelope decryption; it is read in place and must never be modified or exposed.</summary>
+        internal byte[] AgreementScalar => _agreementScalar;
+        /// <summary>Gets a borrowed view of the agreement public key.</summary>
+        internal ReadOnlySpan<byte> AgreementPublicKey => _agreementPublicKey;
+        /// <summary>Gets a borrowed view of the node digest that <see cref="NodeId"/> formats.</summary>
+        internal ReadOnlySpan<byte> NodeHash => _nodeHash;
         /// <summary>Gets the SHA-256 signing-key fingerprint used as the node identifier.</summary>
         public string NodeId { get; }
         /// <summary>Gets a non-allocating read-only view of the signing public key.</summary>
@@ -46,8 +56,11 @@ namespace MajDHTNetwork
             _seed = seed.ToArray();
             _signingKey = new Ed25519PrivateKeyParameters(_seed, 0);
             _publicKey = _signingKey.GeneratePublicKey().GetEncoded();
-            Agreement = Crypto.AgreementKey(_seed);
-            NodeId = Crypto.Hex(Crypto.Hash(_publicKey));
+            _agreementScalar = Crypto.AgreementScalar(_seed);
+            _agreementPublicKey = new byte[Crypto.AgreementKeyLength];
+            Crypto.AgreementPublicKey(_agreementScalar, _agreementPublicKey);
+            _nodeHash = Crypto.Hash(_publicKey);
+            NodeId = Crypto.Hex(_nodeHash);
         }
 
         /// <summary>Exports a copy of the private seed for secure caller-managed persistence.</summary>
@@ -73,6 +86,15 @@ namespace MajDHTNetwork
             return Crypto.Sign(_signingKey, bytes);
         }
 
+        /// <summary>Signs canonical protocol bytes directly into array-backed destination memory.</summary>
+        /// <param name="bytes">The canonical message.</param>
+        /// <param name="destination">Exactly 64 writable bytes.</param>
+        /// <exception cref="ArgumentException">The destination is not 64 bytes long.</exception>
+        internal void SignTo(ReadOnlyMemory<byte> bytes, Memory<byte> destination)
+        {
+            Crypto.SignTo(_signingKey, bytes, destination);
+        }
+
         /// <summary>
         /// Gets the identity work of this identity: the leading zero bits of Argon2id over its node digest. It is a property of
         /// the seed, so it is computed once per process and survives restarts together with the persisted seed.
@@ -85,7 +107,7 @@ namespace MajDHTNetwork
                 {
                     if (_work < 0)
                     {
-                        _work = IdentityPuzzle.Evaluate(Crypto.ParseHash(NodeId));
+                        _work = IdentityPuzzle.Evaluate(_nodeHash);
                         IdentityPuzzle.Remember(NodeId, _work);
                     }
                     return _work;

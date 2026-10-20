@@ -143,7 +143,8 @@ namespace MajDHTNetwork
             await Task.Yield();
             try
             {
-                await RequestAsync(candidate, Operation.Ping, ReadOnlyMemory<byte>.Empty, _lifetime.Token, allowRelay: false).ConfigureAwait(false);
+                using var pong = await RequestAsync(candidate, Operation.Ping, ReadOnlyMemory<byte>.Empty, _lifetime.Token, allowRelay: false)
+                    .ConfigureAwait(false);
             }
             catch (Exception exception) when (IsPeerFailure(exception) || exception is OperationCanceledException
                 || exception is InvalidOperationException)

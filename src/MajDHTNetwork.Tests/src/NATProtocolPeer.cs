@@ -60,20 +60,20 @@ namespace MajDHTNetwork.Tests
         /// <param name="operation">The raw protocol operation to send.</param>
         /// <param name="body">The operation arguments, retained until request sealing completes.</param>
         /// <param name="token">The bounded operation lifetime.</param>
-        /// <returns>The authenticated outer response body, including its success byte.</returns>
+        /// <returns>The authenticated outer response body, including its success byte, copied out of its pooled frame.</returns>
         /// <exception cref="OperationCanceledException">The caller cancelled the socket exchange.</exception>
         internal async Task<ReadOnlyMemory<byte>> ExchangeAsync(DHTPeer receiver, Operation operation, ReadOnlyMemory<byte> body, CancellationToken token)
         {
             var packet = new Packet(Peer, Crypto.Random(16), (byte)operation, body);
             var endpoint = new IPEndPoint(IPAddress.Loopback, _kind == DHTTransport.Tcp ? receiver.TcpPort() : receiver.UdpPort());
-            var encoded = await _transport.ExchangeAtAsync(_kind, endpoint, packet.Seal(Identity, receiver), token);
-            var response = Packet.Open(Identity, encoded);
+            using var encoded = await _transport.ExchangeAtAsync(_kind, endpoint, packet.Seal(Identity, receiver), token);
+            var response = Packet.Open(Identity, encoded.Bytes);
             if (response.Sender.NodeId != receiver.NodeId || !response.RequestId.Span.SequenceEqual(packet.RequestId.Span)
                 || response.Kind != (byte)(packet.Kind | 128))
             {
                 throw new InvalidDataException("The injected operation received an unauthenticated or mismatched response.");
             }
-            return response.Body;
+            return response.Body.ToArray();
         }
 
         /// <summary>Answers valid block requests while declining every incoming probe.</summary>

@@ -4,6 +4,7 @@ using System.IO;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
+using MajDHTNetwork.Protocol;
 using MajDHTNetwork.Transport;
 
 #nullable enable
@@ -66,10 +67,10 @@ namespace MajDHTNetwork
         /// <param name="endpoint">The remote endpoint.</param>
         /// <param name="envelope">The sealed request.</param>
         /// <param name="cancellationToken">The request lifetime.</param>
-        /// <returns>The opaque response, still requiring authentication.</returns>
+        /// <returns>The opaque response in its received frame, still requiring authentication and released by the caller.</returns>
         /// <exception cref="IOException">No response arrived.</exception>
         /// <exception cref="OperationCanceledException">The request or node lifetime was cancelled.</exception>
-        private async Task<ReadOnlyMemory<byte>> ExchangeCountedAsync(DHTPeer peer, DHTTransport transport, IPEndPoint endpoint,
+        private async Task<OwnedMemory> ExchangeCountedAsync(DHTPeer peer, DHTTransport transport, IPEndPoint endpoint,
             ReadOnlyMemory<byte> envelope, CancellationToken cancellationToken)
         {
             var counter = new TransmissionCounter();
@@ -106,15 +107,15 @@ namespace MajDHTNetwork
                     counters = new PeerCounters();
                     _peerStatistics.Add(nodeId, counters);
                 }
-                var key = (transport, new IPEndPoint(IPAddress.Parse(endpoint.Address.ToString()), endpoint.Port));
-                if (!counters.Routes.TryGetValue(key, out var route))
+                if (!counters.Routes.TryGetValue((transport, endpoint), out var route))
                 {
                     if (counters.Routes.Count >= MaxRouteStatistics)
                     {
                         EvictOldestLocked(counters.Routes, entry => entry.LastUpdated);
                     }
                     route = new LinkCounters();
-                    counters.Routes.Add(key, route);
+                    // Only a new route copies its endpoint, so the ledger key can never be mutated through a caller's endpoint.
+                    counters.Routes.Add((transport, NetworkScope.CopyEndpoint(endpoint)), route);
                 }
                 counters.Total.Add(counter, now);
                 route.Add(counter, now);

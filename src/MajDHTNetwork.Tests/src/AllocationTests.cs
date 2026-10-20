@@ -1,8 +1,10 @@
 #nullable enable
 
 using System;
+using System.IO;
 using System.Net;
 using System.Threading;
+using System.Threading.Tasks;
 using MajDHTNetwork.Protocol;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -86,7 +88,24 @@ namespace MajDHTNetwork.Tests
             var source = DHTPeer.Create(sender, IPAddress.Loopback, 20000, 0, DHTCapabilities.Download);
             var target = DHTPeer.Create(recipient, IPAddress.Loopback, 20001, 0, DHTCapabilities.Download);
             var packet = new Packet(source, Crypto.Random(16), (byte)Operation.Ping, block);
-            Measure("Encrypted 32 KiB packet round trip", () => Packet.Open(recipient, packet.Seal(sender, target)), 100, 150000, 700807);
+            Measure("Encrypted 32 KiB packet round trip", () => Packet.Open(recipient, packet.Seal(sender, target)), 100, 60000, 700807);
+        }
+
+        /// <summary>
+        /// Bounds the fixed cost of sealing and opening a small request, which every block request, lookup and keep-alive pays:
+        /// the envelope copy, the provider's signature and agreement arithmetic, and nothing for the cached sender contact.
+        /// </summary>
+        [Fact]
+        [Trait("Category", "Allocation")]
+        public void SmallPacketRoundTripStaysWithinAllocationBudget()
+        {
+            var body = Crypto.Random(64);
+            var sender = new DHTIdentity();
+            var recipient = new DHTIdentity();
+            var source = DHTPeer.Create(sender, IPAddress.Loopback, 20002, 0, DHTCapabilities.Download);
+            var target = DHTPeer.Create(recipient, IPAddress.Loopback, 20003, 0, DHTCapabilities.Download);
+            var packet = new Packet(source, Crypto.Random(16), (byte)Operation.Find, body);
+            Measure("Encrypted 64-byte packet round trip", () => Packet.Open(recipient, packet.Seal(sender, target)), 1000, 16000);
         }
 
         /// <summary>Bounds repeated read-only cached block retrieval without copying the stored content.</summary>
@@ -108,6 +127,60 @@ namespace MajDHTNetwork.Tests
         public void DisabledLoggerEventsDoNotAllocate()
         {
             Measure("Disabled ILogger event", () => DHTLog.Write(NullLogger.Instance, LogLevel.Debug, "Allocation validation"), 1000, 0);
+        }
+
+        /// <summary>
+        /// Bounds the process-wide managed allocation of a complete multi-block download between two loopback nodes, which
+        /// covers request sealing, transport framing, envelope authentication, block verification and storage on both sides.
+        /// </summary>
+        /// <param name="transport">The single transport used by both nodes.</param>
+        /// <returns>Completion after the measured download.</returns>
+        [Theory]
+        [Trait("Category", "Allocation")]
+        [InlineData(DHTTransport.Tcp)]
+        [InlineData(DHTTransport.Udp)]
+        public async Task BlockDownloadStaysWithinAllocationBudget(DHTTransport transport)
+        {
+            const int BlockCount = 64;
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+            var token = deadline.Token;
+            var providerOptions = TestSupport.Options(transport, DHTCapabilities.Download | DHTCapabilities.Provide);
+            providerOptions.BlockSize = 32768;
+            var downloaderOptions = TestSupport.Options(transport, DHTCapabilities.Download);
+            downloaderOptions.BlockSize = 32768;
+            await using var provider = new MajDHTNode(providerOptions);
+            await using var downloader = new MajDHTNode(downloaderOptions);
+            await provider.StartAsync(token);
+            await downloader.StartAsync(token);
+            await downloader.JoinAsync(provider.LocalPeer, token);
+            // A downloaded file is served locally afterwards, so the warm-up and the measurement use distinct files.
+            using var warmUpSource = new MemoryStream(Crypto.Random(32768 * BlockCount));
+            using var source = new MemoryStream(Crypto.Random(32768 * BlockCount));
+            var warmUp = await provider.PublishAsync("allocation/warm-up", warmUpSource, cancellationToken: token);
+            var record = await provider.PublishAsync("allocation/blocks", source, cancellationToken: token);
+            await downloader.DownloadAsync(warmUp, Stream.Null, warmUp.FileHash, token);
+            // The budget lies below the roughly 142,000 bytes measured while each received frame was still a fresh array, so
+            // reintroducing that copy fails this test.
+            await MeasureAsync(transport + " 32 KiB block download", async () =>
+            {
+                await downloader.DownloadAsync(record, Stream.Null, record.FileHash, token);
+            }, BlockCount, 130000);
+        }
+
+        /// <summary>Measures process-wide managed allocation of one asynchronous operation; the caller warms the code paths.</summary>
+        /// <param name="name">The workload described in the diagnostic output.</param>
+        /// <param name="operation">The asynchronous operation to measure, which may run on any thread.</param>
+        /// <param name="units">The number of units, such as blocks, that the operation processes.</param>
+        /// <param name="budget">The maximum permitted managed bytes per unit.</param>
+        private async Task MeasureAsync(string name, Func<Task> operation, int units, long budget)
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            var before = GC.GetTotalAllocatedBytes(true);
+            await operation();
+            var allocated = (GC.GetTotalAllocatedBytes(true) - before) / units;
+            _output.WriteLine(name + ": " + allocated + " bytes/unit");
+            Assert.True(allocated <= budget, name + " exceeded its allocation budget of " + budget + " bytes/unit; measured " + allocated + ".");
         }
 
         /// <summary>Measures synchronous managed allocation after warming providers and pools.</summary>

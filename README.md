@@ -632,34 +632,81 @@ returns stable read-only views; eviction does not invalidate existing views.
 Callers must treat returned read-only memory as immutable.
 
 The internal `Packet` is a readonly value type that copies memory views. Borrowed
-memory keeps its caller-managed lifetime; decoded packets retain their owned
-decrypted arrays. Objects that own mutable state, pooled buffers, identities or
-persistent signed metadata remain reference types.
+memory keeps its caller-managed lifetime. Opening an envelope decrypts it **in
+place**: the received frame is owned exclusively by the receiver, its ciphertext
+region becomes the plaintext, the decoded packet borrows that frame, a consumed
+envelope cannot be opened again, and a failed authentication zeroes the region.
+No plaintext array is allocated per packet. Objects that own mutable state,
+pooled buffers, identities or persistent signed metadata remain reference types.
 
-Protocol writers and file-read buffers use cleared pooled arrays; readers slice
-existing memory without per-field arrays. Ciphertext is written directly into the
-pooled final envelope, and Merkle trees use one contiguous node buffer. Proof
-verification uses stack storage. Pooled memory never escapes as public async
-results. The legacy array-only cryptographic provider is accessed through array
-segments with correct offsets, avoiding buffered signing copies. Small owned
-arrays remain where persistence, public defensive copies or provider APIs require
-ownership.
+Received frames are **pooled**. The TCP reader and the UDP receive loop hand
+every frame to its consumer as an owned view, and the consumer releases the frame
+once it has copied or finished reading whatever it keeps: a downloaded block's
+frame is released after the store has copied the block and the destination has
+received it, a server-side request frame is released after the handler returns
+(a handler abandoned by a timeout keeps its frame until it finishes), and
+contacts, records, introduction tickets and nonces parsed from a frame are
+copied before the frame goes back to the pool. The public `ReadBlockAsync` copies
+a remote block out of its frame before releasing it, so pooled memory never
+escapes as a public result.
+
+The library is written for hosts that are sensitive to garbage-collection pauses,
+such as Unity gameplay:
+
+- Protocol writers and file-read buffers use cleared pooled arrays; readers slice
+  existing memory without per-field arrays. Version labels and identifiers are
+  compared as bytes instead of decoded into strings. Ciphertext is written
+  directly into the pooled final envelope, the signature is written in place, and
+  Merkle trees use one contiguous node buffer. Proof verification uses stack
+  storage. Pooled memory never escapes as public async results.
+- SHA-256, the prefixed leaf hash and the authenticated cipher are cached per
+  thread and reinitialized per use; HKDF-SHA256 runs entirely on the stack and is
+  verified against RFC 5869 and the provider's generator; X25519 runs on raw
+  scalars with pooled, zeroed secrets; the UDP cookie HMAC is created once per
+  transport.
+- Verified contacts and records are cached by the digest of their exact bytes,
+  bounded and expiry-checked, so the sender of every request and the manifest of
+  every block request are signature-checked and allocated once. The replay cache
+  is keyed by inline digests rather than strings.
+- The replay cache, route copies, TCP frame prefixes, per-block download state
+  and statistics keys avoid per-request strings, lists and parsed addresses.
+- Received TCP frames are read into pooled buffers, UDP datagrams land in one
+  reusable receive buffer per socket and only frames with a consumer are copied
+  into pooled buffers, and every frame is released by its consumer, so the third
+  32 KiB copy that each downloaded block used to allocate is gone.
+
+The remaining per-block cost is dominated by two owned 32 KiB copies that the
+ownership contracts require (the sealed reply retained by the replay cache and
+the default store's copy) and by the provider's Ed25519 and X25519 arithmetic:
+on the same host one signature allocates about 1.9 KB, one verification about
+6.5 KB and each X25519 operation about 1 KB, so a sealed and opened envelope
+costs about 11 KB in the provider and about 1 KB in this library.
 
 Measured warmed managed allocations on the Windows .NET 9 Release test host:
 
-| Workload | Before | After |
-| --- | ---: | ---: |
-| 32 KiB codec round trip | 98,864 B/op | 96 B/op |
-| 32 KiB Merkle leaf | 33,048 B/op | 192 B/op |
-| 128-leaf Merkle tree | 46,120 B/op | 8,576 B/op |
-| SHA-256 hexadecimal formatting | 1,376 B/op | 152 B/op |
-| 32 KiB encrypted packet round trip | 700,807 B/op | about 95,000 B/op |
-| Cached 32 KiB block read | — | 0 B/op |
-| Disabled logger event | — | 0 B/op |
+| Workload | Original | Previous pass | Now |
+| --- | ---: | ---: | ---: |
+| 32 KiB codec round trip | 98,864 B/op | 96 B/op | 96 B/op |
+| 32 KiB Merkle leaf | 33,048 B/op | 192 B/op | 56 B/op |
+| 128-leaf Merkle tree | 46,120 B/op | 8,576 B/op | 8,440 B/op |
+| SHA-256 hexadecimal formatting | 1,376 B/op | 152 B/op | 152 B/op |
+| 32 KiB encrypted packet round trip | 700,807 B/op | about 95,000 B/op | about 46,000 B/op |
+| 64-byte encrypted packet round trip | — | — | about 13,000 B/op |
+| 32 KiB block downloaded end to end over TCP (both nodes) | about 253,000 B/block | about 140,000 B/block | about 104,000 B/block |
+| 32 KiB block downloaded end to end over UDP (both nodes) | about 256,000 B/block | about 142,000 B/block | about 106,000 B/block |
+| Cached 32 KiB block read | — | 0 B/op | 0 B/op |
+| Disabled logger event | — | 0 B/op | 0 B/op |
 
-These measurements use `GC.GetAllocatedBytesForCurrentThread`, warm pools and
-providers before measuring, and exclude native allocations and network I/O. They
-are allocation regressions rather than throughput or cross-runtime claims.
+The single-operation rows use `GC.GetAllocatedBytesForCurrentThread`; the
+end-to-end rows use `GC.GetTotalAllocatedBytes` around a complete two-node
+loopback download of a file the downloader has not seen before, including
+request sealing, transport framing, authentication, block verification and
+storage on both sides. All warm pools and providers before measuring and exclude
+native allocations and network I/O. They are allocation regressions rather than
+throughput or cross-runtime claims. In the end-to-end rows, the original column
+is the first measurement of that test, the previous pass decrypted in place but
+still received every frame into a fresh array, and the current pass releases
+pooled frames; its budget of 130,000 B/block fails if the frame copy returns.
 
 ## Security scope
 
@@ -701,8 +748,9 @@ and impersonation, Merkle geometry, three-node discovery and downloads, relay
 fallback, dual-transport, IPv6 and dual-stack transfers, endpoint bootstrap, UDP
 loss/replay, NAT registration and punching, external-address voting, dial-back
 and relay-hinted private nodes, packet-loss statistics and loss-ranked routes,
-concurrent multi-provider downloads, quota and lifecycle limits, and warmed allocation
-budgets.
+concurrent multi-provider downloads, quota and lifecycle limits, pooled frame
+release checked by churning the array pool after a download, and warmed
+allocation budgets.
 
 .NET Standard is an API target, not evidence of successful Unity, Mono, IL2CPP,
 Player, mobile, NAT, WAN or hardware integration. Those hosts and network

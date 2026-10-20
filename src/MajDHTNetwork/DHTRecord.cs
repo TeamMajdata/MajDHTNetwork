@@ -14,8 +14,20 @@ namespace MajDHTNetwork
     {
         /// <summary>The flag marking a withdrawal.</summary>
         private const byte WithdrawnFlag = 1;
+        /// <summary>The maximum accepted encoded record length.</summary>
+        internal const int MaxEncodedLength = 2200;
+        /// <summary>The maximum number of distinct records whose verification is cached process-wide.</summary>
+        private const int CacheCapacity = 256;
+        /// <summary>
+        /// The verified records keyed by their exact bytes, so the manifest repeated by every block request of one file and
+        /// the records repeated across lookups are parsed, signature-checked and allocated once.
+        /// </summary>
+        private static readonly EncodedCache<DHTRecord> s_cache = new EncodedCache<DHTRecord>(CacheCapacity,
+            static encoded => new DHTRecord(encoded.Span), static (record, encoded) => !record.IsExpired && record.Encoded.SequenceEqual(encoded));
         /// <summary>The signed wire representation.</summary>
         private readonly byte[] _encoded;
+        /// <summary>The cached local geometry identifier, formatted on first use.</summary>
+        private string? _contentId;
         /// <summary>Gets the publisher-scoped lookup key.</summary>
         public DHTKey Key { get; }
         /// <summary>
@@ -39,6 +51,8 @@ namespace MajDHTNetwork
         public DateTimeOffset ExpiresAt { get; }
         /// <summary>Gets whether the publication has expired.</summary>
         public bool IsExpired => ExpiresAt <= DateTimeOffset.UtcNow;
+        /// <summary>Gets the local geometry identifier: the whole-file hash and canonical block size, formatted once per record.</summary>
+        internal string ContentId => _contentId ??= FileHash + ":" + BlockSize.ToString(System.Globalization.CultureInfo.InvariantCulture);
 
         /// <summary>Decodes and authenticates a signed publication.</summary>
         /// <param name="encoded">The canonical signed bytes.</param>
@@ -51,7 +65,7 @@ namespace MajDHTNetwork
             var signature = wrapper.Bytes(64);
             wrapper.End();
             using var wire = new Wire(payload);
-            if (wire.Text(32) != "MajDHT/1/record")
+            if (!wire.Tag(ProtocolTags.Record))
             {
                 throw new InvalidDataException("Unsupported record version.");
             }
@@ -136,7 +150,7 @@ namespace MajDHTNetwork
         {
             var key = new DHTKey(identity.NodeId, name);
             using var payload = new Wire();
-            payload.PutText("MajDHT/1/record");
+            payload.Put(ProtocolTags.Record);
             payload.Put(identity.PublicKey);
             payload.PutText(key.ToString());
             payload.PutByte(flags);
@@ -179,11 +193,24 @@ namespace MajDHTNetwork
         /// <exception cref="InvalidDataException">The record cannot be authenticated.</exception>
         public static DHTRecord Parse(ReadOnlySpan<byte> encoded)
         {
-            if (encoded.Length > 2200)
+            if (encoded.Length > MaxEncodedLength)
             {
                 throw new ArgumentException("Invalid record size.", nameof(encoded));
             }
             return new DHTRecord(encoded);
+        }
+
+        /// <summary>Gets the verified record for canonical bytes received on the wire, reusing the cached instance for repeated bytes.</summary>
+        /// <param name="encoded">The borrowed canonical record; it is never retained.</param>
+        /// <returns>The authenticated, unexpired publication.</returns>
+        /// <exception cref="InvalidDataException">The record is oversized or cannot be authenticated.</exception>
+        internal static DHTRecord ParseCached(ReadOnlyMemory<byte> encoded)
+        {
+            if (encoded.Length > MaxEncodedLength)
+            {
+                throw new InvalidDataException("Oversized record.");
+            }
+            return s_cache.Get(encoded);
         }
 
         /// <summary>Checks whether another publication describes identical block geometry and content, or is also a withdrawal.</summary>

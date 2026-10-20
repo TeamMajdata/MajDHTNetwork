@@ -12,7 +12,7 @@ namespace MajDHTNetwork
         private readonly IPAddress _address;
 
         /// <summary>Gets a copy of the advertised IP address.</summary>
-        public IPAddress Address => IPAddress.Parse(_address.ToString());
+        public IPAddress Address => Protocol.NetworkScope.CopyAddress(_address);
         /// <summary>Gets the internally cached address for socket operations.</summary>
         internal IPAddress NetworkAddress => _address;
         /// <summary>Gets the TCP port, or zero when this endpoint does not accept TCP.</summary>
@@ -37,7 +37,7 @@ namespace MajDHTNetwork
             {
                 throw new ArgumentException("Invalid advertised endpoint address, port or flags.");
             }
-            _address = IPAddress.Parse(address.ToString());
+            _address = Protocol.NetworkScope.CopyAddress(address);
             TcpPort = tcpPort;
             UdpPort = udpPort;
             Flags = flags;

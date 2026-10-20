@@ -171,7 +171,7 @@ namespace MajDHTNetwork
                         throw new ArgumentException("Configure at most one listen address per address family.");
                     }
                 }
-                result.Add(IPAddress.Parse(address.ToString()));
+                result.Add(NetworkScope.CopyAddress(address));
             }
             return result;
         }
@@ -199,7 +199,7 @@ namespace MajDHTNetwork
                 {
                     throw new ArgumentException("Advertised addresses must be distinct unicast addresses of a listener's address family.");
                 }
-                result.Add(IPAddress.Parse(address.ToString()));
+                result.Add(NetworkScope.CopyAddress(address));
             }
             return result;
         }
@@ -225,7 +225,7 @@ namespace MajDHTNetwork
                 {
                     throw new ArgumentException("Bootstrap endpoints require a unicast address and a non-zero port.");
                 }
-                result.Add(new IPEndPoint(IPAddress.Parse(endpoint.Address.ToString()), endpoint.Port));
+                result.Add(NetworkScope.CopyEndpoint(endpoint));
             }
             return result;
         }

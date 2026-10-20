@@ -53,13 +53,17 @@ namespace MajDHTNetwork.Tests
             var secret = Encoding.UTF8.GetBytes("private lookup key and content bytes");
             var message = new Packet(sender, Crypto.Random(16), (byte)Operation.Ping, secret);
             var encrypted = message.Seal(identity, recipient);
-            var opened = Packet.Open(remote, encrypted);
-            Assert.True(BytesEqual(opened.Body, secret) && opened.Sender.NodeId == sender.NodeId, "Envelope must authenticate sender and payload.");
+            // Opening decrypts in place, so the envelope is inspected and copied before it is consumed.
             Assert.True(!Encoding.UTF8.GetString(encrypted).Contains("private lookup"), "Application payload must be encrypted.");
-            Assert.ThrowsAny<CryptographicException>(() => Packet.Open(identity, encrypted));
             var changed = (byte[])encrypted.Clone();
             changed[changed.Length - 1] ^= 1;
+            var wrongRecipient = (byte[])encrypted.Clone();
+            var opened = Packet.Open(remote, encrypted);
+            Assert.True(BytesEqual(opened.Body, secret) && opened.Sender.NodeId == sender.NodeId, "Envelope must authenticate sender and payload.");
+            Assert.ThrowsAny<CryptographicException>(() => Packet.Open(identity, wrongRecipient));
             Assert.ThrowsAny<CryptographicException>(() => Packet.Open(remote, changed));
+            Assert.True(Array.TrueForAll(changed.AsSpan(changed.Length - 64).ToArray(), value => value == 0),
+                "A failed authentication must zero the ciphertext region instead of leaving partial plaintext.");
             var forged = message.Seal(new DHTIdentity(), recipient);
             Assert.ThrowsAny<CryptographicException>(() => Packet.Open(remote, forged));
             Packet.CheckForward(encrypted, recipient.NodeId);

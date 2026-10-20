@@ -447,7 +447,8 @@ namespace MajDHTNetwork
             var response = await RequestNatAsync(relay, transport, body.WrittenMemory, cancellationToken).ConfigureAwait(false);
             DialBackJob job;
             string id;
-            using (var reader = new Wire(response.Body))
+            using (var arrangement = response.Body)
+            using (var reader = new Wire(arrangement.Bytes))
             {
                 var observed = ReadNatEndpoint(reader);
                 var helper = reader.Text(64);
@@ -543,11 +544,12 @@ namespace MajDHTNetwork
         /// <param name="request">The remaining request arguments.</param>
         /// <param name="transport">The receiving transport.</param>
         /// <param name="source">The client's observed endpoint, which is the only permitted dial-back address.</param>
+        /// <param name="response">The encoder receiving the observed endpoint, helper identity, nonce, expiry and candidate ports.</param>
         /// <param name="cancellationToken">The handler lifetime.</param>
-        /// <returns>The observed endpoint, helper identity, nonce, expiry and candidate ports.</returns>
+        /// <returns>Completion after a helper accepted the dial-back and the arrangement was written.</returns>
         /// <exception cref="IOException">The requester exceeded its quota or no helper accepted the dial-back.</exception>
         /// <exception cref="InvalidDataException">The request is malformed.</exception>
-        private async Task<ReadOnlyMemory<byte>> DispatchDialBackAsync(Packet packet, Wire request, DHTTransport transport, IPEndPoint source,
+        private async Task DispatchDialBackAsync(Packet packet, Wire request, DHTTransport transport, IPEndPoint source, Wire response,
             CancellationToken cancellationToken)
         {
             lock (_gate)
@@ -596,7 +598,8 @@ namespace MajDHTNetwork
                 }
                 try
                 {
-                    await RequestAsync(helper, Operation.Rendezvous, assist.WrittenMemory, cancellationToken, allowRelay: false).ConfigureAwait(false);
+                    using var acceptance = await RequestAsync(helper, Operation.Rendezvous, assist.WrittenMemory, cancellationToken, allowRelay: false)
+                        .ConfigureAwait(false);
                 }
                 catch (Exception exception) when (IsPeerFailure(exception))
                 {
@@ -604,13 +607,12 @@ namespace MajDHTNetwork
                     Log(LogLevel.Debug, "Dial-back helper declined: ", exception);
                     continue;
                 }
-                using var response = new Wire();
                 PutNatEndpoint(response, source);
                 response.PutText(helper.NodeId);
                 response.Put(nonce);
                 response.PutLong(expiresAt.ToUnixTimeMilliseconds());
                 WriteProbePorts(response, ports);
-                return response.ToArray();
+                return;
             }
             throw new IOException("No independent dial-back helper is available.");
         }
@@ -686,16 +688,15 @@ namespace MajDHTNetwork
         /// <summary>Accepts a relay's dial-back delegation and probes the client's observed address in the background.</summary>
         /// <param name="packet">The authenticated relay request.</param>
         /// <param name="request">The remaining request arguments.</param>
-        /// <returns>An empty result once the probes are scheduled.</returns>
         /// <exception cref="IOException">The relay or target exceeded a quota, or the target scope is not permitted.</exception>
         /// <exception cref="InvalidDataException">The delegation is malformed or expired.</exception>
-        private ReadOnlyMemory<byte> DispatchDialBackAssist(Packet packet, Wire request)
+        private void DispatchDialBackAssist(Packet packet, Wire request)
         {
             if ((packet.Sender.Capabilities & DHTCapabilities.Relay) == 0)
             {
                 throw new InvalidDataException("Only relays may delegate dial-backs.");
             }
-            var owner = new DHTPeer(request.Bytes(DHTPeer.MaxEncodedLength));
+            var owner = DHTPeer.Parse(request.Bytes(DHTPeer.MaxEncodedLength));
             var transport = request.Byte();
             var targetText = request.Text(96);
             var ports = ReadProbePorts(request);
@@ -726,7 +727,6 @@ namespace MajDHTNetwork
                 }
                 _probeWork.Add(SendProbesAsync(owner, (DHTTransport)transport, target, ports, nonce, expiresAt));
             }
-            return Array.Empty<byte>();
         }
 
         /// <summary>Checks whether this helper may send probes to an address scope.</summary>
@@ -867,7 +867,8 @@ namespace MajDHTNetwork
                 var probe = new Packet(LocalPeer, Crypto.Random(16), (byte)Operation.Probe, body.ToArray());
                 var encoded = await _transport.ExchangeAtAsync(transport, endpoint, probe.Seal(_identity, owner), cancellationToken)
                     .ConfigureAwait(false);
-                ReadResponseBody(AuthenticateResponse(encoded, owner, probe));
+                using var response = AuthenticateResponse(encoded, owner, probe);
+                ReadResponseBody(response.Packet);
                 return true;
             }
             catch (Exception exception) when (IsPeerFailure(exception) || exception is InvalidOperationException)
@@ -877,12 +878,11 @@ namespace MajDHTNetwork
             }
         }
 
-        /// <summary>Accepts a helper's dial-back probe for a pending local job.</summary>
+        /// <summary>Accepts a helper's dial-back probe for a pending local job; the response body stays empty.</summary>
         /// <param name="packet">The authenticated probe.</param>
         /// <param name="transport">The receiving transport.</param>
-        /// <returns>An empty successful result.</returns>
         /// <exception cref="InvalidDataException">The probe does not match a pending job.</exception>
-        private ReadOnlyMemory<byte> DispatchProbe(Packet packet, DHTTransport transport)
+        private void DispatchProbe(Packet packet, DHTTransport transport)
         {
             using var reader = new Wire(packet.Body);
             var nonce = reader.Bytes(16);
@@ -898,7 +898,6 @@ namespace MajDHTNetwork
                 }
                 job.Success.TrySetResult((int)index);
             }
-            return Array.Empty<byte>();
         }
 
         /// <summary>Encodes a bounded dial-back candidate port list.</summary>

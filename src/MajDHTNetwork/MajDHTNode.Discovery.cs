@@ -75,7 +75,7 @@ namespace MajDHTNetwork
                 throw new ArgumentException("A remote bootstrap contact is required.", nameof(bootstrap));
             }
             using var cancellation = OperationCancellation(cancellationToken);
-            await RequestAsync(bootstrap, Operation.Ping, Array.Empty<byte>(), cancellation.Token).ConfigureAwait(false);
+            using var pong = await RequestAsync(bootstrap, Operation.Ping, Array.Empty<byte>(), cancellation.Token).ConfigureAwait(false);
             await RegisterBootstrapRelayAsync(bootstrap, cancellation.Token).ConfigureAwait(false);
             await LookupAsync(0, NodeId, cancellation.Token).ConfigureAwait(false);
             Log(LogLevel.Information, "Bootstrap authentication and neighbor discovery completed.");
@@ -119,9 +119,10 @@ namespace MajDHTNetwork
                 var counter = new TransmissionCounter();
                 try
                 {
-                    var encoded = await _transport.ExchangeAtAsync(transport, endpoint, request.SealHello(_identity), cancellationToken, counter)
+                    using var encoded = await _transport.ExchangeAtAsync(transport, endpoint, request.SealHello(_identity), cancellationToken, counter)
                         .ConfigureAwait(false);
-                    var response = Packet.Open(_identity, encoded);
+                    // The contact and endpoint read below are copies, so the frame is released when this attempt ends.
+                    var response = Packet.Open(_identity, encoded.Bytes);
                     if (response.Sender.NodeId == NodeId || !HasRequiredWork(response.Sender) || response.Kind != (request.Kind | 128)
                         || !CryptographicOperations.FixedTimeEquals(response.RequestId.Span, request.RequestId.Span))
                     {
@@ -471,10 +472,10 @@ namespace MajDHTNetwork
             body.PutText(target);
             try
             {
-                var response = await RequestAsync(peer, Operation.Find, body.WrittenMemory, cancellationToken).ConfigureAwait(false);
-                using var reader = new Wire(response);
-                var signedRecord = reader.Bytes(2200);
-                var record = signedRecord.Length == 0 ? null : DHTRecord.Parse(signedRecord.Span);
+                using var response = await RequestAsync(peer, Operation.Find, body.WrittenMemory, cancellationToken).ConfigureAwait(false);
+                using var reader = new Wire(response.Bytes);
+                var signedRecord = reader.Bytes(DHTRecord.MaxEncodedLength);
+                var record = signedRecord.Length == 0 ? null : DHTRecord.ParseCached(signedRecord);
                 var peers = ReadPeers(reader);
                 peers.RemoveAll(peer => !HasRequiredWork(peer));
                 var providers = ReadPeers(reader);

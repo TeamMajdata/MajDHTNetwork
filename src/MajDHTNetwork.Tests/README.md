@@ -77,10 +77,11 @@ and requires the DLL, XML documentation, README, protocol document and license.
 | `src/TestDefaults.cs` | Module initializer that disables the default identity work for short-lived test nodes; Sybil tests set `IdentityWorkBits` explicitly. |
 | `src/IdentityPuzzleTests.cs` | Exclusive check that floods of uncached identities beyond the per-second Argon2id budget are not evaluated. |
 | `src/WithdrawalTests.cs` | Signed withdrawals without content, key withdrawal with resolution, download refusal, provider and content pruning, replay refusal and republication, and local `StopProviding`. |
-| `src/MemoryTests.cs`, `src/ContentStoreTests.cs` | Span APIs, borrowed/owned memory, immutable snapshots and bounded cache eviction. |
+| `src/MemoryTests.cs`, `src/ContentStoreTests.cs` | Span APIs, borrowed/owned memory, owned frame views, immutable snapshots and bounded cache eviction. |
+| `src/FrameOwnershipTests.cs` | Pooled receive frames released only after their consumers copied what they keep: stored, written and publicly read blocks survive array-pool churn after TCP and UDP downloads. |
 | `src/RoutingTests.cs`, `src/LoggingTests.cs` | Default Kademlia table XOR distance ordering, routing removal and structured logging contracts. |
 | `src/MerkleTests.cs`, `src/NetworkTests.cs` | File geometry, signatures, discovery, aliases, relays and malicious-provider recovery. |
-| `src/TransportTests.cs`, `src/TransportSessionTests.cs` | Dual listeners, IPv6, fallback/loss/replay, persistent duplex TCP and endpoint-pinned UDP demultiplexing. |
+| `src/TransportTests.cs`, `src/TransportSessionTests.cs` | Dual listeners, IPv6, fallback/loss/replay, persistent duplex TCP that survives rejected incoming requests, and endpoint-pinned UDP demultiplexing. |
 | `src/LeaseTests.cs`, `src/LifecycleTests.cs` | Revision floors, expiry, quotas, capabilities, cancellation and shutdown. |
 | `src/NATTests.cs`, `src/NATProtocolPeer.cs`, `src/NatQuotaTests.cs`, `src/NatFallbackTests.cs` | Relay-assisted direct routes, adversarial probes, observed endpoints, registration recovery/quotas and opaque fallback after a successful punch. |
 | `src/ValueTypeTests.cs` | Key/Packet defaults, value semantics, input boundaries, ownership and zero-allocation operations. |

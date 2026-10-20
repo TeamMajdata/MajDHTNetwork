@@ -146,7 +146,7 @@ namespace MajDHTNetwork
             {
                 try
                 {
-                    await RequestAsync(peer, Operation.Store, body.WrittenMemory, cancellationToken).ConfigureAwait(false);
+                    using var acceptance = await RequestAsync(peer, Operation.Store, body.WrittenMemory, cancellationToken).ConfigureAwait(false);
                     accepted++;
                 }
                 catch (Exception exception) when (IsPeerFailure(exception))

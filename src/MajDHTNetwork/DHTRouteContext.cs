@@ -42,7 +42,7 @@ namespace MajDHTNetwork
             var addresses = new List<IPAddress>();
             foreach (var address in externalAddresses)
             {
-                addresses.Add(IPAddress.Parse(address.ToString()));
+                addresses.Add(Protocol.NetworkScope.CopyAddress(address));
             }
             PreferredTransport = preferredTransport;
             NatTraversalEnabled = natTraversalEnabled;

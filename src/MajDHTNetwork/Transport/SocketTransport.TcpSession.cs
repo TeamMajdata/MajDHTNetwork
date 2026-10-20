@@ -4,7 +4,6 @@ using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using MajDHTNetwork.Protocol;
@@ -146,30 +145,23 @@ namespace MajDHTNetwork.Transport
                 var cipher = outer.Bytes(Wire.MaxPacket);
                 outer.End();
                 using var reader = new Wire(header);
-                if (reader.Text(32) != "MajDHT/1/envelope")
+                if (!reader.Tag(ProtocolTags.Envelope))
                 {
                     return null;
                 }
                 var kind = reader.Byte();
-                var recipient = reader.Text(64);
-                var key = reader.Bytes(32);
-                var nonce = reader.Bytes(12);
+                var recipient = reader.Bytes(Crypto.DigestLength * 2);
+                var key = reader.Bytes(Crypto.AgreementKeyLength);
+                var nonce = reader.Bytes(Crypto.NonceLength);
                 reader.End();
-                if ((kind & 0x7f) == 0 || recipient.Length != 64 || key.Length != 32 || nonce.Length != 12 || cipher.Length < 16)
+                if ((kind & 0x7f) == 0 || !Crypto.IsHash(recipient.Span) || key.Length != Crypto.AgreementKeyLength
+                    || nonce.Length != Crypto.NonceLength || cipher.Length < Crypto.TagLength)
                 {
                     return null;
                 }
-                for (var index = 0; index < recipient.Length; index++)
-                {
-                    var character = recipient[index];
-                    if (!((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')))
-                    {
-                        return null;
-                    }
-                }
                 return kind;
             }
-            catch (Exception exception) when (exception is InvalidDataException || exception is DecoderFallbackException)
+            catch (InvalidDataException)
             {
                 return null;
             }
@@ -196,11 +188,15 @@ namespace MajDHTNetwork.Transport
             private readonly SemaphoreSlim _sendGate = new SemaphoreSlim(1, 1);
             /// <summary>Protects the outbound response slot.</summary>
             private readonly object _responseSync = new object();
+            /// <summary>The reusable length prefix of received frames, owned by the single reader loop.</summary>
+            private readonly byte[] _readPrefix = new byte[FramePrefixLength];
+            /// <summary>The reusable length prefix of sent frames, serialized by the send gate.</summary>
+            private readonly byte[] _writePrefix = new byte[FramePrefixLength];
             /// <summary>The connection establishment result.</summary>
             private readonly TaskCompletionSource<bool> _ready =
                 new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            /// <summary>The response to the one currently outstanding outbound request.</summary>
-            private TaskCompletionSource<ReadOnlyMemory<byte>>? _response;
+            /// <summary>The response to the one currently outstanding outbound request, as the pooled frame it arrived in.</summary>
+            private TaskCompletionSource<PooledBuffer>? _response;
             /// <summary>The expected untrusted response operation when the request has a known header.</summary>
             private byte? _expectedKind;
             /// <summary>The last read or write timestamp used for idle eviction.</summary>
@@ -275,27 +271,38 @@ namespace MajDHTNetwork.Transport
                     var stream = _client.GetStream();
                     while (!_token.IsCancellationRequested)
                     {
-                        var frame = await ReadFrameAsync(stream, _token).ConfigureAwait(false);
-                        Touch();
-                        var kind = ReadEnvelopeKind(frame);
-                        bool response;
-                        lock (_responseSync)
+                        var frame = await ReadFrameAsync(stream, _readPrefix, _token).ConfigureAwait(false);
+                        // The frame belongs to whoever takes it: the outstanding exchange or the request dispatcher. A response
+                        // that nobody is waiting for is released here.
+                        var taken = false;
+                        try
                         {
-                            response = _owner._responseClassifier != null
-                                ? _owner._responseClassifier(frame)
-                                : kind.HasValue ? (kind.Value & 0x80) != 0 : _response != null;
-                            if (response)
+                            Touch();
+                            var kind = ReadEnvelopeKind(frame.Memory);
+                            bool response;
+                            lock (_responseSync)
                             {
-                                if (_response != null && (!_expectedKind.HasValue || !kind.HasValue || kind == _expectedKind))
+                                response = _owner._responseClassifier != null
+                                    ? _owner._responseClassifier(frame.Memory)
+                                    : kind.HasValue ? (kind.Value & 0x80) != 0 : _response != null;
+                                if (response && _response != null && (!_expectedKind.HasValue || !kind.HasValue || kind == _expectedKind))
                                 {
-                                    _response.TrySetResult(frame);
+                                    taken = _response.TrySetResult(frame);
                                 }
                             }
+                            if (!response)
+                            {
+                                Interlocked.Increment(ref _incoming);
+                                taken = true;
+                                _owner.DispatchTcp(this, frame);
+                            }
                         }
-                        if (!response)
+                        finally
                         {
-                            Interlocked.Increment(ref _incoming);
-                            _owner.DispatchTcp(this, frame);
+                            if (!taken)
+                            {
+                                frame.Dispose();
+                            }
                         }
                     }
                 }
@@ -323,19 +330,21 @@ namespace MajDHTNetwork.Transport
             /// <summary>Serializes one outgoing request while the independent reader serves incoming frames.</summary>
             /// <param name="packet">The encrypted request.</param>
             /// <param name="cancellationToken">The caller and exchange budget.</param>
-            /// <returns>The opaque response, requiring caller authentication.</returns>
+            /// <returns>The opaque response in the pooled frame it arrived in; the caller authenticates it and releases the frame.</returns>
             /// <exception cref="IOException">The connection closes before its response arrives.</exception>
             /// <exception cref="OperationCanceledException">The exchange is cancelled.</exception>
-            internal async Task<ReadOnlyMemory<byte>> ExchangeAsync(ReadOnlyMemory<byte> packet, CancellationToken cancellationToken)
+            internal async Task<PooledBuffer> ExchangeAsync(ReadOnlyMemory<byte> packet, CancellationToken cancellationToken)
             {
                 Interlocked.Increment(ref _outgoing);
                 var entered = false;
+                var delivered = false;
+                TaskCompletionSource<PooledBuffer>? response = null;
                 try
                 {
                     await _exchangeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
                     entered = true;
                     await AwaitCancellableAsync(_ready.Task, cancellationToken).ConfigureAwait(false);
-                    var response = new TaskCompletionSource<ReadOnlyMemory<byte>>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    response = new TaskCompletionSource<PooledBuffer>(TaskCreationOptions.RunContinuationsAsynchronously);
                     ObserveFault(response.Task);
                     var kind = ReadEnvelopeKind(packet);
                     lock (_responseSync)
@@ -348,7 +357,12 @@ namespace MajDHTNetwork.Transport
                         _response = response;
                     }
                     await SendAsync(packet, cancellationToken).ConfigureAwait(false);
-                    return await AwaitCancellableAsync(response.Task, cancellationToken).ConfigureAwait(false);
+                    // Cancelling the slot directly avoids the extra completion source and race task of a generic wait.
+                    using var cancellation = cancellationToken.Register(
+                        static state => ((TaskCompletionSource<PooledBuffer>)state!).TrySetCanceled(), response);
+                    var frame = await response.Task.ConfigureAwait(false);
+                    delivered = true;
+                    return frame;
                 }
                 catch
                 {
@@ -367,6 +381,11 @@ namespace MajDHTNetwork.Transport
                         {
                             _response = null;
                             _expectedKind = null;
+                        }
+                        if (!delivered && response != null && response.Task.IsCompletedSuccessfully)
+                        {
+                            // The reader filled the slot after this exchange had already failed, so nobody else releases the frame.
+                            response.Task.Result.Dispose();
                         }
                         _exchangeGate.Release();
                     }
@@ -390,7 +409,7 @@ namespace MajDHTNetwork.Transport
                     {
                         throw new IOException("The TCP session has closed.");
                     }
-                    await WriteFrameAsync(_client.GetStream(), packet, lifetime.Token).ConfigureAwait(false);
+                    await WriteFrameAsync(_client.GetStream(), _writePrefix, packet, lifetime.Token).ConfigureAwait(false);
                     Touch();
                 }
                 finally

@@ -63,9 +63,9 @@ namespace MajDHTNetwork.Tests
             providerPeer = DHTPeer.Create(identity, IPAddress.Parse("127.0.0.2"), 0, 1, DHTCapabilities.Provide);
             provider.Run();
             var registration = new Packet(providerPeer, Crypto.Random(16), (byte)Operation.Rendezvous, new byte[] { 0 });
-            var registrationBytes = await provider.ExchangeAtAsync(DHTTransport.Udp,
+            using var registrationBytes = await provider.ExchangeAtAsync(DHTTransport.Udp,
                 new IPEndPoint(IPAddress.Loopback, relay.LocalPeer.UdpPort()), registration.Seal(identity, relay.LocalPeer), deadline.Token);
-            var registered = Packet.Open(identity, registrationBytes);
+            var registered = Packet.Open(identity, registrationBytes.Bytes);
             Assert.Equal(relay.NodeId, registered.Sender.NodeId);
             using (var reply = new Wire(registered.Body))
             {

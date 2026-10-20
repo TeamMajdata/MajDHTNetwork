@@ -12,7 +12,7 @@ namespace MajDHTNetwork
         private readonly IPEndPoint _endpoint;
 
         /// <summary>Gets a copy of the remote endpoint.</summary>
-        public IPEndPoint Endpoint => new IPEndPoint(IPAddress.Parse(_endpoint.Address.ToString()), _endpoint.Port);
+        public IPEndPoint Endpoint => Protocol.NetworkScope.CopyEndpoint(_endpoint);
         /// <summary>Gets the transport.</summary>
         public DHTTransport Transport { get; }
         /// <summary>Gets the number of request transmissions sent over this route.</summary>
@@ -38,7 +38,7 @@ namespace MajDHTNetwork
             {
                 throw new ArgumentException("Invalid route statistics.");
             }
-            _endpoint = new IPEndPoint(IPAddress.Parse(endpoint.Address.ToString()), endpoint.Port);
+            _endpoint = Protocol.NetworkScope.CopyEndpoint(endpoint);
             Transport = transport;
             SentPackets = sentPackets;
             LostPackets = lostPackets;

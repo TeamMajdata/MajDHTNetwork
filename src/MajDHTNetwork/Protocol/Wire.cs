@@ -146,6 +146,23 @@ namespace MajDHTNetwork.Protocol
             bytes.CopyTo(Reserve(bytes.Length));
         }
 
+        /// <summary>Writes a length-prefixed lowercase hexadecimal identifier directly from its digest without a string.</summary>
+        /// <param name="digest">The digest to format.</param>
+        internal void PutHex(ReadOnlySpan<byte> digest)
+        {
+            PutLong(digest.Length * 2);
+            Crypto.HexTo(digest, Reserve(digest.Length * 2));
+        }
+
+        /// <summary>Reads a length-prefixed value and compares it with an expected canonical label without decoding text.</summary>
+        /// <param name="expected">The expected label bytes.</param>
+        /// <returns>Whether the value equals the label.</returns>
+        /// <exception cref="InvalidDataException">The value is longer than the label or truncated.</exception>
+        internal bool Tag(ReadOnlySpan<byte> expected)
+        {
+            return Bytes(expected.Length).Span.SequenceEqual(expected);
+        }
+
         /// <summary>Reads a bounded length-prefixed view without allocating or copying its contents.</summary>
         /// <param name="limit">The maximum accepted length.</param>
         /// <returns>A borrowed immutable slice retaining its input owner.</returns>

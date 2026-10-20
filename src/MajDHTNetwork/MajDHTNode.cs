@@ -40,8 +40,8 @@ namespace MajDHTNetwork
         private readonly Dictionary<string, Dictionary<string, ProviderClaim>> _providers = new Dictionary<string, Dictionary<string, ProviderClaim>>();
         /// <summary>The locally available Merkle trees indexed by file hash and block size.</summary>
         private readonly Dictionary<string, LocalContent> _contents = new Dictionary<string, LocalContent>();
-        /// <summary>The bounded request replay cache.</summary>
-        private readonly Dictionary<string, CachedReply> _replies = new Dictionary<string, CachedReply>();
+        /// <summary>The bounded request replay cache, keyed without strings so every request can be matched allocation-free.</summary>
+        private readonly Dictionary<ReplayKey, CachedReply> _replies = new Dictionary<ReplayKey, CachedReply>();
         /// <summary>The owned socket listeners and exchange implementation.</summary>
         private readonly SocketTransport _transport;
         /// <summary>The current signed contact, refreshed during maintenance.</summary>
@@ -233,7 +233,7 @@ namespace MajDHTNetwork
         /// <returns>The whole-file hash and canonical block size.</returns>
         private static string ContentId(DHTRecord record)
         {
-            return record.FileHash + ":" + record.BlockSize.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            return record.ContentId;
         }
 
         /// <summary>Keeps the signed content geometry with its Merkle authentication tree.</summary>
@@ -258,7 +258,7 @@ namespace MajDHTNetwork
         private sealed class CachedReply
         {
             /// <summary>The authenticated operation fingerprint.</summary>
-            internal string Fingerprint { get; }
+            internal RequestFingerprint Fingerprint { get; }
             /// <summary>The insertion time used for expiry.</summary>
             internal DateTimeOffset Created { get; } = DateTimeOffset.UtcNow;
             /// <summary>The single completion shared by duplicate requests.</summary>
@@ -266,9 +266,84 @@ namespace MajDHTNetwork
 
             /// <summary>Creates a pending replay entry.</summary>
             /// <param name="fingerprint">The operation and body fingerprint.</param>
-            internal CachedReply(string fingerprint)
+            internal CachedReply(RequestFingerprint fingerprint)
             {
                 Fingerprint = fingerprint;
+            }
+        }
+
+        /// <summary>Identifies a request by its sender digest and correlation identifier without strings.</summary>
+        private readonly struct ReplayKey : IEquatable<ReplayKey>
+        {
+            /// <summary>The sender's node digest.</summary>
+            private readonly DigestKey _sender;
+            /// <summary>The first correlation identifier word.</summary>
+            private readonly ulong _high;
+            /// <summary>The second correlation identifier word.</summary>
+            private readonly ulong _low;
+
+            /// <summary>Copies the sender digest and correlation identifier into inline storage.</summary>
+            /// <param name="senderHash">The 32-byte sender node digest.</param>
+            /// <param name="requestId">The 16-byte correlation identifier.</param>
+            internal ReplayKey(ReadOnlySpan<byte> senderHash, ReadOnlySpan<byte> requestId)
+            {
+                _sender = new DigestKey(senderHash);
+                _high = System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian(requestId);
+                _low = System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian(requestId.Slice(8));
+            }
+
+            /// <inheritdoc />
+            public bool Equals(ReplayKey other)
+            {
+                return _high == other._high && _low == other._low && _sender.Equals(other._sender);
+            }
+
+            /// <inheritdoc />
+            public override bool Equals(object? obj)
+            {
+                return obj is ReplayKey other && Equals(other);
+            }
+
+            /// <inheritdoc />
+            public override int GetHashCode()
+            {
+                return HashCode.Combine(_sender, _high, _low);
+            }
+        }
+
+        /// <summary>Fingerprints the operation and body of a request, so a reused identifier with different content is rejected.</summary>
+        private readonly struct RequestFingerprint : IEquatable<RequestFingerprint>
+        {
+            /// <summary>The operation with its response bit.</summary>
+            private readonly byte _kind;
+            /// <summary>The body digest.</summary>
+            private readonly DigestKey _body;
+
+            /// <summary>Hashes a request body and retains its operation.</summary>
+            /// <param name="kind">The operation with its response bit.</param>
+            /// <param name="body">The operation body.</param>
+            internal RequestFingerprint(byte kind, ReadOnlySpan<byte> body)
+            {
+                _kind = kind;
+                _body = DigestKey.Of(body);
+            }
+
+            /// <inheritdoc />
+            public bool Equals(RequestFingerprint other)
+            {
+                return _kind == other._kind && _body.Equals(other._body);
+            }
+
+            /// <inheritdoc />
+            public override bool Equals(object? obj)
+            {
+                return obj is RequestFingerprint other && Equals(other);
+            }
+
+            /// <inheritdoc />
+            public override int GetHashCode()
+            {
+                return HashCode.Combine(_kind, _body);
             }
         }
     }

@@ -14,7 +14,7 @@ namespace MajDHTNetwork
         private readonly IPEndPoint _endpoint;
 
         /// <summary>Gets a copy of the remote endpoint.</summary>
-        public IPEndPoint Endpoint => new IPEndPoint(IPAddress.Parse(_endpoint.Address.ToString()), _endpoint.Port);
+        public IPEndPoint Endpoint => NetworkScope.CopyEndpoint(_endpoint);
         /// <summary>Gets the owned endpoint for socket operations.</summary>
         internal IPEndPoint NetworkEndpoint => _endpoint;
         /// <summary>Gets the transport.</summary>
@@ -32,7 +32,7 @@ namespace MajDHTNetwork
             {
                 throw new ArgumentException("A direct route needs a unicast endpoint, a non-zero port and a TCP or UDP transport.");
             }
-            _endpoint = new IPEndPoint(IPAddress.Parse(endpoint.Address.ToString()), endpoint.Port);
+            _endpoint = NetworkScope.CopyEndpoint(endpoint);
             Transport = transport;
         }
     }

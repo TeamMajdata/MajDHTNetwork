@@ -75,13 +75,14 @@ namespace MajDHTNetwork.Tests
         /// <param name="peer">The destination contact.</param>
         /// <param name="packet">The sealed request.</param>
         /// <param name="token">The test deadline.</param>
-        /// <returns>The opaque response.</returns>
-        internal static Task<ReadOnlyMemory<byte>> ExchangeAsync(this SocketTransport transport, DHTPeer peer, ReadOnlyMemory<byte> packet,
+        /// <returns>The opaque response, copied out of its pooled frame so a test can keep it.</returns>
+        internal static async Task<ReadOnlyMemory<byte>> ExchangeAsync(this SocketTransport transport, DHTPeer peer, ReadOnlyMemory<byte> packet,
             CancellationToken token)
         {
             var protocol = peer.TcpPort() != 0 ? DHTTransport.Tcp : DHTTransport.Udp;
             var port = protocol == DHTTransport.Tcp ? peer.TcpPort() : peer.UdpPort();
-            return transport.ExchangeAtAsync(protocol, new IPEndPoint(peer.Address(), port), packet, token);
+            using var response = await transport.ExchangeAtAsync(protocol, new IPEndPoint(peer.Address(), port), packet, token);
+            return response.Preserve();
         }
     }
 }

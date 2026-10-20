@@ -292,15 +292,41 @@ namespace MajDHTNetwork
                 RequireDownloader();
             }
             using var cancellation = OperationCancellation(cancellationToken);
+            using var block = await ReadBlockCoreAsync(record, provider, index, relay, cancellation.Token).ConfigureAwait(false);
+            // A pooled frame never escapes as a public result: a remote block is copied before its frame is released.
+            return block.Preserve();
+        }
+
+        /// <summary>Reads one block of a validated manifest with a lifetime the caller already linked to the node.</summary>
+        /// <param name="record">The validated signed manifest.</param>
+        /// <param name="provider">The final content provider.</param>
+        /// <param name="index">The validated block index.</param>
+        /// <param name="relay">An optional relay; null permits direct access with automatic relay fallback.</param>
+        /// <param name="cancellationToken">The transfer lifetime, already linked to the node lifetime.</param>
+        /// <returns>
+        /// The raw block after exact length, position and Merkle authentication: a stable store view for a local block, or a
+        /// view inside the provider's response frame that the caller releases by disposing it.
+        /// </returns>
+        private async Task<OwnedMemory> ReadBlockCoreAsync(DHTRecord record, DHTPeer provider, int index, DHTPeer? relay,
+            CancellationToken cancellationToken)
+        {
             if (provider.NodeId == NodeId && relay == null)
             {
-                return (await ReadLocalBlockAsync(record, index, cancellation.Token).ConfigureAwait(false)).Bytes;
+                return new OwnedMemory((await ReadLocalBlockAsync(record, index, cancellationToken).ConfigureAwait(false)).Bytes);
             }
             using var body = new Wire();
             body.Put(record.Encoded);
             body.PutLong(index);
-            var response = await RequestAsync(provider, Operation.Block, body.WrittenMemory, cancellation.Token, relay).ConfigureAwait(false);
-            return VerifyRemoteBlock(record, index, response);
+            var response = await RequestAsync(provider, Operation.Block, body.WrittenMemory, cancellationToken, relay).ConfigureAwait(false);
+            try
+            {
+                return response.Narrow(VerifyRemoteBlock(record, index, response.Bytes));
+            }
+            catch
+            {
+                response.Dispose();
+                throw;
+            }
         }
 
         /// <summary>Parses a remote proof into stack storage and returns a verified borrowed block.</summary>
@@ -420,7 +446,7 @@ namespace MajDHTNetwork
             {
                 try
                 {
-                    await RequestAsync(peer, Operation.Store, body.WrittenMemory, cancellationToken).ConfigureAwait(false);
+                    using var acceptance = await RequestAsync(peer, Operation.Store, body.WrittenMemory, cancellationToken).ConfigureAwait(false);
                     accepted++;
                 }
                 catch (Exception exception) when (IsPeerFailure(exception))

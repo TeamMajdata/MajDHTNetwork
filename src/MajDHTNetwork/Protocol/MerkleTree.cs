@@ -40,7 +40,6 @@ namespace MajDHTNetwork.Protocol
             _offsets = new int[levels];
             _nodes = new byte[checked(total * 32)];
             leaves.CopyTo(_nodes);
-            using var hash = SHA256.Create();
             var width = Count;
             for (var level = 1; level < levels; level++)
             {
@@ -50,7 +49,7 @@ namespace MajDHTNetwork.Protocol
                 {
                     Parent(_nodes.AsSpan(_offsets[level - 1] + (index * 64), 32),
                         _nodes.AsSpan(_offsets[level - 1] + (Math.Min((index * 2) + 1, width - 1) * 32), 32),
-                        _nodes.AsSpan(_offsets[level] + (index * 32), 32), hash);
+                        _nodes.AsSpan(_offsets[level] + (index * 32), 32));
                 }
                 width = next;
             }
@@ -67,37 +66,26 @@ namespace MajDHTNetwork.Protocol
             return digest;
         }
 
-        /// <summary>Hashes a domain byte and a borrowed block without concatenating the complete block.</summary>
+        /// <summary>Hashes a domain byte and a borrowed block without concatenating the complete block or allocating a hash instance.</summary>
         /// <param name="bytes">The raw block.</param>
         /// <param name="destination">At least 32 writable digest bytes.</param>
+        /// <exception cref="ArgumentException">The destination is too short.</exception>
         internal static void Leaf(ReadOnlySpan<byte> bytes, Span<byte> destination)
         {
-            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-            Span<byte> prefix = stackalloc byte[1];
-            prefix[0] = 0;
-            hash.AppendData(prefix);
-            hash.AppendData(bytes);
-            if (!hash.TryGetHashAndReset(destination, out var written) || written != 32)
-            {
-                throw new ArgumentException("A leaf digest requires 32 writable bytes.", nameof(destination));
-            }
+            Crypto.HashPrefixed(0, bytes, destination);
         }
 
-        /// <summary>Hashes a branch using stack storage and an already allocated hash instance.</summary>
+        /// <summary>Hashes a branch using stack storage and the per-thread hash instance.</summary>
         /// <param name="left">The left digest.</param>
         /// <param name="right">The right digest.</param>
         /// <param name="destination">The output digest.</param>
-        /// <param name="hash">The reusable SHA-256 instance.</param>
-        private static void Parent(ReadOnlySpan<byte> left, ReadOnlySpan<byte> right, Span<byte> destination, SHA256 hash)
+        private static void Parent(ReadOnlySpan<byte> left, ReadOnlySpan<byte> right, Span<byte> destination)
         {
             Span<byte> input = stackalloc byte[65];
             input[0] = 1;
             left.CopyTo(input.Slice(1, 32));
             right.CopyTo(input.Slice(33, 32));
-            if (!hash.TryComputeHash(input, destination, out var written) || written != 32)
-            {
-                throw new CryptographicException("Merkle branch hashing failed.");
-            }
+            Crypto.Hash(input, destination);
         }
 
         /// <summary>Appends one leaf to pooled metadata storage and returns its content-store identifier.</summary>
@@ -200,17 +188,16 @@ namespace MajDHTNetwork.Protocol
             Span<byte> digest = stackalloc byte[32];
             Span<byte> expected = stackalloc byte[32];
             Leaf(bytes, digest);
-            using var hash = SHA256.Create();
             for (var level = 0; level < levels; level++)
             {
                 var sibling = proof.Slice(level * 32, 32);
                 if ((index & 1) == 0)
                 {
-                    Parent(digest, sibling, digest, hash);
+                    Parent(digest, sibling, digest);
                 }
                 else
                 {
-                    Parent(sibling, digest, digest, hash);
+                    Parent(sibling, digest, digest);
                 }
                 index /= 2;
             }

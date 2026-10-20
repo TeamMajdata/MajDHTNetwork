@@ -8,7 +8,7 @@ using MajDHTNetwork.Protocol;
 namespace MajDHTNetwork.Transport
 {
     /// <summary>Validates UDP return reachability with fixed-size cookies and borrowed envelope views.</summary>
-    internal sealed class UdpCookies
+    internal sealed class UdpCookies : IDisposable
     {
         /// <summary>The fixed transport header length.</summary>
         internal const int PrefixLength = 5;
@@ -20,8 +20,10 @@ namespace MajDHTNetwork.Transport
         internal const int HelloLength = 69;
         /// <summary>The maximum transport datagram size.</summary>
         internal const int MaxDatagram = Wire.MaxPacket + CorrelatedPrefixLength;
-        /// <summary>The running-node cookie secret.</summary>
-        private readonly byte[] _secret = Crypto.Random(32);
+        /// <summary>The keyed hash over the running-node cookie secret, reused for every cookie under <see cref="_hmacGate"/>.</summary>
+        private readonly HMACSHA256 _hmac = new HMACSHA256(Crypto.Random(32));
+        /// <summary>Serializes use of the keyed hash, which is not thread-safe.</summary>
+        private readonly object _hmacGate = new object();
 
         /// <summary>Writes a fixed transport header.</summary>
         /// <param name="destination">At least five writable bytes.</param>
@@ -70,10 +72,21 @@ namespace MajDHTNetwork.Transport
             wire.PutLong(endpoint.Port);
             wire.PutLong(window);
             wire.Put(packetHash);
-            using var hmac = new HMACSHA256(_secret);
-            if (!hmac.TryComputeHash(wire.WrittenSpan, destination, out var written) || written != 32)
+            lock (_hmacGate)
             {
-                throw new CryptographicException("UDP cookie hashing failed.");
+                if (!_hmac.TryComputeHash(wire.WrittenSpan, destination, out var written) || written != 32)
+                {
+                    throw new CryptographicException("UDP cookie hashing failed.");
+                }
+            }
+        }
+
+        /// <summary>Releases the keyed hash and its secret.</summary>
+        public void Dispose()
+        {
+            lock (_hmacGate)
+            {
+                _hmac.Dispose();
             }
         }
 

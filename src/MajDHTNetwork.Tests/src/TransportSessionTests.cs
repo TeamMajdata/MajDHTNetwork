@@ -87,6 +87,56 @@ namespace MajDHTNetwork.Tests
             Assert.Equal(13, Volatile.Read(ref incomingCount));
         }
 
+        /// <summary>Keeps the outstanding exchange and the connection alive after the local handler rejects an incoming request.</summary>
+        /// <returns>Completion after the pending response and one further exchange arrive on the same accepted connection.</returns>
+        [Fact]
+        [Trait("Category", "NAT")]
+        public async Task RejectedIncomingTcpRequestDoesNotAbortOutstandingExchangeOrCloseSession()
+        {
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            var token = deadline.Token;
+            using var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            var endpoint = (IPEndPoint)listener.LocalEndpoint;
+            var localIdentity = new DHTIdentity();
+            var remoteIdentity = new DHTIdentity();
+            var remote = DHTPeer.Create(remoteIdentity, IPAddress.Loopback, endpoint.Port, 0, DHTCapabilities.Download);
+            var rejected = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var incomingCount = 0;
+            await using var transport = new SocketTransport(ClientOptions(DHTTransport.Tcp).Snapshot(),
+                (bytes, protocol, source, cancellationToken) =>
+                {
+                    Interlocked.Increment(ref incomingCount);
+                    rejected.TrySetResult(true);
+                    return Task.FromException<ReadOnlyMemory<byte>>(new IOException("This peer serves no requests."));
+                });
+            transport.Bind();
+            var local = DHTPeer.Create(localIdentity, IPAddress.Loopback, transport.TcpPort, 0, DHTCapabilities.Download);
+            transport.Run();
+            var first = Request(local, Operation.Ping, 1);
+            var firstExchange = transport.ExchangeAtAsync(DHTTransport.Tcp, endpoint, first.Seal(localIdentity, remote), token);
+            using var connection = await listener.AcceptTcpClientAsync(token);
+
+            // Further active opens cannot succeed; both exchanges must complete on this accepted connection.
+            listener.Stop();
+            var stream = connection.GetStream();
+            AssertRequest(remoteIdentity, local, first, await ReadTcpFrameAsync(stream, token));
+
+            // Like a relay verifying a registrant, the remote asks its own question before it answers ours.
+            var remoteRequest = Request(remote, Operation.Ping, 2);
+            await WriteTcpFrameAsync(stream, remoteRequest.Seal(remoteIdentity, local), token);
+            await rejected.Task.WaitAsync(token);
+            await WriteTcpFrameAsync(stream, Response(first, remote).Seal(remoteIdentity, local), token);
+            AssertResponse(localIdentity, remote, first, await firstExchange);
+
+            var second = Request(local, Operation.Ping, 3);
+            var secondExchange = transport.ExchangeAtAsync(DHTTransport.Tcp, endpoint, second.Seal(localIdentity, remote), token);
+            AssertRequest(remoteIdentity, local, second, await ReadTcpFrameAsync(stream, token));
+            await WriteTcpFrameAsync(stream, Response(second, remote).Seal(remoteIdentity, local), token);
+            AssertResponse(localIdentity, remote, second, await secondExchange);
+            Assert.Equal(1, Volatile.Read(ref incomingCount));
+        }
+
         /// <summary>Routes reversed UDP replies by request digest and discards a reply carrying an unrelated digest.</summary>
         /// <returns>Completion after two concurrent authenticated exchanges from the listener's source port.</returns>
         [Fact]
@@ -236,6 +286,19 @@ namespace MajDHTNetwork.Tests
         private static void AssertResponse(DHTIdentity identity, DHTPeer sender, Packet request, ReadOnlyMemory<byte> encoded)
         {
             AssertRequest(identity, sender, Response(request, sender), encoded);
+        }
+
+        /// <summary>Authenticates a response delivered by the transport in its pooled frame, then releases the frame.</summary>
+        /// <param name="identity">The original requester's private identity.</param>
+        /// <param name="sender">The expected responder.</param>
+        /// <param name="request">The request whose slot must receive this response.</param>
+        /// <param name="encoded">The received encrypted response in its frame.</param>
+        private static void AssertResponse(DHTIdentity identity, DHTPeer sender, Packet request, OwnedMemory encoded)
+        {
+            using (encoded)
+            {
+                AssertResponse(identity, sender, request, encoded.Bytes);
+            }
         }
 
         /// <summary>Reads one bounded envelope from the external TCP peer's connection.</summary>

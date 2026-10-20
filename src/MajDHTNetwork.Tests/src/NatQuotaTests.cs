@@ -33,8 +33,8 @@ namespace MajDHTNetwork.Tests
             var secondIdentity = new DHTIdentity();
             await using var first = CreateClient(protocol);
             await using var second = CreateClient(protocol);
-            var registered = await RegisterAsync(first, firstIdentity, relay.LocalPeer, protocol, deadline.Token);
-            using (var response = new Wire(registered.Body))
+            using var registered = await RegisterAsync(first, firstIdentity, relay.LocalPeer, protocol, deadline.Token);
+            using (var response = new Wire(registered.Packet.Body))
             {
                 Assert.Equal(0, response.Byte());
                 using var payload = new Wire(response.Bytes(Wire.MaxPacket));
@@ -44,11 +44,11 @@ namespace MajDHTNetwork.Tests
                 payload.End();
                 response.End();
             }
-            var rejected = await RegisterAsync(second, secondIdentity, relay.LocalPeer, protocol, deadline.Token);
-            Assert.Equal(1, Status(rejected));
+            using var rejected = await RegisterAsync(second, secondIdentity, relay.LocalPeer, protocol, deadline.Token);
+            Assert.Equal(1, Status(rejected.Packet));
             await Task.Delay(TimeSpan.FromMilliseconds(1200), deadline.Token);
-            var reclaimed = await RegisterAsync(second, secondIdentity, relay.LocalPeer, protocol, deadline.Token);
-            Assert.Equal(0, Status(reclaimed));
+            using var reclaimed = await RegisterAsync(second, secondIdentity, relay.LocalPeer, protocol, deadline.Token);
+            Assert.Equal(0, Status(reclaimed.Packet));
         }
 
         /// <summary>Rejects an authenticated rendezvous request at a server without relay capability.</summary>
@@ -63,8 +63,8 @@ namespace MajDHTNetwork.Tests
             await using var server = new MajDHTNode(RelayOptions(protocol, DHTCapabilities.Download));
             await server.StartAsync(deadline.Token);
             await using var client = CreateClient(protocol);
-            var result = await RegisterAsync(client, new DHTIdentity(), server.LocalPeer, protocol, deadline.Token);
-            Assert.Equal(1, Status(result));
+            using var result = await RegisterAsync(client, new DHTIdentity(), server.LocalPeer, protocol, deadline.Token);
+            Assert.Equal(1, Status(result.Packet));
         }
 
         /// <summary>Retries TCP registration after an initial UDP-only success supplies the relay's corrected contact.</summary>
@@ -140,8 +140,8 @@ namespace MajDHTNetwork.Tests
         /// <param name="relay">The authenticated server contact.</param>
         /// <param name="protocol">The source mapping to register.</param>
         /// <param name="cancellationToken">The test deadline.</param>
-        /// <returns>The authenticated and correlated response.</returns>
-        private static async Task<Packet> RegisterAsync(SocketTransport client, DHTIdentity identity, DHTPeer relay,
+        /// <returns>The authenticated and correlated response, still holding its received frame until disposed.</returns>
+        private static async Task<OwnedPacket> RegisterAsync(SocketTransport client, DHTIdentity identity, DHTPeer relay,
             DHTTransport protocol, CancellationToken cancellationToken)
         {
             var sender = DHTPeer.Create(identity, IPAddress.Loopback, protocol == DHTTransport.Tcp ? 1 : 0,
@@ -149,11 +149,11 @@ namespace MajDHTNetwork.Tests
             var request = new Packet(sender, Crypto.Random(16), (byte)Operation.Rendezvous, new byte[] { 0 });
             var endpoint = new IPEndPoint(relay.Address(), protocol == DHTTransport.Tcp ? relay.TcpPort() : relay.UdpPort());
             var result = await client.ExchangeAtAsync(protocol, endpoint, request.Seal(identity, relay), cancellationToken);
-            var response = Packet.Open(identity, result);
+            var response = Packet.Open(identity, result.Bytes);
             Assert.Equal(relay.NodeId, response.Sender.NodeId);
             Assert.True(request.RequestId.Span.SequenceEqual(response.RequestId.Span));
             Assert.Equal((byte)(request.Kind | 0x80), response.Kind);
-            return response;
+            return new OwnedPacket(response, result);
         }
 
         /// <summary>Reads an operation status while validating its complete response framing.</summary>

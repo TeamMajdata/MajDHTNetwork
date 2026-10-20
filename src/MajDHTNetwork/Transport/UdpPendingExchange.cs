@@ -3,6 +3,7 @@ using System.Buffers.Binary;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
+using MajDHTNetwork.Protocol;
 
 #nullable enable
 
@@ -59,21 +60,23 @@ namespace MajDHTNetwork.Transport
         }
     }
 
-    /// <summary>Owns bounded challenge and response signals for one UDP exchange.</summary>
+    /// <summary>Owns bounded challenge and response signals for one UDP exchange, including the pooled frames they receive.</summary>
     internal sealed class UdpPendingExchange
     {
-        /// <summary>The first challenge from the pinned endpoint.</summary>
-        internal TaskCompletionSource<ReadOnlyMemory<byte>> Challenge { get; } =
-            new TaskCompletionSource<ReadOnlyMemory<byte>>(TaskCreationOptions.RunContinuationsAsynchronously);
-        /// <summary>The first correlated response after sending a cookie-bearing request.</summary>
-        internal TaskCompletionSource<ReadOnlyMemory<byte>> Response { get; } =
-            new TaskCompletionSource<ReadOnlyMemory<byte>>(TaskCreationOptions.RunContinuationsAsynchronously);
+        /// <summary>The first challenge from the pinned endpoint, read only by the exchange and released with it.</summary>
+        internal TaskCompletionSource<PooledBuffer> Challenge { get; } =
+            new TaskCompletionSource<PooledBuffer>(TaskCreationOptions.RunContinuationsAsynchronously);
+        /// <summary>The first correlated response after sending a cookie-bearing request, handed to the caller when delivered.</summary>
+        internal TaskCompletionSource<PooledBuffer> Response { get; } =
+            new TaskCompletionSource<PooledBuffer>(TaskCreationOptions.RunContinuationsAsynchronously);
         /// <summary>Gets the immutable destination snapshot.</summary>
         internal IPEndPoint Endpoint { get; }
         /// <summary>Gets the exact request digest.</summary>
         internal byte[] Digest { get; }
         /// <summary>Whether the challenge has been used to send a request.</summary>
         private int _requestSent;
+        /// <summary>Whether the response frame was handed to the caller, who then releases it.</summary>
+        private int _responseDelivered;
         /// <summary>Gets whether a cookie-bearing request has been sent.</summary>
         internal bool RequestSent => Volatile.Read(ref _requestSent) != 0;
 
@@ -90,6 +93,37 @@ namespace MajDHTNetwork.Transport
         internal void MarkRequestSent()
         {
             Volatile.Write(ref _requestSent, 1);
+        }
+
+        /// <summary>Records that the caller took the response frame and is responsible for releasing it.</summary>
+        internal void MarkResponseDelivered()
+        {
+            Volatile.Write(ref _responseDelivered, 1);
+        }
+
+        /// <summary>
+        /// Releases the received frames that no caller took, and closes both signals so that a frame routed to this exchange
+        /// afterwards is refused and released by the receiver instead.
+        /// </summary>
+        internal void Release()
+        {
+            ReleaseUndelivered(Challenge);
+            if (Volatile.Read(ref _responseDelivered) == 0)
+            {
+                ReleaseUndelivered(Response);
+            }
+        }
+
+        /// <summary>Closes one signal and releases the frame it holds when it was completed before being closed.</summary>
+        /// <param name="signal">The challenge or response signal.</param>
+        private static void ReleaseUndelivered(TaskCompletionSource<PooledBuffer> signal)
+        {
+            // Completing the signal and reading its state are atomic, so a frame either arrived before this point and is
+            // released here, or arrives afterwards, fails to complete the signal and is released by the receiver.
+            if (!signal.TrySetCanceled() && signal.Task.IsCompletedSuccessfully)
+            {
+                signal.Task.Result.Dispose();
+            }
         }
     }
 }

@@ -25,6 +25,16 @@ namespace MajDHTNetwork.Protocol
         /// <exception cref="ObjectDisposedException">The owner has been disposed.</exception>
         public Memory<byte> Memory => (_buffer ?? throw new ObjectDisposedException(nameof(PooledBuffer))).AsMemory(0, _length);
 
+        /// <summary>Rents a buffer of exactly the given length and copies bytes into it.</summary>
+        /// <param name="bytes">The bytes to copy, such as a datagram in a reusable receive buffer.</param>
+        /// <returns>An owned buffer holding the copy.</returns>
+        internal static PooledBuffer Copy(ReadOnlySpan<byte> bytes)
+        {
+            var buffer = new PooledBuffer(bytes.Length);
+            bytes.CopyTo(buffer.Memory.Span);
+            return buffer;
+        }
+
         /// <summary>Clears and returns owned storage exactly once.</summary>
         public void Dispose()
         {

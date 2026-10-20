@@ -39,12 +39,12 @@ namespace MajDHTNetwork
             private readonly List<ProviderSlot> _providers = new List<ProviderSlot>();
             /// <summary>Protects the scheduling state.</summary>
             private readonly object _gate = new object();
-            /// <summary>The blocks waiting for a provider, lowest first.</summary>
-            private readonly SortedSet<int> _pending = new SortedSet<int>();
-            /// <summary>The providers already asked for each block.</summary>
+            /// <summary>The blocks a provider failed that wait for another provider, lowest first.</summary>
+            private readonly SortedSet<int> _returned = new SortedSet<int>();
+            /// <summary>The providers already asked for each block, kept only while the block is in flight or returned.</summary>
             private readonly Dictionary<int, HashSet<string>> _attempted = new Dictionary<int, HashSet<string>>();
-            /// <summary>The verified blocks waiting to be written in order.</summary>
-            private readonly Dictionary<int, ReadOnlyMemory<byte>> _completed = new Dictionary<int, ReadOnlyMemory<byte>>();
+            /// <summary>The verified blocks waiting to be written in order, each still holding its provider's response frame.</summary>
+            private readonly Dictionary<int, OwnedMemory> _completed = new Dictionary<int, OwnedMemory>();
             /// <summary>Serializes ordered writes to the digest, leaves, store and destination.</summary>
             private readonly SemaphoreSlim _writer = new SemaphoreSlim(1, 1);
             /// <summary>Cancels every worker on failure or caller cancellation.</summary>
@@ -57,6 +57,8 @@ namespace MajDHTNetwork
             private TaskCompletionSource<bool> _changed = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             /// <summary>The next block index to write.</summary>
             private int _nextToWrite;
+            /// <summary>The lowest block index that was never leased; every block at or above it is pending in index order.</summary>
+            private int _nextToLease;
             /// <summary>The first fatal failure.</summary>
             private Exception? _failure;
 
@@ -86,11 +88,6 @@ namespace MajDHTNetwork
                 for (var index = 0; index < shuffled.Count; index++)
                 {
                     _providers.Add(new ProviderSlot(shuffled[index], index, shuffled[index].NodeId == node.NodeId));
-                }
-                for (var index = 0; index < record.BlockCount; index++)
-                {
-                    _pending.Add(index);
-                    _attempted.Add(index, new HashSet<string>(StringComparer.Ordinal));
                 }
                 _cancellation.Token.Register(Signal);
             }
@@ -134,10 +131,11 @@ namespace MajDHTNetwork
                         {
                             return;
                         }
-                        ReadOnlyMemory<byte> bytes;
+                        OwnedMemory bytes;
                         try
                         {
-                            bytes = await _node.ReadBlockAsync(_record, lease.Value.Provider.Peer, lease.Value.Index, cancellationToken: token)
+                            // The manifest, index and capability were validated once by DownloadAsync, whose lifetime this token links.
+                            bytes = await _node.ReadBlockCoreAsync(_record, lease.Value.Provider.Peer, lease.Value.Index, null, token)
                                 .ConfigureAwait(false);
                         }
                         catch (Exception exception) when (IsPeerFailure(exception))
@@ -163,6 +161,10 @@ namespace MajDHTNetwork
             /// <summary>Waits for the lowest leasable block and its best available provider.</summary>
             /// <returns>The lease, or null when no block is pending.</returns>
             /// <exception cref="OperationCanceledException">The download stopped.</exception>
+            /// <remarks>
+            /// Returned blocks are tried first because they are always below the lease cursor. A never-leased block has no
+            /// attempted providers, so when the cursor block has no free provider, no later block has one either.
+            /// </remarks>
             private async Task<Lease?> LeaseAsync()
             {
                 while (true)
@@ -171,29 +173,53 @@ namespace MajDHTNetwork
                     lock (_gate)
                     {
                         _cancellation.Token.ThrowIfCancellationRequested();
-                        if (_pending.Count == 0)
+                        if (_returned.Count == 0 && _nextToLease >= _record.BlockCount)
                         {
                             return null;
                         }
-                        foreach (var index in _pending)
+                        var limit = _nextToWrite + _window;
+                        foreach (var index in _returned)
                         {
-                            if (index >= _nextToWrite + _window)
+                            if (index >= limit)
                             {
                                 break;
                             }
                             var provider = ChooseProviderLocked(index);
                             if (provider != null)
                             {
-                                _pending.Remove(index);
-                                _attempted[index].Add(provider.Peer.NodeId);
-                                provider.InFlight++;
-                                return new Lease(index, provider);
+                                _returned.Remove(index);
+                                return LeaseLocked(index, provider);
+                            }
+                        }
+                        if (_nextToLease < _record.BlockCount && _nextToLease < limit)
+                        {
+                            var provider = ChooseProviderLocked(_nextToLease);
+                            if (provider != null)
+                            {
+                                return LeaseLocked(_nextToLease++, provider);
                             }
                         }
                         wait = _changed.Task;
                     }
                     await wait.ConfigureAwait(false);
                 }
+            }
+
+            /// <summary>Records that a provider was asked for a block and assigns the lease.</summary>
+            /// <param name="index">The block index.</param>
+            /// <param name="provider">The chosen provider.</param>
+            /// <returns>The lease.</returns>
+            /// <remarks>The caller must hold the scheduling lock.</remarks>
+            private Lease LeaseLocked(int index, ProviderSlot provider)
+            {
+                if (!_attempted.TryGetValue(index, out var attempted))
+                {
+                    attempted = new HashSet<string>(StringComparer.Ordinal);
+                    _attempted.Add(index, attempted);
+                }
+                attempted.Add(provider.Peer.NodeId);
+                provider.InFlight++;
+                return new Lease(index, provider);
             }
 
             /// <summary>Chooses the best provider with a free slot that has not been asked for a block.</summary>
@@ -204,9 +230,10 @@ namespace MajDHTNetwork
             {
                 ProviderSlot? best = null;
                 var bestLoss = 0.0;
+                _attempted.TryGetValue(index, out var attempted);
                 foreach (var provider in _providers)
                 {
-                    if (provider.InFlight >= _perPeerLimit || _attempted[index].Contains(provider.Peer.NodeId))
+                    if (provider.InFlight >= _perPeerLimit || (attempted != null && attempted.Contains(provider.Peer.NodeId)))
                     {
                         continue;
                     }
@@ -251,13 +278,14 @@ namespace MajDHTNetwork
 
             /// <summary>Records a verified block and wakes waiting workers.</summary>
             /// <param name="lease">The completed lease.</param>
-            /// <param name="bytes">The verified block.</param>
-            private void Accept(Lease lease, ReadOnlyMemory<byte> bytes)
+            /// <param name="bytes">The verified block, whose frame the download now owns until the block is written or the download ends.</param>
+            private void Accept(Lease lease, OwnedMemory bytes)
             {
                 lock (_gate)
                 {
                     lease.Provider.InFlight--;
                     _completed[lease.Index] = bytes;
+                    _attempted.Remove(lease.Index);
                 }
                 Signal();
             }
@@ -275,7 +303,7 @@ namespace MajDHTNetwork
                     exhausted = _attempted[lease.Index].Count >= _providers.Count;
                     if (!exhausted)
                     {
-                        _pending.Add(lease.Index);
+                        _returned.Add(lease.Index);
                     }
                 }
                 if (exhausted)
@@ -285,7 +313,10 @@ namespace MajDHTNetwork
                 Signal();
             }
 
-            /// <summary>Writes every consecutive completed block to the digest, leaves, store and destination.</summary>
+            /// <summary>
+            /// Writes every consecutive completed block to the digest, leaves, store and destination, releasing each block's
+            /// response frame once the store has copied the block and the destination has received it.
+            /// </summary>
             /// <returns>Completion after no further consecutive block is available.</returns>
             /// <exception cref="OperationCanceledException">The download stopped.</exception>
             private async Task DrainAsync()
@@ -296,7 +327,7 @@ namespace MajDHTNetwork
                 {
                     while (true)
                     {
-                        ReadOnlyMemory<byte> block;
+                        OwnedMemory block;
                         lock (_gate)
                         {
                             if (!_completed.TryGetValue(_nextToWrite, out block))
@@ -305,10 +336,13 @@ namespace MajDHTNetwork
                             }
                             _completed.Remove(_nextToWrite);
                         }
-                        _digest.AppendData(block.Span);
-                        var leafId = MerkleTree.AppendLeaf(_leaves, block.Span);
-                        await _node._store.PutAsync(leafId, block, token).ConfigureAwait(false);
-                        await _destination.WriteAsync(block, token).ConfigureAwait(false);
+                        using (block)
+                        {
+                            _digest.AppendData(block.Bytes.Span);
+                            var leafId = MerkleTree.AppendLeaf(_leaves, block.Bytes.Span);
+                            await _node._store.PutAsync(leafId, block.Bytes, token).ConfigureAwait(false);
+                            await _destination.WriteAsync(block.Bytes, token).ConfigureAwait(false);
+                        }
                         lock (_gate)
                         {
                             _nextToWrite++;
@@ -341,9 +375,17 @@ namespace MajDHTNetwork
                 previous.TrySetResult(true);
             }
 
-            /// <summary>Releases the cancellation source and the writer gate.</summary>
+            /// <summary>Releases the frames of blocks that were never written, the cancellation source and the writer gate.</summary>
             public void Dispose()
             {
+                lock (_gate)
+                {
+                    foreach (var block in _completed.Values)
+                    {
+                        block.Dispose();
+                    }
+                    _completed.Clear();
+                }
                 _cancellation.Dispose();
                 _writer.Dispose();
             }

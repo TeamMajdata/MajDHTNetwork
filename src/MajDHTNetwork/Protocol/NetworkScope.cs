@@ -22,6 +22,24 @@ namespace MajDHTNetwork.Protocol
             Global
         }
 
+        /// <summary>Copies an address from its bytes, so defensive copies do not format and parse text.</summary>
+        /// <param name="address">The address to copy.</param>
+        /// <returns>An independent equal address, including the IPv6 scope identifier.</returns>
+        internal static IPAddress CopyAddress(IPAddress address)
+        {
+            return address.AddressFamily == AddressFamily.InterNetworkV6
+                ? new IPAddress(address.GetAddressBytes(), address.ScopeId)
+                : new IPAddress(address.GetAddressBytes());
+        }
+
+        /// <summary>Copies an endpoint from its address bytes and port, so callers and handlers cannot mutate cached endpoints.</summary>
+        /// <param name="endpoint">The endpoint to copy.</param>
+        /// <returns>An independent equal endpoint.</returns>
+        internal static IPEndPoint CopyEndpoint(IPEndPoint endpoint)
+        {
+            return new IPEndPoint(CopyAddress(endpoint.Address), endpoint.Port);
+        }
+
         /// <summary>Checks whether an address can identify one remote interface.</summary>
         /// <param name="address">The address to inspect.</param>
         /// <returns>Whether the address is a canonical unicast address.</returns>

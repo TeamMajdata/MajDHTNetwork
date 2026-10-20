@@ -48,6 +48,35 @@ namespace MajDHTNetwork.Tests
             });
         }
 
+        /// <summary>Releases a pooled frame through a narrowed view, preserves pooled bytes by copying and GC-owned bytes as they are.</summary>
+        [Fact]
+        public void OwnedViewsReleaseTheirFrameOnceAndPreserveBytesBeyondIt()
+        {
+            var frame = PooledBuffer.Copy(new byte[] { 1, 2, 3, 4, 5 });
+            var whole = new OwnedMemory(frame);
+            Assert.True(whole.IsPooled);
+            var field = whole.Narrow(whole.Bytes.Slice(1, 3));
+            Assert.True(field.IsPooled);
+            Assert.True(field.Bytes.Span.SequenceEqual(new byte[] { 2, 3, 4 }), "A narrowed view must expose the selected bytes.");
+            var preserved = field.Preserve();
+            MemoryMarshal.TryGetArray(field.Bytes, out var pooled);
+            MemoryMarshal.TryGetArray(preserved, out var copied);
+            Assert.False(ReferenceEquals(pooled.Array, copied.Array), "Preserving a pooled view must copy out of the frame.");
+            field.Dispose();
+            field.Dispose();
+            Assert.Throws<ObjectDisposedException>(() =>
+            {
+                _ = frame.Memory;
+            });
+            Assert.True(preserved.Span.SequenceEqual(new byte[] { 2, 3, 4 }), "Preserved bytes must survive the frame's release.");
+            var stable = new byte[] { 7, 8 };
+            var unpooled = new OwnedMemory(stable);
+            Assert.False(unpooled.IsPooled);
+            MemoryMarshal.TryGetArray(unpooled.Preserve(), out var same);
+            Assert.True(ReferenceEquals(stable, same.Array), "GC-owned bytes must be preserved without a copy.");
+            unpooled.Dispose();
+        }
+
         /// <summary>Matches the empty-message RFC 8032 vector and verifies a signature at a nonzero array offset.</summary>
         [Fact]
         public void Ed25519MatchesRfc8032AndHonorsSignatureOffsets()

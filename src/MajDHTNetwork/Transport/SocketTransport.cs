@@ -16,6 +16,10 @@ namespace MajDHTNetwork.Transport
     /// <summary>Exchanges bounded envelopes through shared UDP sockets and reusable TCP sessions.</summary>
     internal sealed partial class SocketTransport : IAsyncDisposable
     {
+        /// <summary>The big-endian length prefix size of a TCP frame.</summary>
+        private const int FramePrefixLength = 4;
+        /// <summary>The largest UDP payload a socket can deliver, so oversized datagrams are received and dropped rather than failed.</summary>
+        private const int MaxUdpPayload = 65536;
         /// <summary>The interval between simultaneous-open attempts.</summary>
         private static readonly TimeSpan s_punchInterval = TimeSpan.FromMilliseconds(200);
         /// <summary>The immutable node options.</summary>
@@ -291,7 +295,10 @@ namespace MajDHTNetwork.Transport
             }
         }
 
-        /// <summary>Demultiplexes replies before applying incoming request concurrency limits.</summary>
+        /// <summary>
+        /// Demultiplexes replies before applying incoming request concurrency limits. Datagrams land in the channel's reusable
+        /// receive buffer, and only the frames that have a consumer are copied into pooled buffers that the consumer releases.
+        /// </summary>
         /// <param name="channel">The receiving UDP socket.</param>
         /// <returns>Completion when the socket closes.</returns>
         private async Task ReceiveAsync(UdpChannel channel)
@@ -300,10 +307,11 @@ namespace MajDHTNetwork.Transport
             {
                 while (!_shutdown.IsCancellationRequested)
                 {
-                    UdpReceiveResult packet;
+                    SocketReceiveFromResult received;
                     try
                     {
-                        packet = await channel.Client.ReceiveAsync().ConfigureAwait(false);
+                        received = await channel.Client.Client.ReceiveFromAsync(channel.ReceiveSegment, SocketFlags.None, channel.AnySource)
+                            .ConfigureAwait(false);
                     }
                     catch (SocketException) when (!_shutdown.IsCancellationRequested)
                     {
@@ -311,15 +319,20 @@ namespace MajDHTNetwork.Transport
                         await Task.Delay(10, _shutdownToken).ConfigureAwait(false);
                         continue;
                     }
-                    if (packet.Buffer.Length > UdpCookies.MaxDatagram || RouteUdpReply(packet))
+                    if (received.ReceivedBytes > UdpCookies.MaxDatagram || !(received.RemoteEndPoint is IPEndPoint source))
                     {
                         continue;
                     }
-                    if (!_acceptUdpRequests || !channel.Listening || (!IsUdpRequestFrame(packet.Buffer)) || !_slots.Wait(0))
+                    var datagram = channel.ReceiveBuffer.AsMemory(0, received.ReceivedBytes);
+                    if (RouteUdpReply(datagram, source))
                     {
                         continue;
                     }
-                    Track(ServeUdpAsync(packet));
+                    if (!_acceptUdpRequests || !channel.Listening || !IsUdpRequestFrame(datagram.Span) || !_slots.Wait(0))
+                    {
+                        continue;
+                    }
+                    Track(ServeUdpAsync(PooledBuffer.Copy(datagram.Span), source));
                 }
             }
             catch (Exception exception) when (_shutdown.IsCancellationRequested || exception is SocketException || exception is ObjectDisposedException)
@@ -340,39 +353,40 @@ namespace MajDHTNetwork.Transport
         }
 
         /// <summary>Routes challenges and correlated replies only to their pinned pending exchange.</summary>
-        /// <param name="packet">The received datagram and source.</param>
+        /// <param name="datagram">The received datagram in the reusable receive buffer, valid until the next receive.</param>
+        /// <param name="source">The observed source endpoint.</param>
         /// <returns>Whether this is a reply or challenge, including unmatched frames to discard.</returns>
-        private bool RouteUdpReply(UdpReceiveResult packet)
+        private bool RouteUdpReply(ReadOnlyMemory<byte> datagram, IPEndPoint source)
         {
-            var challengeDigest = UdpCookies.ChallengeDigest(packet.Buffer);
+            var challengeDigest = UdpCookies.ChallengeDigest(datagram);
             if (challengeDigest.HasValue)
             {
-                if (_udpPending.TryGetValue(new UdpExchangeKey(packet.RemoteEndPoint, challengeDigest.Value.Span), out var pending))
+                if (_udpPending.TryGetValue(new UdpExchangeKey(source, challengeDigest.Value.Span), out var pending))
                 {
-                    pending.Challenge.TrySetResult(packet.Buffer);
+                    Deliver(pending.Challenge, datagram.Span);
                 }
                 return true;
             }
-            var replyDigest = UdpCookies.ReplyDigest(packet.Buffer);
+            var replyDigest = UdpCookies.ReplyDigest(datagram);
             if (replyDigest.HasValue)
             {
-                if (_udpPending.TryGetValue(new UdpExchangeKey(packet.RemoteEndPoint, replyDigest.Value.Span), out var pending)
+                if (_udpPending.TryGetValue(new UdpExchangeKey(source, replyDigest.Value.Span), out var pending)
                     && pending.RequestSent)
                 {
-                    var response = UdpCookies.OpenReply(packet.Buffer, pending.Digest);
+                    var response = UdpCookies.OpenReply(datagram, pending.Digest);
                     if (response.HasValue)
                     {
-                        pending.Response.TrySetResult(response.Value);
+                        Deliver(pending.Response, response.Value.Span);
                     }
                 }
                 return true;
             }
-            if (UdpCookies.IsFrame(packet.Buffer, 3))
+            if (UdpCookies.IsFrame(datagram.Span, 3))
             {
                 UdpPendingExchange? only = null;
                 foreach (var pending in _udpPending.Values)
                 {
-                    if (!pending.Endpoint.Equals(packet.RemoteEndPoint))
+                    if (!pending.Endpoint.Equals(source))
                     {
                         continue;
                     }
@@ -382,14 +396,31 @@ namespace MajDHTNetwork.Transport
                     }
                     only = pending;
                 }
-                var response = UdpCookies.OpenReply(packet.Buffer);
+                var response = UdpCookies.OpenReply(datagram);
                 if (only != null && only.RequestSent && response.HasValue)
                 {
-                    only.Response.TrySetResult(response.Value);
+                    Deliver(only.Response, response.Value.Span);
                 }
                 return true;
             }
-            return UdpCookies.IsFrame(packet.Buffer, 1) || UdpCookies.IsFrame(packet.Buffer, 4);
+            return UdpCookies.IsFrame(datagram.Span, 1) || UdpCookies.IsFrame(datagram.Span, 4);
+        }
+
+        /// <summary>Copies a routed frame into its own pooled buffer and completes a pending signal with it.</summary>
+        /// <param name="signal">The challenge or response signal of the pending exchange.</param>
+        /// <param name="frame">The sealed packet or challenge bytes in the reusable receive buffer.</param>
+        /// <remarks>A signal that was already completed, or closed by a finished exchange, refuses the frame and it is released here.</remarks>
+        private static void Deliver(TaskCompletionSource<PooledBuffer> signal, ReadOnlySpan<byte> frame)
+        {
+            if (signal.Task.IsCompleted)
+            {
+                return;
+            }
+            var copy = PooledBuffer.Copy(frame);
+            if (!signal.TrySetResult(copy))
+            {
+                copy.Dispose();
+            }
         }
 
         /// <summary>Tracks work and observes faults without retaining completed tasks.</summary>
@@ -415,11 +446,12 @@ namespace MajDHTNetwork.Transport
 
         /// <summary>Schedules a TCP request without blocking the session reader or its response slot.</summary>
         /// <param name="session">The pinned connected session.</param>
-        /// <param name="request">The received encrypted envelope.</param>
-        private void DispatchTcp(TcpSession session, ReadOnlyMemory<byte> request)
+        /// <param name="request">The received encrypted envelope, released by the dispatcher once its handler can no longer read it.</param>
+        private void DispatchTcp(TcpSession session, PooledBuffer request)
         {
             if (_shutdown.IsCancellationRequested || !_slots.Wait(0))
             {
+                request.Dispose();
                 session.CompleteIncoming();
                 session.Stop();
                 return;
@@ -429,54 +461,78 @@ namespace MajDHTNetwork.Transport
 
         /// <summary>Serves one frame while the session independently receives other traffic.</summary>
         /// <param name="session">The connection receiving the request.</param>
-        /// <param name="request">The received encrypted envelope.</param>
-        /// <returns>Completion after response transmission or cancellation.</returns>
-        private async Task ServeTcpAsync(TcpSession session, ReadOnlyMemory<byte> request)
+        /// <param name="request">The received encrypted envelope, released once the handler has finished with it and the reply was sent.</param>
+        /// <returns>Completion after response transmission, rejection or cancellation.</returns>
+        /// <remarks>
+        /// A rejected request produces no reply and leaves the connection open, exactly like a dropped datagram. The duplex
+        /// session may be carrying this side's own outstanding exchange with the same peer, so closing it here would abort
+        /// that exchange as well. Only a failed response transmission closes the connection, because the frame may have been
+        /// partially written.
+        /// </remarks>
+        private async Task ServeTcpAsync(TcpSession session, PooledBuffer request)
         {
             using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_shutdownToken, session.Token);
             cancellation.CancelAfter(_options.RequestTimeout + _options.RequestTimeout);
+            Task<ReadOnlyMemory<byte>>? handling = null;
             try
             {
-                var response = await InvokeHandlerAsync(request, DHTTransport.Tcp, session.Endpoint, cancellation.Token).ConfigureAwait(false);
-                await session.SendAsync(response, cancellation.Token).ConfigureAwait(false);
-            }
-            catch (Exception exception)
-            {
-                DHTLog.Write(_logger, LogLevel.Debug, "Rejected TCP request: ", exception);
-                session.Stop();
+                ReadOnlyMemory<byte> response;
+                try
+                {
+                    handling = StartHandler(request.Memory, DHTTransport.Tcp, session.Endpoint, cancellation.Token);
+                    response = await AwaitCancellableAsync(handling, cancellation.Token).ConfigureAwait(false);
+                }
+                catch (Exception exception)
+                {
+                    DHTLog.Write(_logger, LogLevel.Debug, "Rejected TCP request: ", exception);
+                    return;
+                }
+                try
+                {
+                    await session.SendAsync(response, cancellation.Token).ConfigureAwait(false);
+                }
+                catch (Exception exception)
+                {
+                    DHTLog.Write(_logger, LogLevel.Debug, "TCP response transmission failed: ", exception);
+                    session.Stop();
+                }
             }
             finally
             {
+                ReleaseAfter(handling, request);
                 session.CompleteIncoming();
                 _slots.Release();
             }
         }
 
         /// <summary>Validates a UDP cookie before dispatch and returns a digest-correlated reply.</summary>
-        /// <param name="packet">The received datagram and observed source.</param>
+        /// <param name="datagram">The received transport frame, released once the handler has finished with it and the reply was sent.</param>
+        /// <param name="source">The observed source endpoint.</param>
         /// <returns>Completion after cleanup.</returns>
-        private async Task ServeUdpAsync(UdpReceiveResult packet)
+        private async Task ServeUdpAsync(PooledBuffer datagram, IPEndPoint source)
         {
             using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(_shutdownToken);
             cancellation.CancelAfter(_options.RequestTimeout + _options.RequestTimeout);
+            Task<ReadOnlyMemory<byte>>? handling = null;
             try
             {
-                var challenge = _cookies.Challenge(packet.Buffer, packet.RemoteEndPoint);
+                var challenge = _cookies.Challenge(datagram.Memory.Span, source);
                 if (challenge != null)
                 {
-                    await SendUdpAsync(challenge, packet.RemoteEndPoint, cancellation.Token).ConfigureAwait(false);
+                    await SendUdpAsync(challenge, source, cancellation.Token).ConfigureAwait(false);
                     return;
                 }
-                var request = _cookies.OpenRequest(packet.Buffer, packet.RemoteEndPoint);
+                var request = _cookies.OpenRequest(datagram.Memory, source);
                 if (!request.HasValue)
                 {
                     return;
                 }
                 var digest = Crypto.Hash(request.Value.Span);
-                var reply = await InvokeHandlerAsync(request.Value, DHTTransport.Udp, packet.RemoteEndPoint, cancellation.Token).ConfigureAwait(false);
+                handling = StartHandler(request.Value, DHTTransport.Udp, source, cancellation.Token);
+                var reply = await AwaitCancellableAsync(handling, cancellation.Token).ConfigureAwait(false);
                 using var owner = new PooledBuffer(reply.Length + UdpCookies.CorrelatedPrefixLength);
                 UdpCookies.WriteReply(reply.Span, digest, owner.Memory.Span);
-                await SendUdpAsync(owner.Memory, packet.RemoteEndPoint, cancellation.Token).ConfigureAwait(false);
+                await SendUdpAsync(owner.Memory, source, cancellation.Token).ConfigureAwait(false);
             }
             catch (Exception exception)
             {
@@ -484,23 +540,40 @@ namespace MajDHTNetwork.Transport
             }
             finally
             {
+                ReleaseAfter(handling, datagram);
                 _slots.Release();
             }
         }
 
-        /// <summary>Runs user dispatch independently so synchronous handlers cannot block readers or shutdown.</summary>
-        /// <param name="packet">The independently owned encrypted request.</param>
+        /// <summary>Starts user dispatch independently so synchronous handlers cannot block readers or shutdown.</summary>
+        /// <param name="packet">The received encrypted request, which stays valid until the returned task completes.</param>
         /// <param name="transport">The receiving protocol.</param>
         /// <param name="endpoint">The observed endpoint to copy before exposing it to the handler.</param>
         /// <param name="cancellationToken">The bounded incoming request lifetime.</param>
-        /// <returns>The handler response or a cancelled wait.</returns>
-        /// <exception cref="OperationCanceledException">The incoming request lifetime ends.</exception>
-        private Task<ReadOnlyMemory<byte>> InvokeHandlerAsync(ReadOnlyMemory<byte> packet, DHTTransport transport,
+        /// <returns>The handler's task, which the caller awaits with a cancellable wait.</returns>
+        private Task<ReadOnlyMemory<byte>> StartHandler(ReadOnlyMemory<byte> packet, DHTTransport transport,
             IPEndPoint endpoint, CancellationToken cancellationToken)
         {
             var source = CopyEndpoint(endpoint);
-            var handling = Task.Run(() => _handler(packet, transport, source, cancellationToken), cancellationToken);
-            return AwaitCancellableAsync(handling, cancellationToken);
+            return Task.Run(() => _handler(packet, transport, source, cancellationToken), cancellationToken);
+        }
+
+        /// <summary>Releases a request frame once its handler can no longer read it.</summary>
+        /// <param name="handling">The handler's task, or null when no handler was started.</param>
+        /// <param name="frame">The received frame the handler borrows.</param>
+        /// <remarks>
+        /// A cancelled wait abandons a handler that may still be running, so the frame is then released by a continuation when
+        /// the handler finishes rather than while it may still be reading the frame.
+        /// </remarks>
+        private static void ReleaseAfter(Task? handling, PooledBuffer frame)
+        {
+            if (handling == null || handling.IsCompleted)
+            {
+                frame.Dispose();
+                return;
+            }
+            _ = handling.ContinueWith(static (completed, state) => ((PooledBuffer)state!).Dispose(), frame, CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         }
 
         /// <summary>Sends a UDP frame through the bound socket of the destination's address family.</summary>
@@ -533,10 +606,13 @@ namespace MajDHTNetwork.Transport
         /// <param name="packet">The sealed request.</param>
         /// <param name="cancellationToken">Cancels queueing and exchange.</param>
         /// <param name="counter">An optional counter of transmissions and unanswered transmissions for packet-loss statistics.</param>
-        /// <returns>The response; the caller must authenticate its sender and request identifier.</returns>
+        /// <returns>
+        /// The response in the pooled frame it arrived in; the caller must authenticate its sender and request identifier and
+        /// release the frame by disposing the view once it has copied whatever it keeps.
+        /// </returns>
         /// <exception cref="IOException">The packet, endpoint or transport is invalid, or no response arrives.</exception>
         /// <exception cref="OperationCanceledException">The exchange or transport was cancelled.</exception>
-        internal Task<ReadOnlyMemory<byte>> ExchangeAtAsync(DHTTransport transport, IPEndPoint endpoint,
+        internal Task<OwnedMemory> ExchangeAtAsync(DHTTransport transport, IPEndPoint endpoint,
             ReadOnlyMemory<byte> packet, CancellationToken cancellationToken, TransmissionCounter? counter = null)
         {
             return StartExchange(transport, endpoint, packet, cancellationToken, false, counter);
@@ -547,10 +623,10 @@ namespace MajDHTNetwork.Transport
         /// <param name="endpoint">The pinned remote endpoint observed by the rendezvous peer.</param>
         /// <param name="packet">The identical signed encrypted punch request on every retry.</param>
         /// <param name="cancellationToken">Cancels the complete punching attempt.</param>
-        /// <returns>The encrypted response, requiring caller authentication and token correlation.</returns>
+        /// <returns>The encrypted response in its pooled frame, requiring caller authentication, token correlation and release.</returns>
         /// <exception cref="IOException">A matching listener is unavailable or punching fails.</exception>
         /// <exception cref="OperationCanceledException">The exchange or transport was cancelled.</exception>
-        internal Task<ReadOnlyMemory<byte>> PunchAsync(DHTTransport transport, IPEndPoint endpoint,
+        internal Task<OwnedMemory> PunchAsync(DHTTransport transport, IPEndPoint endpoint,
             ReadOnlyMemory<byte> packet, CancellationToken cancellationToken)
         {
             return StartExchange(transport, endpoint, packet, cancellationToken, true, null);
@@ -565,7 +641,7 @@ namespace MajDHTNetwork.Transport
         /// <param name="counter">An optional transmission counter; punching is never counted.</param>
         /// <returns>The tracked exchange task.</returns>
         /// <exception cref="OperationCanceledException">The transport has stopped.</exception>
-        private Task<ReadOnlyMemory<byte>> StartExchange(DHTTransport transport, IPEndPoint endpoint,
+        private Task<OwnedMemory> StartExchange(DHTTransport transport, IPEndPoint endpoint,
             ReadOnlyMemory<byte> packet, CancellationToken cancellationToken, bool punch, TransmissionCounter? counter)
         {
             lock (_lifecycleSync)
@@ -584,10 +660,10 @@ namespace MajDHTNetwork.Transport
         /// <param name="cancellationToken">The caller's cancellation.</param>
         /// <param name="punch">Whether to require a reusable local listener.</param>
         /// <param name="counter">An optional transmission counter.</param>
-        /// <returns>The opaque response.</returns>
+        /// <returns>The opaque response in its pooled frame, which the caller releases.</returns>
         /// <exception cref="IOException">Validation, connection or response retrieval fails.</exception>
         /// <exception cref="OperationCanceledException">The caller, budget or transport was cancelled.</exception>
-        private async Task<ReadOnlyMemory<byte>> ExchangeCoreAsync(DHTTransport transport,
+        private async Task<OwnedMemory> ExchangeCoreAsync(DHTTransport transport,
             IPEndPoint endpoint, ReadOnlyMemory<byte> packet, CancellationToken cancellationToken, bool punch, TransmissionCounter? counter)
         {
             if (packet.Length == 0 || packet.Length > Wire.MaxPacket || endpoint.Port == 0
@@ -614,7 +690,7 @@ namespace MajDHTNetwork.Transport
                         throw new IOException("UDP punching requires an active UDP listener of the destination address family.");
                     }
                     EnsureUdpSocket(endpoint.AddressFamily);
-                    return await ExchangeUdpAsync(endpoint, packet, lifetime.Token, punch, counter).ConfigureAwait(false);
+                    return new OwnedMemory(await ExchangeUdpAsync(endpoint, packet, lifetime.Token, punch, counter).ConfigureAwait(false));
                 }
                 if (punch && (!_tcpRunning || TcpPortFor(endpoint.AddressFamily) == 0))
                 {
@@ -628,7 +704,7 @@ namespace MajDHTNetwork.Transport
                         var session = GetTcpSession(endpoint, punch ? s_punchInterval : _options.RequestTimeout);
                         var response = await session.ExchangeAsync(packet, lifetime.Token).ConfigureAwait(false);
                         counter?.Delivered();
-                        return response;
+                        return new OwnedMemory(response);
                     }
                     catch (Exception exception) when (IsTransportFailure(exception))
                     {
@@ -663,10 +739,10 @@ namespace MajDHTNetwork.Transport
         /// <param name="cancellationToken">The overall exchange lifetime.</param>
         /// <param name="punch">Whether retries use short intervals within one parent budget.</param>
         /// <param name="counter">An optional counter receiving one entry per completed attempt.</param>
-        /// <returns>The correlated sealed response from the pinned endpoint.</returns>
+        /// <returns>The correlated sealed response from the pinned endpoint, in a pooled frame the caller releases.</returns>
         /// <exception cref="IOException">The pending entry conflicts or all retries expire.</exception>
         /// <exception cref="OperationCanceledException">The overall lifetime is cancelled.</exception>
-        private async Task<ReadOnlyMemory<byte>> ExchangeUdpAsync(IPEndPoint endpoint, ReadOnlyMemory<byte> packet,
+        private async Task<PooledBuffer> ExchangeUdpAsync(IPEndPoint endpoint, ReadOnlyMemory<byte> packet,
             CancellationToken cancellationToken, bool punch, TransmissionCounter? counter)
         {
             var digest = Crypto.Hash(packet.Span);
@@ -691,8 +767,9 @@ namespace MajDHTNetwork.Transport
                         if (!hasRequest)
                         {
                             await SendUdpAsync(hello, endpoint, timeout.Token).ConfigureAwait(false);
+                            // The challenge frame stays with the pending exchange, which releases it when the exchange ends.
                             var challenge = await AwaitCancellableAsync(pending.Challenge.Task, timeout.Token).ConfigureAwait(false);
-                            if (!UdpCookies.WriteRequest(challenge.Span, packet.Span, digest, request.Memory.Span))
+                            if (!UdpCookies.WriteRequest(challenge.Memory.Span, packet.Span, digest, request.Memory.Span))
                             {
                                 throw new InvalidDataException("Invalid UDP return-reachability challenge.");
                             }
@@ -702,6 +779,7 @@ namespace MajDHTNetwork.Transport
                         await SendUdpAsync(request.Memory, endpoint, timeout.Token).ConfigureAwait(false);
                         var response = await AwaitCancellableAsync(pending.Response.Task, timeout.Token).ConfigureAwait(false);
                         counter?.Delivered();
+                        pending.MarkResponseDelivered();
                         return response;
                     }
                     catch (Exception exception) when (IsTransportFailure(exception))
@@ -716,6 +794,7 @@ namespace MajDHTNetwork.Transport
             finally
             {
                 _udpPending.TryRemove(key, out var ignored);
+                pending.Release();
             }
         }
 
@@ -771,11 +850,7 @@ namespace MajDHTNetwork.Transport
         /// <returns>An independent endpoint.</returns>
         private static IPEndPoint CopyEndpoint(IPEndPoint endpoint)
         {
-            var original = endpoint.Address;
-            var address = original.AddressFamily == AddressFamily.InterNetworkV6
-                ? new IPAddress(original.GetAddressBytes(), original.ScopeId)
-                : new IPAddress(original.GetAddressBytes());
-            return new IPEndPoint(address, endpoint.Port);
+            return NetworkScope.CopyEndpoint(endpoint);
         }
 
         /// <summary>Reads an exact byte count without accepting partial or truncated frames.</summary>
@@ -784,12 +859,12 @@ namespace MajDHTNetwork.Transport
         /// <param name="cancellationToken">Cancels the read.</param>
         /// <returns>Completion after the buffer is filled.</returns>
         /// <exception cref="EndOfStreamException">The connection ends during a frame.</exception>
-        private static async Task ReadExactlyAsync(Stream stream, byte[] bytes, CancellationToken cancellationToken)
+        private static async Task ReadExactlyAsync(Stream stream, Memory<byte> bytes, CancellationToken cancellationToken)
         {
             var offset = 0;
             while (offset < bytes.Length)
             {
-                var count = await stream.ReadAsync(bytes, offset, bytes.Length - offset, cancellationToken).ConfigureAwait(false);
+                var count = await stream.ReadAsync(bytes.Slice(offset), cancellationToken).ConfigureAwait(false);
                 if (count == 0)
                 {
                     throw new EndOfStreamException("Truncated TCP frame.");
@@ -798,41 +873,55 @@ namespace MajDHTNetwork.Transport
             }
         }
 
-        /// <summary>Reads a bounded big-endian length-prefixed envelope.</summary>
+        /// <summary>Reads a bounded big-endian length-prefixed envelope into an exclusively owned pooled buffer.</summary>
         /// <param name="stream">The connected stream.</param>
+        /// <param name="prefix">The caller-owned four-byte prefix buffer, reused across frames of one reader.</param>
         /// <param name="cancellationToken">Cancels the read.</param>
-        /// <returns>The encrypted envelope.</returns>
+        /// <returns>
+        /// The encrypted envelope in a pooled frame, decrypted in place when it is opened and released by whoever consumes it.
+        /// </returns>
         /// <exception cref="InvalidDataException">The declared frame size is invalid.</exception>
         /// <exception cref="EndOfStreamException">The frame is truncated.</exception>
-        private static async Task<ReadOnlyMemory<byte>> ReadFrameAsync(Stream stream, CancellationToken cancellationToken)
+        private static async Task<PooledBuffer> ReadFrameAsync(Stream stream, byte[] prefix, CancellationToken cancellationToken)
         {
-            var prefix = new byte[4];
             await ReadExactlyAsync(stream, prefix, cancellationToken).ConfigureAwait(false);
             var length = ((uint)prefix[0] << 24) | ((uint)prefix[1] << 16) | ((uint)prefix[2] << 8) | prefix[3];
             if (length == 0 || length > Wire.MaxPacket)
             {
                 throw new InvalidDataException("Invalid TCP frame size.");
             }
-            var packet = new byte[(int)length];
-            await ReadExactlyAsync(stream, packet, cancellationToken).ConfigureAwait(false);
-            return packet;
+            var frame = new PooledBuffer((int)length);
+            try
+            {
+                await ReadExactlyAsync(stream, frame.Memory, cancellationToken).ConfigureAwait(false);
+                return frame;
+            }
+            catch
+            {
+                frame.Dispose();
+                throw;
+            }
         }
 
         /// <summary>Writes one big-endian length-prefixed encrypted envelope.</summary>
         /// <param name="stream">The connected stream.</param>
+        /// <param name="prefix">The caller-owned four-byte prefix buffer, reused across frames of one serialized writer.</param>
         /// <param name="packet">The encrypted envelope.</param>
         /// <param name="cancellationToken">Cancels the write.</param>
         /// <returns>Completion after the frame is written.</returns>
         /// <exception cref="InvalidDataException">The frame size is invalid.</exception>
-        private static async Task WriteFrameAsync(Stream stream, ReadOnlyMemory<byte> packet, CancellationToken cancellationToken)
+        private static async Task WriteFrameAsync(Stream stream, byte[] prefix, ReadOnlyMemory<byte> packet, CancellationToken cancellationToken)
         {
             var length = packet.Length;
             if (length == 0 || length > Wire.MaxPacket)
             {
                 throw new InvalidDataException("Invalid TCP frame size.");
             }
-            var prefix = new[] { (byte)(length >> 24), (byte)(length >> 16), (byte)(length >> 8), (byte)length };
-            await stream.WriteAsync(prefix, 0, prefix.Length, cancellationToken).ConfigureAwait(false);
+            prefix[0] = (byte)(length >> 24);
+            prefix[1] = (byte)(length >> 16);
+            prefix[2] = (byte)(length >> 8);
+            prefix[3] = (byte)length;
+            await stream.WriteAsync(prefix, 0, FramePrefixLength, cancellationToken).ConfigureAwait(false);
             await stream.WriteAsync(packet, cancellationToken).ConfigureAwait(false);
         }
 
@@ -892,10 +981,11 @@ namespace MajDHTNetwork.Transport
             {
                 channel.Send.Dispose();
             }
+            _cookies.Dispose();
             _shutdown.Dispose();
         }
 
-        /// <summary>Owns one bound UDP socket, its send serialization and its receive loop.</summary>
+        /// <summary>Owns one bound UDP socket, its send serialization, its receive loop and the loop's reusable receive buffer.</summary>
         private sealed class UdpChannel
         {
             /// <summary>Gets the owned bound socket.</summary>
@@ -906,6 +996,12 @@ namespace MajDHTNetwork.Transport
             internal bool Listening { get; }
             /// <summary>Gets the serialization of sends on this socket.</summary>
             internal SemaphoreSlim Send { get; } = new SemaphoreSlim(1, 1);
+            /// <summary>Gets the receive buffer owned by the single receive loop, holding one datagram until the next receive.</summary>
+            internal byte[] ReceiveBuffer { get; } = new byte[MaxUdpPayload];
+            /// <summary>Gets the receive buffer as the segment that the socket fills.</summary>
+            internal ArraySegment<byte> ReceiveSegment { get; }
+            /// <summary>Gets the wildcard endpoint of the socket's address family that a receive accepts datagrams from.</summary>
+            internal EndPoint AnySource { get; }
             /// <summary>Gets or sets whether the receive loop has started.</summary>
             internal bool Running { get; set; }
             /// <summary>Gets or sets the receive loop task.</summary>
@@ -920,6 +1016,8 @@ namespace MajDHTNetwork.Transport
                 Client = client;
                 Endpoint = endpoint;
                 Listening = listening;
+                ReceiveSegment = new ArraySegment<byte>(ReceiveBuffer);
+                AnySource = new IPEndPoint(endpoint.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any, 0);
             }
         }
     }

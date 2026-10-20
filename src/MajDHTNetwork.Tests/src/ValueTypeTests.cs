@@ -359,9 +359,12 @@ namespace MajDHTNetwork.Tests
             Assert.True(original.Body.IsEmpty);
         }
 
-        /// <summary>Shares an opened packet's owned plaintext across copies without aliasing caller-owned inputs.</summary>
+        /// <summary>
+        /// Shares an opened packet's plaintext across copies: the plaintext lives in the envelope buffer, which opening consumes,
+        /// and never aliases the sender's request or body inputs.
+        /// </summary>
         [Fact]
-        public void DecodedPacketCopiesShareOwnedPlaintextWithoutAliasingCallerBuffers()
+        public void DecodedPacketCopiesShareEnvelopePlaintextWithoutAliasingSenderBuffers()
         {
             var senderIdentity = new DHTIdentity();
             var recipientIdentity = new DHTIdentity();
@@ -372,6 +375,7 @@ namespace MajDHTNetwork.Tests
             requestBytes.AsSpan(2, 16).Fill(0x31);
             var request = new Packet(sender, requestBytes.AsMemory(2, 16), (byte)Operation.Find, bodyBytes.AsMemory(1, 3));
             var encrypted = request.Seal(senderIdentity, recipient);
+            var cipherText = (byte[])encrypted.Clone();
             var opened = Packet.Open(recipientIdentity, encrypted);
             var copy = opened;
 
@@ -380,13 +384,13 @@ namespace MajDHTNetwork.Tests
             Assert.Same(opened.Sender, copy.Sender);
             Assert.True(MemoryMarshal.TryGetArray(copy.RequestId, out var requestView));
             Assert.NotSame(requestBytes, requestView.Array);
-            Assert.NotSame(encrypted, requestView.Array);
+            Assert.Same(encrypted, requestView.Array);
             Assert.True(MemoryMarshal.TryGetArray(copy.Body, out var bodyView));
             Assert.NotSame(bodyBytes, bodyView.Array);
-            Assert.NotSame(encrypted, bodyView.Array);
+            Assert.Same(encrypted, bodyView.Array);
+            Assert.False(encrypted.AsSpan().SequenceEqual(cipherText), "Opening must decrypt the envelope in place.");
 
             opened = default;
-            Array.Clear(encrypted, 0, encrypted.Length);
             Array.Clear(requestBytes, 0, requestBytes.Length);
             Array.Clear(bodyBytes, 0, bodyBytes.Length);
 
@@ -395,6 +399,9 @@ namespace MajDHTNetwork.Tests
             Assert.Equal((byte)Operation.Find, copy.Kind);
             Assert.Equal(new byte[] { 11, 12, 13 }, copy.Body.ToArray());
             Assert.Equal(new string('1', 16), Encoding.ASCII.GetString(copy.RequestId.Span));
+            // A consumed envelope cannot be opened again; the failed authentication zeroes the plaintext it now holds.
+            Assert.ThrowsAny<CryptographicException>(() => Packet.Open(recipientIdentity, encrypted));
+            Assert.True(copy.Body.Span.SequenceEqual(new byte[3]), "A failed reopen must zero the consumed envelope.");
         }
 
         /// <summary>Uses the authenticated packet value when present and the fallback only when the nullable is absent.</summary>

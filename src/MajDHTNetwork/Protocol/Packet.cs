@@ -1,7 +1,6 @@
 using System;
 using System.IO;
 using System.Security.Cryptography;
-using Org.BouncyCastle.Crypto.Parameters;
 
 #nullable enable
 
@@ -34,6 +33,10 @@ namespace MajDHTNetwork.Protocol
     /// <remarks>Copies share their memory. Borrowed constructor buffers must remain stable until encryption finishes.</remarks>
     internal readonly struct Packet
     {
+        /// <summary>The Ed25519 signature length.</summary>
+        private const int SignatureLength = 64;
+        /// <summary>The correlation identifier length.</summary>
+        private const int RequestIdLength = 16;
         /// <summary>The sender contact, or null for an uninitialized packet.</summary>
         private readonly DHTPeer? _sender;
 
@@ -62,7 +65,7 @@ namespace MajDHTNetwork.Protocol
         /// <exception cref="ArgumentException">The correlation identifier is not 16 bytes long.</exception>
         internal Packet(DHTPeer sender, ReadOnlyMemory<byte> requestId, byte kind, ReadOnlyMemory<byte> body)
         {
-            if (requestId.Length != 16)
+            if (requestId.Length != RequestIdLength)
             {
                 throw new ArgumentException("A packet correlation identifier must contain 16 bytes.", nameof(requestId));
             }
@@ -81,18 +84,26 @@ namespace MajDHTNetwork.Protocol
         /// <exception cref="CryptographicException">The cryptographic provider cannot seal the packet.</exception>
         internal byte[] Seal(DHTIdentity identity, DHTPeer recipient)
         {
-            var ephemeral = new X25519PrivateKeyParameters(Crypto.Random(32), 0);
-            var nonce = Crypto.Random(12);
             using var header = new Wire();
-            WriteHeader(header, recipient.NodeId, ephemeral.GeneratePublicKey().GetEncoded(), nonce);
-            var headerBytes = header.WrittenMemory;
-            using var payload = new Wire();
-            WriteSignedPayload(payload, identity, headerBytes);
-            var key = Crypto.Derive(ephemeral, recipient.AgreementKey, headerBytes);
-            using var outer = new Wire();
-            outer.Put(headerBytes.Span);
-            Crypto.EncryptTo(outer, key, nonce, headerBytes, payload.WrittenMemory);
-            return Finish(outer);
+            WriteHeader(header, recipient.NodeHash);
+            header.PutLong(Crypto.AgreementKeyLength);
+            // The ephemeral public key is written into the header before anything else is appended, so the reservation is valid.
+            var scalar = Crypto.EphemeralAgreement(header.Allocate(Crypto.AgreementKeyLength));
+            try
+            {
+                var nonce = WriteNonce(header);
+                var headerBytes = header.WrittenMemory;
+                using var signed = new Wire();
+                var payload = WriteSignedPayload(signed, identity, headerBytes);
+                using var outer = new Wire();
+                outer.Put(headerBytes.Span);
+                Crypto.EncryptTo(outer, scalar, recipient.AgreementKey, headerBytes, nonce, payload);
+                return Finish(outer);
+            }
+            finally
+            {
+                Crypto.ReturnSecret(scalar);
+            }
         }
 
         /// <summary>Signs a Hello request without encryption because the recipient's keys are not yet known.</summary>
@@ -107,46 +118,63 @@ namespace MajDHTNetwork.Protocol
                 throw new InvalidDataException("Only Hello requests may be sent without encryption.");
             }
             using var header = new Wire();
-            WriteHeader(header, HelloPlaceholders.UnknownRecipient, HelloPlaceholders.EmptyKey, Crypto.Random(12));
-            var headerBytes = header.WrittenMemory;
-            using var payload = new Wire();
-            WriteSignedPayload(payload, identity, headerBytes);
+            // The placeholder recipient is the hexadecimal form of 32 zero bytes, and the placeholder key is 32 zero bytes.
+            WriteHeader(header, ProtocolTags.EmptyKey);
+            header.Put(ProtocolTags.EmptyKey);
+            WriteNonce(header);
+            using var signed = new Wire();
+            var payload = WriteSignedPayload(signed, identity, header.WrittenMemory);
             using var outer = new Wire();
-            outer.Put(headerBytes.Span);
-            outer.Put(payload.WrittenSpan);
+            outer.Put(header.WrittenSpan);
+            outer.Put(payload.Span);
             return Finish(outer);
         }
 
-        /// <summary>Writes the canonical envelope header.</summary>
+        /// <summary>Writes the canonical envelope header up to the recipient identifier.</summary>
         /// <param name="header">The destination encoder.</param>
-        /// <param name="recipient">The final recipient identifier.</param>
-        /// <param name="publicKey">The ephemeral public key, or zeros for a Hello request.</param>
-        /// <param name="nonce">The random nonce.</param>
-        private void WriteHeader(Wire header, string recipient, ReadOnlySpan<byte> publicKey, ReadOnlySpan<byte> nonce)
+        /// <param name="recipientHash">The final recipient's node digest, formatted as its identifier.</param>
+        private void WriteHeader(Wire header, ReadOnlySpan<byte> recipientHash)
         {
-            header.PutText("MajDHT/1/envelope");
+            header.Put(ProtocolTags.Envelope);
             header.PutByte(Kind);
-            header.PutText(recipient);
-            header.Put(publicKey);
-            header.Put(nonce);
+            header.PutHex(recipientHash);
         }
 
-        /// <summary>Writes the signed message that is encrypted, or left in plaintext for Hello.</summary>
-        /// <param name="payload">The destination encoder.</param>
+        /// <summary>Appends a random nonce as the last header field.</summary>
+        /// <param name="header">The header encoder.</param>
+        /// <returns>The borrowed nonce, valid while the header is not written further.</returns>
+        private static ReadOnlyMemory<byte> WriteNonce(Wire header)
+        {
+            header.PutLong(Crypto.NonceLength);
+            Crypto.Fill(header.Allocate(Crypto.NonceLength).Span);
+            var written = header.WrittenMemory;
+            return written.Slice(written.Length - Crypto.NonceLength);
+        }
+
+        /// <summary>
+        /// Writes the signed message into one pooled writer: the header and plaintext fields form the signature input, and the
+        /// plaintext fields followed by the signature form the payload that is encrypted, or sent as is for Hello.
+        /// </summary>
+        /// <param name="signed">The destination encoder, which must be empty.</param>
         /// <param name="identity">The sending identity.</param>
         /// <param name="header">The canonical header covered by the signature.</param>
-        private void WriteSignedPayload(Wire payload, DHTIdentity identity, ReadOnlyMemory<byte> header)
+        /// <returns>The borrowed payload view, valid until the writer is disposed.</returns>
+        private ReadOnlyMemory<byte> WriteSignedPayload(Wire signed, DHTIdentity identity, ReadOnlyMemory<byte> header)
         {
-            using var plain = new Wire();
-            plain.Put(Sender.Encoded);
-            plain.Put(RequestId.Span);
-            plain.PutLong(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
-            plain.Put(Body.Span);
-            using var signed = new Wire();
             signed.Put(header.Span);
-            signed.Put(plain.WrittenSpan);
-            payload.Put(plain.WrittenSpan);
-            payload.Put(identity.Sign(signed.WrittenMemory));
+            var start = signed.Length;
+            var sender = Sender.Encoded;
+            signed.PutLong(8 + sender.Length + 8 + RequestId.Length + 8 + 8 + Body.Length);
+            signed.Put(sender);
+            signed.Put(RequestId.Span);
+            signed.PutLong(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            signed.Put(Body.Span);
+            var messageLength = signed.Length;
+            signed.PutLong(SignatureLength);
+            // Reserve first: growing the writer would otherwise invalidate the message view.
+            var signature = signed.Allocate(SignatureLength);
+            identity.SignTo(signed.WrittenMemory.Slice(0, messageLength), signature);
+            return signed.WrittenMemory.Slice(start);
         }
 
         /// <summary>Copies a complete envelope and enforces the datagram budget.</summary>
@@ -165,9 +193,9 @@ namespace MajDHTNetwork.Protocol
 
         /// <summary>Verifies an envelope header and obtains routing metadata without decrypting it.</summary>
         /// <param name="encoded">The encrypted packet.</param>
-        /// <returns>The operation, final recipient, ephemeral key, nonce and authenticated header bytes.</returns>
+        /// <returns>The parsed header views.</returns>
         /// <exception cref="InvalidDataException">The envelope header is invalid.</exception>
-        private static (byte Kind, string Recipient, ReadOnlyMemory<byte> PublicKey, ReadOnlyMemory<byte> Nonce, ReadOnlyMemory<byte> Header, ReadOnlyMemory<byte> Cipher) Header(ReadOnlyMemory<byte> encoded)
+        private static EnvelopeHeader Header(ReadOnlyMemory<byte> encoded)
         {
             if (encoded.Length > Wire.MaxPacket)
             {
@@ -178,22 +206,21 @@ namespace MajDHTNetwork.Protocol
             var cipher = outer.Bytes(Wire.MaxPacket);
             outer.End();
             using var reader = new Wire(header);
-            if (reader.Text(32) != "MajDHT/1/envelope")
+            if (!reader.Tag(ProtocolTags.Envelope))
             {
                 throw new InvalidDataException("Unsupported envelope version.");
             }
             var kind = reader.Byte();
-            var recipient = reader.Text(64);
-            var publicKey = reader.Bytes(32);
-            var nonce = reader.Bytes(12);
+            var recipient = reader.Bytes(Crypto.DigestLength * 2);
+            var publicKey = reader.Bytes(Crypto.AgreementKeyLength);
+            var nonce = reader.Bytes(Crypto.NonceLength);
             reader.End();
-            Crypto.ParseHash(recipient);
-            if ((kind & 0x7f) < (byte)Operation.Ping || (kind & 0x7f) > (byte)Operation.Probe
-                || publicKey.Length != 32 || nonce.Length != 12 || cipher.Length < 16)
+            if (!Crypto.IsHash(recipient.Span) || (kind & 0x7f) < (byte)Operation.Ping || (kind & 0x7f) > (byte)Operation.Probe
+                || publicKey.Length != Crypto.AgreementKeyLength || nonce.Length != Crypto.NonceLength || cipher.Length < Crypto.TagLength)
             {
                 throw new InvalidDataException("Invalid envelope header.");
             }
-            return (kind, recipient, publicKey, nonce, header, cipher);
+            return new EnvelopeHeader(kind, recipient, publicKey, nonce, header, cipher);
         }
 
         /// <summary>Allows only data requests to the declared recipient through an opaque relay.</summary>
@@ -203,7 +230,7 @@ namespace MajDHTNetwork.Protocol
         internal static void CheckForward(ReadOnlyMemory<byte> encoded, string recipient)
         {
             var header = Header(encoded);
-            if (header.Recipient != recipient || header.Kind < (byte)Operation.Ping || header.Kind > (byte)Operation.Block)
+            if (!Crypto.AsciiEquals(header.Recipient.Span, recipient) || header.Kind < (byte)Operation.Ping || header.Kind > (byte)Operation.Block)
             {
                 throw new InvalidDataException("Only Ping, Find, Store and Block requests to the declared recipient may be relayed.");
             }
@@ -211,8 +238,11 @@ namespace MajDHTNetwork.Protocol
 
         /// <summary>Authenticates and decrypts a message addressed to this node, or authenticates a plaintext Hello request.</summary>
         /// <param name="identity">The receiving identity.</param>
-        /// <param name="encoded">The encrypted envelope.</param>
-        /// <returns>The verified sender and plaintext operation.</returns>
+        /// <param name="encoded">
+        /// The exclusively owned envelope. Its ciphertext is decrypted in place, so the returned packet borrows this buffer,
+        /// the ciphertext cannot be opened a second time, and a failed authentication leaves the ciphertext region zeroed.
+        /// </param>
+        /// <returns>The verified sender and plaintext operation, borrowing the envelope buffer.</returns>
         /// <exception cref="CryptographicException">Recipient, signature or ciphertext authentication failed.</exception>
         /// <exception cref="InvalidDataException">The message is malformed or outside the clock-skew window.</exception>
         internal static Packet Open(DHTIdentity identity, ReadOnlyMemory<byte> encoded)
@@ -221,7 +251,7 @@ namespace MajDHTNetwork.Protocol
             ReadOnlyMemory<byte> bytes;
             if (header.Kind == (byte)Operation.Hello)
             {
-                if (header.Recipient != HelloPlaceholders.UnknownRecipient || !header.PublicKey.Span.SequenceEqual(HelloPlaceholders.EmptyKey))
+                if (!header.Recipient.Span.SequenceEqual(ProtocolTags.UnknownRecipient) || !header.PublicKey.Span.SequenceEqual(ProtocolTags.EmptyKey))
                 {
                     throw new CryptographicException("A Hello request must not name a recipient key.");
                 }
@@ -229,30 +259,29 @@ namespace MajDHTNetwork.Protocol
             }
             else
             {
-                if (header.Recipient != identity.NodeId)
+                if (!IsRecipient(header.Recipient.Span, identity))
                 {
                     throw new CryptographicException("Envelope recipient mismatch.");
                 }
-                var key = Crypto.Derive(identity.Agreement, header.PublicKey, header.Header);
-                bytes = Crypto.Transform(false, key, header.Nonce, header.Header, header.Cipher);
+                bytes = Crypto.DecryptInPlace(identity.AgreementScalar, header.PublicKey, header.Bytes, header.Nonce, header.Cipher);
             }
             using var payload = new Wire(bytes);
             var plain = payload.Bytes(Wire.MaxPacket);
-            var signature = payload.Bytes(64);
+            var signature = payload.Bytes(SignatureLength);
             payload.End();
             using var reader = new Wire(plain);
-            var sender = new DHTPeer(reader.Bytes(DHTPeer.MaxEncodedLength));
-            var requestId = reader.Bytes(16);
+            var sender = DHTPeer.Parse(reader.Bytes(DHTPeer.MaxEncodedLength));
+            var requestId = reader.Bytes(RequestIdLength);
             var timestamp = reader.Long();
             var body = reader.Bytes(Wire.MaxPacket);
             reader.End();
             var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            if (requestId.Length != 16 || timestamp < now - 120 || timestamp > now + 120)
+            if (requestId.Length != RequestIdLength || timestamp < now - 120 || timestamp > now + 120)
             {
                 throw new InvalidDataException("Invalid request identity or timestamp.");
             }
             using var signed = new Wire();
-            signed.Put(header.Header.Span);
+            signed.Put(header.Bytes.Span);
             signed.Put(plain.Span);
             if (!Crypto.Verify(sender.SigningKey, signed.WrittenMemory, signature))
             {
@@ -261,13 +290,50 @@ namespace MajDHTNetwork.Protocol
             return new Packet(sender, requestId, header.Kind, body);
         }
 
-        /// <summary>Holds Hello placeholders outside the packet type so that constructing packets never runs a type initializer.</summary>
-        private static class HelloPlaceholders
+        /// <summary>Checks whether a header names an identity as the final recipient, comparing digests instead of strings.</summary>
+        /// <param name="recipient">The 64-digit recipient identifier from the header.</param>
+        /// <param name="identity">The receiving identity.</param>
+        /// <returns>Whether the identifier is the identity's node identifier.</returns>
+        private static bool IsRecipient(ReadOnlySpan<byte> recipient, DHTIdentity identity)
         {
-            /// <summary>The placeholder recipient of a Hello request sent before the recipient is known.</summary>
-            internal static readonly string UnknownRecipient = new string('0', 64);
-            /// <summary>The placeholder key of an unencrypted Hello request.</summary>
-            internal static readonly byte[] EmptyKey = new byte[32];
+            Span<byte> digest = stackalloc byte[Crypto.DigestLength];
+            Crypto.ParseHash(recipient, digest);
+            return digest.SequenceEqual(identity.NodeHash);
+        }
+
+        /// <summary>The borrowed views of one parsed envelope header.</summary>
+        private readonly struct EnvelopeHeader
+        {
+            /// <summary>Gets the operation with the response bit.</summary>
+            internal byte Kind { get; }
+            /// <summary>Gets the 64-digit recipient identifier.</summary>
+            internal ReadOnlyMemory<byte> Recipient { get; }
+            /// <summary>Gets the ephemeral public key, or zeros for a Hello request.</summary>
+            internal ReadOnlyMemory<byte> PublicKey { get; }
+            /// <summary>Gets the nonce.</summary>
+            internal ReadOnlyMemory<byte> Nonce { get; }
+            /// <summary>Gets the complete authenticated header bytes.</summary>
+            internal ReadOnlyMemory<byte> Bytes { get; }
+            /// <summary>Gets the ciphertext, or the plaintext payload of a Hello request.</summary>
+            internal ReadOnlyMemory<byte> Cipher { get; }
+
+            /// <summary>Retains the parsed views.</summary>
+            /// <param name="kind">The operation with the response bit.</param>
+            /// <param name="recipient">The recipient identifier.</param>
+            /// <param name="publicKey">The ephemeral public key.</param>
+            /// <param name="nonce">The nonce.</param>
+            /// <param name="bytes">The complete header.</param>
+            /// <param name="cipher">The ciphertext or Hello payload.</param>
+            internal EnvelopeHeader(byte kind, ReadOnlyMemory<byte> recipient, ReadOnlyMemory<byte> publicKey, ReadOnlyMemory<byte> nonce,
+                ReadOnlyMemory<byte> bytes, ReadOnlyMemory<byte> cipher)
+            {
+                Kind = kind;
+                Recipient = recipient;
+                PublicKey = publicKey;
+                Nonce = nonce;
+                Bytes = bytes;
+                Cipher = cipher;
+            }
         }
     }
 }

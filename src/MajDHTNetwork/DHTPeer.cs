@@ -25,6 +25,14 @@ namespace MajDHTNetwork
         private const byte ReachabilityMask = 0x03;
         /// <summary>The reachability bit marking an endpoint-dependent NAT mapping.</summary>
         private const byte EndpointDependentBit = 0x04;
+        /// <summary>The maximum number of distinct contacts whose verification is cached process-wide.</summary>
+        private const int CacheCapacity = 512;
+        /// <summary>
+        /// The verified contacts keyed by their exact bytes, so the sender of every request and the contacts repeated across
+        /// lookups are parsed, signature-checked and allocated once instead of on every packet.
+        /// </summary>
+        private static readonly EncodedCache<DHTPeer> s_cache = new EncodedCache<DHTPeer>(CacheCapacity,
+            static encoded => new DHTPeer(encoded), static (peer, encoded) => !peer.IsExpired && peer.Encoded.SequenceEqual(encoded));
         /// <summary>The immutable canonical contact bytes.</summary>
         private readonly byte[] _encoded;
         /// <summary>The signing public key.</summary>
@@ -50,7 +58,7 @@ namespace MajDHTNetwork
         /// <summary>Gets whether the owner observed an endpoint-dependent NAT mapping, which makes hole punching unlikely.</summary>
         public bool HasEndpointDependentMapping { get; }
         /// <summary>Gets a copy of the external address confirmed by independent relays, or null when unknown.</summary>
-        public IPAddress? ExternalAddress => _externalAddress == null ? null : IPAddress.Parse(_externalAddress.ToString());
+        public IPAddress? ExternalAddress => _externalAddress == null ? null : NetworkScope.CopyAddress(_externalAddress);
         /// <summary>Gets the internally cached external address.</summary>
         internal IPAddress? ExternalNetworkAddress => _externalAddress;
         /// <summary>Gets the advertised and signed node capabilities.</summary>
@@ -83,6 +91,19 @@ namespace MajDHTNetwork
         {
         }
 
+        /// <summary>Gets the verified contact for canonical bytes, reusing the cached instance when the same bytes were verified before.</summary>
+        /// <param name="encoded">The borrowed signed bytes; they are never retained.</param>
+        /// <returns>The verified, unexpired contact.</returns>
+        /// <exception cref="InvalidDataException">The contact is malformed, expired or forged.</exception>
+        internal static DHTPeer Parse(ReadOnlyMemory<byte> encoded)
+        {
+            if (encoded.Length > MaxEncodedLength)
+            {
+                throw new InvalidDataException("Oversized node contact.");
+            }
+            return s_cache.Get(encoded);
+        }
+
         /// <summary>Parses and verifies canonical contact bytes, optionally rejecting nested relay hints.</summary>
         /// <param name="encoded">The signed bytes.</param>
         /// <param name="allowRelayHints">Whether the contact may embed relay hints.</param>
@@ -99,7 +120,7 @@ namespace MajDHTNetwork
             var signature = wrapper.Bytes(64);
             wrapper.End();
             using var wire = new Wire(payload);
-            if (wire.Text(32) != "MajDHT/1/contact")
+            if (!wire.Tag(ProtocolTags.Contact))
             {
                 throw new InvalidDataException("Unsupported contact version.");
             }
@@ -172,9 +193,9 @@ namespace MajDHTNetwork
                 expiry = Math.Min(expiry, hint.ExpiresAt.ToUnixTimeSeconds());
             }
             using var payload = new Wire();
-            payload.PutText("MajDHT/1/contact");
+            payload.Put(ProtocolTags.Contact);
             payload.Put(identity.PublicKey);
-            payload.Put(identity.Agreement.GeneratePublicKey().GetEncoded());
+            payload.Put(identity.AgreementPublicKey);
             payload.PutByte((byte)capabilities);
             payload.PutByte((byte)((byte)reachability | (endpointDependentMapping ? EndpointDependentBit : 0)));
             payload.PutLong(identity.NextSequence());

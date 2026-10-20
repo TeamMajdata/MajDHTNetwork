@@ -93,8 +93,8 @@ namespace MajDHTNetwork.Tests
             var contact = identity == null ? Peer : DHTPeer.Create(identity, claimed.Address, claimed.Port, 0, Peer.Capabilities);
             var packet = new Packet(contact, Crypto.Random(16), (byte)operation, body);
             var endpoint = new IPEndPoint(receiver.Endpoints[0].Address, receiver.Endpoints[0].TcpPort);
-            var encoded = await _transport.ExchangeAtAsync(DHTTransport.Tcp, endpoint, packet.Seal(sender, receiver), token);
-            var response = Packet.Open(sender, encoded);
+            using var encoded = await _transport.ExchangeAtAsync(DHTTransport.Tcp, endpoint, packet.Seal(sender, receiver), token);
+            var response = Packet.Open(sender, encoded.Bytes);
             if (response.Sender.NodeId != receiver.NodeId || response.Kind != (byte)(packet.Kind | 128)
                 || !response.RequestId.Span.SequenceEqual(packet.RequestId.Span))
             {
@@ -104,7 +104,8 @@ namespace MajDHTNetwork.Tests
             var status = reader.Byte();
             var result = reader.Bytes(Wire.MaxPacket);
             reader.End();
-            return (status, result);
+            // The result outlives the pooled response frame, so it is copied.
+            return (status, result.ToArray());
         }
 
         /// <summary>Answers each request with the current script.</summary>

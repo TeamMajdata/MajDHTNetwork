@@ -138,7 +138,8 @@ namespace MajDHTNetwork
                 body.PutByte(1);
                 body.PutText(peer.NodeId);
                 var response = await RequestNatAsync(relay, transport, body.WrittenMemory, timeout.Token).ConfigureAwait(false);
-                using var reader = new Wire(response.Body);
+                using var introduction = response.Body;
+                using var reader = new Wire(introduction.Bytes);
                 var invitation = ReadNatInvitation(reader, transport);
                 reader.End();
                 if (invitation.Peer.NodeId != peer.NodeId)
@@ -248,9 +249,12 @@ namespace MajDHTNetwork
         /// <param name="transport">The mapping being observed.</param>
         /// <param name="body">The rendezvous operation arguments.</param>
         /// <param name="cancellationToken">The operation lifetime.</param>
-        /// <returns>The refreshed relay contact, decoded response body and the relay endpoint that was used.</returns>
+        /// <returns>
+        /// The refreshed relay contact, the decoded response body, which the caller releases by disposing it, and the relay
+        /// endpoint that was used.
+        /// </returns>
         /// <exception cref="IOException">No common address family exists or the relay rejected the request.</exception>
-        private async Task<(DHTPeer Peer, ReadOnlyMemory<byte> Body, IPEndPoint Endpoint)> RequestNatAsync(DHTPeer relay, DHTTransport transport,
+        private async Task<(DHTPeer Peer, OwnedMemory Body, IPEndPoint Endpoint)> RequestNatAsync(DHTPeer relay, DHTTransport transport,
             ReadOnlyMemory<byte> body, CancellationToken cancellationToken)
         {
             if (relay.IsExpired)
@@ -261,8 +265,16 @@ namespace MajDHTNetwork
             var packet = new Packet(LocalPeer, Crypto.Random(16), (byte)Operation.Rendezvous, body);
             var result = await ExchangeCountedAsync(relay, transport, endpoint, packet.Seal(_identity, relay), cancellationToken).ConfigureAwait(false);
             var response = AuthenticateResponse(result, relay, packet);
-            ObservePeer(response.Sender, endpoint.Address);
-            return (response.Sender, ReadResponseBody(response), endpoint);
+            try
+            {
+                ObservePeer(response.Packet.Sender, endpoint.Address);
+            }
+            catch
+            {
+                response.Dispose();
+                throw;
+            }
+            return (response.Packet.Sender, TakeResponseBody(response), endpoint);
         }
 
         /// <summary>Refreshes an observed mapping, records it for the external-address vote and starts a queued introduction.</summary>
@@ -273,7 +285,8 @@ namespace MajDHTNetwork
         private async Task<DHTPeer> RegisterNatTransportAsync(DHTPeer relay, DHTTransport transport, CancellationToken cancellationToken)
         {
             var response = await RequestNatAsync(relay, transport, s_natRegistration, cancellationToken).ConfigureAwait(false);
-            using var reader = new Wire(response.Body);
+            using var body = response.Body;
+            using var reader = new Wire(body.Bytes);
             var observed = ReadNatEndpoint(reader);
             RecordObservation(response.Peer, response.Endpoint.Address, transport, observed);
             var hasInvitation = reader.Byte();
@@ -356,11 +369,12 @@ namespace MajDHTNetwork
         /// <param name="request">The operation arguments.</param>
         /// <param name="transport">The receiving transport.</param>
         /// <param name="source">The socket's validated remote endpoint.</param>
+        /// <param name="response">The encoder receiving the action result.</param>
         /// <param name="cancellationToken">The handler lifetime.</param>
-        /// <returns>The action result.</returns>
+        /// <returns>Completion after the action result was written.</returns>
         /// <exception cref="IOException">Relaying is disabled, a mapping or helper is absent, or a quota was reached.</exception>
         /// <exception cref="InvalidDataException">The request is invalid.</exception>
-        private async Task<ReadOnlyMemory<byte>> DispatchRendezvousAsync(Packet packet, Wire request, DHTTransport transport, IPEndPoint source,
+        private async Task DispatchRendezvousAsync(Packet packet, Wire request, DHTTransport transport, IPEndPoint source, Wire response,
             CancellationToken cancellationToken)
         {
             if ((_options.Capabilities & DHTCapabilities.Relay) == 0)
@@ -371,11 +385,14 @@ namespace MajDHTNetwork
             switch (action)
             {
                 case 2:
-                    return await DispatchDialBackAsync(packet, request, transport, source, cancellationToken).ConfigureAwait(false);
+                    await DispatchDialBackAsync(packet, request, transport, source, response, cancellationToken).ConfigureAwait(false);
+                    return;
                 case 3:
-                    return DispatchDialBackAssist(packet, request);
+                    DispatchDialBackAssist(packet, request);
+                    return;
                 default:
-                    return DispatchRendezvous(packet, request, action, transport, source);
+                    DispatchRendezvous(packet, request, action, transport, source, response);
+                    return;
             }
         }
 
@@ -385,10 +402,10 @@ namespace MajDHTNetwork
         /// <param name="action">Zero to register and poll, or one to request an introduction.</param>
         /// <param name="transport">The receiving transport.</param>
         /// <param name="source">The socket's validated remote endpoint.</param>
-        /// <returns>The observed mapping or peer introduction.</returns>
+        /// <param name="response">The encoder receiving the observed mapping or peer introduction.</param>
         /// <exception cref="IOException">A mapping is absent, or a quota was reached.</exception>
         /// <exception cref="InvalidDataException">The request is invalid.</exception>
-        private ReadOnlyMemory<byte> DispatchRendezvous(Packet packet, Wire request, byte action, DHTTransport transport, IPEndPoint source)
+        private void DispatchRendezvous(Packet packet, Wire request, byte action, DHTTransport transport, IPEndPoint source, Wire response)
         {
             var targetId = action == 1 ? request.Text(64) : string.Empty;
             request.End();
@@ -396,7 +413,6 @@ namespace MajDHTNetwork
             {
                 throw new InvalidDataException("Invalid rendezvous action or target.");
             }
-            using var response = new Wire();
             lock (_gate)
             {
                 PruneNatState();
@@ -462,16 +478,14 @@ namespace MajDHTNetwork
                     PutNatInvitation(response, new NatInvitation(target.Peer, transport, binding.Endpoint, token, ticketExpiry));
                 }
             }
-            return response.ToArray();
         }
 
-        /// <summary>Validates an introduced peer's probe and records its direct source endpoint.</summary>
+        /// <summary>Validates an introduced peer's probe and records its direct source endpoint; the response body stays empty.</summary>
         /// <param name="packet">The authenticated direct probe.</param>
         /// <param name="transport">The receiving transport.</param>
         /// <param name="source">The socket's observed remote endpoint.</param>
-        /// <returns>An empty successful response body.</returns>
         /// <exception cref="InvalidDataException">The ticket, identity, transport or source endpoint does not match.</exception>
-        private ReadOnlyMemory<byte> DispatchPunch(Packet packet, DHTTransport transport, IPEndPoint source)
+        private void DispatchPunch(Packet packet, DHTTransport transport, IPEndPoint source)
         {
             if (packet.Body.Length != 16)
             {
@@ -488,7 +502,6 @@ namespace MajDHTNetwork
                 RememberNatRoute(packet.Sender, transport, source);
                 session.Success.TrySetResult(true);
             }
-            return Array.Empty<byte>();
         }
 
         /// <summary>Starts or coalesces a bounded introduction while retaining its work for shutdown.</summary>
@@ -546,7 +559,8 @@ namespace MajDHTNetwork
                     {
                         var encoded = await _transport.PunchAsync(invitation.Transport, invitation.Endpoint,
                             request.Seal(_identity, invitation.Peer), timeout.Token).ConfigureAwait(false);
-                        ReadResponseBody(AuthenticateResponse(encoded, invitation.Peer, request));
+                        using var response = AuthenticateResponse(encoded, invitation.Peer, request);
+                        ReadResponseBody(response.Packet);
                         lock (_gate)
                         {
                             RememberNatRoute(invitation.Peer, invitation.Transport, invitation.Endpoint);
@@ -695,15 +709,15 @@ namespace MajDHTNetwork
         /// <summary>The response of a direct exchange and the advertised address it proved, if any.</summary>
         private readonly struct DirectExchange
         {
-            /// <summary>Gets the encrypted response.</summary>
-            internal ReadOnlyMemory<byte> Response { get; }
+            /// <summary>Gets the encrypted response in its received frame, which the consumer releases.</summary>
+            internal OwnedMemory Response { get; }
             /// <summary>Gets the advertised address that answered, or null for punched, registered or unadvertised routes.</summary>
             internal IPAddress? VerifiedAddress { get; }
 
             /// <summary>Creates a direct exchange result.</summary>
-            /// <param name="response">The encrypted response.</param>
+            /// <param name="response">The encrypted response in its received frame.</param>
             /// <param name="verifiedAddress">The advertised address that answered, or null.</param>
-            internal DirectExchange(ReadOnlyMemory<byte> response, IPAddress? verifiedAddress)
+            internal DirectExchange(OwnedMemory response, IPAddress? verifiedAddress)
             {
                 Response = response;
                 VerifiedAddress = verifiedAddress;
@@ -784,7 +798,7 @@ namespace MajDHTNetwork
         /// <returns>An independent endpoint and address.</returns>
         private static IPEndPoint CopyEndpoint(IPEndPoint endpoint)
         {
-            return new IPEndPoint(IPAddress.Parse(endpoint.Address.ToString()), endpoint.Port);
+            return NetworkScope.CopyEndpoint(endpoint);
         }
 
         /// <summary>Encodes a relay-observed endpoint.</summary>
@@ -831,7 +845,7 @@ namespace MajDHTNetwork
         /// <exception cref="InvalidDataException">The ticket is expired, malformed, local, or uses another address family.</exception>
         private NatInvitation ReadNatInvitation(Wire reader, DHTTransport transport)
         {
-            var peer = new DHTPeer(reader.Bytes(DHTPeer.MaxEncodedLength));
+            var peer = DHTPeer.Parse(reader.Bytes(DHTPeer.MaxEncodedLength));
             var endpoint = ReadNatEndpoint(reader);
             var token = reader.Bytes(16);
             var expiresAt = DateTimeOffset.FromUnixTimeMilliseconds(reader.Long());
