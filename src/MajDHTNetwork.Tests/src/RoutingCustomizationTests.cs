@@ -49,8 +49,11 @@ namespace MajDHTNetwork.Tests
             Assert.False(routes[0].AttemptPunch, "Punching through an unregistered hint would consume a relay slot.");
             Assert.Equal(registered.NodeId, routes[1].Relay.NodeId);
             Assert.True(routes[1].AttemptPunch);
-            Assert.Equal(routed[0].NodeId, routes[2].Relay.NodeId);
-            Assert.Equal(routed[2].NodeId, routes[3].Relay.NodeId);
+            // Routed relays are drawn in random order from the nearest candidates, so only membership is fixed.
+            var routedIds = new HashSet<string> { routed[0].NodeId, routed[2].NodeId, routed[3].NodeId };
+            Assert.Contains(routes[2].Relay.NodeId, routedIds);
+            Assert.Contains(routes[3].Relay.NodeId, routedIds);
+            Assert.NotEqual(routes[2].Relay.NodeId, routes[3].Relay.NodeId);
             Assert.Empty(new DefaultDHTRouteSelector().SelectDirectRoutes(destination, context));
             var withoutTraversal = new DHTRouteContext(DHTTransport.Tcp, false, Array.Empty<IPAddress>(), new[] { registered.NodeId }, 2);
             Assert.All(new DefaultDHTRouteSelector().SelectRelayRoutes(destination, routed, withoutTraversal), route => Assert.False(route.AttemptPunch));
@@ -175,13 +178,13 @@ namespace MajDHTNetwork.Tests
             }
 
             /// <inheritdoc />
-            public void Observe(DHTPeer peer)
+            public void Observe(DHTPeer peer, IPAddress? verifiedAddress)
             {
                 lock (_gate)
                 {
                     _observed.Add(peer.NodeId);
                 }
-                _inner.Observe(peer);
+                _inner.Observe(peer, verifiedAddress);
             }
 
             /// <inheritdoc />

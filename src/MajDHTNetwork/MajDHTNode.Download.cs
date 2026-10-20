@@ -79,9 +79,13 @@ namespace MajDHTNetwork
                 _cancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 _window = node._options.MaxConcurrentBlockRequests * 2;
                 _perPeerLimit = node._options.MaxBlockRequestsPerPeer;
-                for (var index = 0; index < providers.Count; index++)
+                // A random rotation order keeps equally ranked providers, such as many unmeasured Sybil providers, from being
+                // chosen in a predictable discovery order.
+                var shuffled = new List<DHTPeer>(providers);
+                Crypto.Shuffle(shuffled);
+                for (var index = 0; index < shuffled.Count; index++)
                 {
-                    _providers.Add(new ProviderSlot(providers[index], index, providers[index].NodeId == node.NodeId));
+                    _providers.Add(new ProviderSlot(shuffled[index], index, shuffled[index].NodeId == node.NodeId));
                 }
                 for (var index = 0; index < record.BlockCount; index++)
                 {

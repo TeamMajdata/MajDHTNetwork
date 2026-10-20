@@ -23,7 +23,7 @@ namespace MajDHTNetwork.Tests
             {
                 var peer = DHTPeer.Create(new DHTIdentity(), IPAddress.Loopback, 23000 + i, 0, DHTCapabilities.Download);
                 all.Add(peer);
-                routing.Observe(peer);
+                routing.Observe(peer, IPAddress.Loopback);
             }
             var target = Crypto.Hex(Crypto.Random(32));
             var nearest = routing.Closest(target, 512);

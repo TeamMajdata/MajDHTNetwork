@@ -38,7 +38,9 @@ namespace MajDHTNetwork.Tests
         /// <param name="address">The loopback listener address.</param>
         /// <param name="capabilities">The advertised capabilities.</param>
         /// <param name="reachability">The advertised reachability; Public advertises a configured endpoint.</param>
-        internal ScriptedPeer(IPAddress address, DHTCapabilities capabilities, DHTReachability reachability = DHTReachability.Public)
+        /// <param name="workBits">The identity proof-of-work difficulty the contact proves.</param>
+        internal ScriptedPeer(IPAddress address, DHTCapabilities capabilities, DHTReachability reachability = DHTReachability.Public,
+            int workBits = 0)
         {
             var options = new DHTNodeOptions
             {
@@ -51,7 +53,7 @@ namespace MajDHTNetwork.Tests
             Endpoint = new IPEndPoint(address, _transport.TcpPort);
             var flags = reachability == DHTReachability.Public ? DHTEndpointFlags.Configured : DHTEndpointFlags.None;
             Peer = DHTPeer.Create(Identity, new[] { new DHTEndpoint(address, _transport.TcpPort, 0, flags) }, capabilities, reachability,
-                false, null, Array.Empty<DHTPeer>(), TimeSpan.FromHours(1));
+                false, null, Array.Empty<DHTPeer>(), TimeSpan.FromHours(1), workBits);
             _transport.Run();
         }
 
@@ -78,14 +80,16 @@ namespace MajDHTNetwork.Tests
         /// <param name="operation">The operation.</param>
         /// <param name="body">The request body.</param>
         /// <param name="token">The test deadline.</param>
-        /// <param name="identity">An alternative sender identity; its contact advertises this listener.</param>
+        /// <param name="identity">An alternative sender identity; its contact advertises this listener unless overridden.</param>
+        /// <param name="advertised">An endpoint the alternative identity claims instead of this listener.</param>
         /// <returns>The response status and result.</returns>
         /// <exception cref="InvalidDataException">The response was not authenticated by the receiver.</exception>
         internal async Task<(byte Status, ReadOnlyMemory<byte> Result)> SendAsync(DHTPeer receiver, Operation operation, ReadOnlyMemory<byte> body,
-            CancellationToken token, DHTIdentity? identity = null)
+            CancellationToken token, DHTIdentity? identity = null, IPEndPoint? advertised = null)
         {
             var sender = identity ?? Identity;
-            var contact = identity == null ? Peer : DHTPeer.Create(identity, Endpoint.Address, Endpoint.Port, 0, Peer.Capabilities);
+            var claimed = advertised ?? Endpoint;
+            var contact = identity == null ? Peer : DHTPeer.Create(identity, claimed.Address, claimed.Port, 0, Peer.Capabilities);
             var packet = new Packet(contact, Crypto.Random(16), (byte)operation, body);
             var endpoint = new IPEndPoint(receiver.Endpoints[0].Address, receiver.Endpoints[0].TcpPort);
             var encoded = await _transport.ExchangeAtAsync(DHTTransport.Tcp, endpoint, packet.Seal(sender, receiver), token);

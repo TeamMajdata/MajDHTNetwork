@@ -173,6 +173,8 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | `MaxRecords` | `1024` |
 | `MaxFileSize` | `1 GiB` |
 | `BlockSize` | `16384`（允许 1 KiB–32 KiB） |
+| `IdentityWorkBits` | `22`（允许 0–28；同一网络必须一致） |
+| `DisjointLookupPaths` | `3`（允许 1–8） |
 | `MaxConcurrentBlockRequests` | `8`（允许 1–64） |
 | `MaxBlockRequestsPerPeer` | `2`（允许 1–16） |
 | `RequestTimeout` | `5 秒` |
@@ -192,8 +194,8 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 
 | 类型 | 主要成员 |
 | --- | --- |
-| `DHTIdentity` | `DHTIdentity()`、`DHTIdentity(ReadOnlySpan<byte> seed)`、`NodeId`、`PublicKey`、`ExportSeed()`、`ExportSeed(Span<byte>)` |
-| `DHTPeer` | `NodeId`、`Endpoints`、`RelayHints`、`Reachability`、`HasEndpointDependentMapping`、`ExternalAddress`、`Capabilities`、`Sequence`、`ExpiresAt`、`IsExpired` |
+| `DHTIdentity` | `DHTIdentity()`、`DHTIdentity(ReadOnlySpan<byte> seed)`、`NodeId`、`PublicKey`、`ExportSeed()`、`ExportSeed(Span<byte>)`、`ComputeProofOfWork(int bits)` |
+| `DHTPeer` | `NodeId`、`Endpoints`、`RelayHints`、`Reachability`、`HasEndpointDependentMapping`、`ExternalAddress`、`Capabilities`、`WorkNonce`、`IdentityWork`、`Sequence`、`ExpiresAt`、`IsExpired` |
 | `DHTEndpoint` | `DHTEndpoint(IPAddress, int tcpPort, int udpPort, DHTEndpointFlags)`、`Address`、`TcpPort`、`UdpPort`、`Flags` |
 | `DHTReachability` | `Unknown = 0`、`Public = 1`、`Private = 2` |
 | `DHTEndpointFlags` | `None = 0`、`Verified = 1`、`Local = 2`、`Configured = 4` |
@@ -201,8 +203,8 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | `DHTRecord` | `Key`、`FileHash`、`MerkleRoot`、`Length`、`BlockSize`、`BlockCount`、`Revision`、`ExpiresAt`、`IsExpired`、`EncodedLength`、`CopyTo(Span<byte>)`、`ToBytes()`、`Parse(ReadOnlySpan<byte>)` |
 | `IDHTContentStore` | `PutAsync(string blockHash, ReadOnlyMemory<byte>, CancellationToken)`、`GetAsync(string blockHash, CancellationToken)` |
 | `MemoryDHTContentStore` | `MemoryDHTContentStore(long capacity = 64 MiB, int maxEntries = 65536)` |
-| `IDHTRoutingTable` | `Initialize(string localNodeId, int bucketSize)`、`Observe(DHTPeer)`、`Remove(string nodeId)`、`Closest(string routingId, int count)` |
-| `KademliaDHTRoutingTable` | 默认路由表：256 个 XOR 距离桶，每桶 `BucketSize` 个联系人 |
+| `IDHTRoutingTable` | `Initialize(string localNodeId, int bucketSize)`、`Observe(DHTPeer, IPAddress? verifiedAddress)`、`Remove(string nodeId)`、`Closest(string routingId, int count)` |
+| `KademliaDHTRoutingTable` | `KademliaDHTRoutingTable(int maxPerNetworkInBucket = 2, int maxPerNetwork = 10)`；默认路由表，256 个 XOR 距离桶，带按网络限额 |
 | `IDHTRouteSelector` | `SelectDirectRoutes(DHTPeer, DHTRouteContext)`、`SelectRelayRoutes(DHTPeer, IReadOnlyList<DHTPeer> knownRelays, DHTRouteContext)` |
 | `DefaultDHTRouteSelector` | 默认路径选择，见[自定义选路](#自定义选路) |
 | `DHTRouteContext` | `PreferredTransport`、`AlternateTransport`、`NatTraversalEnabled`、`ExternalAddresses`、`MaxRelayAttempts`、`IsRegisteredWith(string)`、`SharesExternalAddress(DHTPeer)`、`GetPeerStatistics(string)`、`PacketLossRate(string)`、`PacketLossRate(string, DHTDirectRoute)` |
@@ -314,6 +316,26 @@ UDP 监听器也可以独立启用。签名联系人最多通告四个端点：
 出站请求先尝试已配置或已验证的端点，再尝试未验证端点与本地端点；每个端点都先用首选传输，再用
 另一种传输。主机名、外部 STUN 服务器与 UPnP 不在本库范围内。
 
+### Sybil 抵御
+
+开放的 DHT 无法阻止一方创建大量身份，但 MajDHT 会提高其成本并限制其影响范围：
+
+- **身份工作量证明。** 每个联系人都携带一个签名的 nonce；SHA-256("MajDHT/1/identity-work"、节点摘要、
+  nonce) 的前导零位数就是它的 `IdentityWork`。节点会证明 `IdentityWorkBits`（默认 22，每次启动约
+  耗费半秒 CPU），并拒绝工作量不足的请求、响应、推荐联系人、中继与引入。每多一位，批量创建身份
+  （包括为靠近某个密钥而刷出的身份）的成本就翻一倍。同一网络的所有节点必须使用相同的值。
+- **经验证的准入。** 联系人只有在某个通告端点上作出应答之后才会进入路由表：入站请求若来自该端点
+  则立即准入，否则节点会去 Ping 它的通告端点，同时最多 16 个、每个源网络每分钟最多八次。只能经
+  中继或打洞路径访问的节点可以使用，但不会推荐给其他节点。
+- **网络多样性。** 路由表中同一 IPv4 /24 或 IPv6 /48 在每个桶内最多两个联系人、整张表最多十个；
+  每个文件按观测到的源地址，同一网络最多保留三个提供者声明。回环、私有与链路本地地址不受限，
+  局域网可以照常工作。
+- **随机化选择。** 回拨协助者在每个网络中随机抽取一个；路由中的中继从最近的候选中随机抽取；下载
+  时提供者以随机顺序开始。靠近目标刷出的身份无法稳定地占据这些角色。
+- **不相交查找。** 每次查找沿 `DisjointLookupPaths` 条路径进行，各路径从不查询同一节点，并各自
+  分得 `MaxLookupQueries` 的一部分，最后合并结果。Sybil 推荐可以耗尽它占据的路径，但只要有一条
+  诚实路径找到了记录或提供者，结果就仍能找到。
+
 ## TCP、UDP 与 NAT 穿透
 
 通过声明 `Relay` 的节点进行引导时，会自动为每种共同启用的传输登记。中继会观测已认证请求的
@@ -378,10 +400,11 @@ await using var node = new MajDHTNode(options, identity, store,
 ```
 
 - **`IDHTRoutingTable`** 决定把哪些已认证联系人保留为查找跳点，以及哪些联系人作为离目标最近的
-  节点返回。节点只会调用一次 `Initialize`，因此每个节点都要传入新的路由表。节点只把已校验且
-  非私有的联系人交给 `Observe`，在请求失败或节点变为私有时调用 `Remove`，并丢弃 `Closest`
-  返回的过期、私有、重复以及本节点自身的联系人。默认的 `KademliaDHTRoutingTable` 维护 256 个
-  XOR 距离桶，每桶最多 `BucketSize` 个联系人，不会淘汰仍然有效的条目。
+  节点返回。节点只会调用一次 `Initialize`，因此每个节点都要传入新的路由表。节点只把已认证且
+  非私有的联系人交给 `Observe`，同时传入该联系人证明了某个通告端点的地址；仅刷新已知联系人时
+  传入 null。节点在请求失败或节点变为私有时调用 `Remove`，并丢弃 `Closest` 返回的过期、私有、
+  重复以及本节点自身的联系人。默认的 `KademliaDHTRoutingTable` 维护 256 个 XOR 距离桶，每桶最多
+  `BucketSize` 个联系人，不会淘汰仍然有效的条目；同一公网网络在每个桶中最多两个、整张表最多十个。
 - **`IDHTRouteSelector`** 决定如何访问目标节点。它返回按顺序排列的直连尝试（端点与传输），
   以及直连全部失败后按顺序排列的中继尝试，并指明是否先经该中继打洞。`DHTRouteContext` 提供
   首选传输、是否启用 NAT 穿透、已确认的外部地址，以及本节点已登记的中继。同一个路径选择实现
@@ -489,8 +512,9 @@ UDP 在处理请求前必须先通过无状态源地址 Cookie 校验。固定 6
 - 可达性证据依赖独立的中继与协助者。单个中继无法设定外部地址，也无法让外来地址作为 Verified
   端点被通告；跨两个网络串通的中继可以做到，串通的中继也可以让节点看起来是私有的。这些都只影响
   可达性，不影响内容完整性。
-- 引导端点、Hello 与 Ping 接受任何身份，因此路由表对 Sybil 身份开放；查找结果与提供者声明仍然
-  只是提示。
+- Sybil 身份的成本被提高、影响被限制（见 [Sybil 抵御](#sybil-抵御)），但无法杜绝：拥有足够
+  CPU 且掌握多个网络地址的攻击者仍可加入身份。查找结果与提供者声明仍然只是提示；签名、Merkle
+  证明与文件哈希才具有权威性。
 - 超出租约的新鲜度由应用负责；当内容必须永不变更时，请固定完整文件哈希。
 
 ## 测试与验证

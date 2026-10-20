@@ -25,6 +25,7 @@ Payload fields, in order:
 | Domain | string `MajDHT/1/contact` |
 | Signing key | bytes, exactly 32 |
 | Agreement key | bytes, exactly 32 |
+| Work nonce | integer, non-negative identity proof-of-work nonce |
 | Capabilities | byte flags: Download=1, Provide=2, Relay=4 |
 | Reachability | byte: bits 0–1 state (0 Unknown, 1 Public, 2 Private; 3 is rejected), bit 2 endpoint-dependent mapping, other bits zero |
 | Sequence | integer, the owner's issue time in Unix **milliseconds**, strictly increasing per identity |
@@ -32,6 +33,14 @@ Payload fields, in order:
 | External address | canonical IP string, max 96 UTF-8 bytes, or empty when unconfirmed |
 | Endpoint count | integer 0..4, followed by that many endpoints |
 | Relay hint count | integer 0..3, followed by that many byte arrays of at most 1,024 bytes, each a signed contact |
+
+The identity work of a contact is the number of leading zero bits of
+SHA-256 over the concatenation, without length prefixes, of the ASCII bytes of
+`MajDHT/1/identity-work`, the 32-byte node digest and the big-endian 64-bit work
+nonce. Nodes reject requests, responses, lookup referrals, provider entries, relay
+routes, introductions and dial-back delegations whose contact proves less than
+their configured `IdentityWorkBits` (default 22); every node of a network must
+use the same value.
 
 Each endpoint is a canonical IP string (max 96 UTF-8 bytes), an integer TCP port
 (0..65535, zero means no TCP), an integer UDP port (0..65535, zero means no UDP)
@@ -161,7 +170,10 @@ Store records an authenticated sender's provider claim and requires its Provide
 flag; it never trusts an unrelated provider supplied in the body. Indexes enforce
 size quotas, expiry, monotonic revisions and equal-revision content consistency.
 Receivers retain bounded revision floors past record expiry. Store success is
-not proof that the provider owns every block.
+not proof that the provider owns every block. For each file, a node keeps at most
+three provider claims whose announcements came from one globally routed IPv4 /24
+or IPv6 /48, by observed source address; loopback, private and link-local sources
+are not limited.
 
 Block requires the server's Provide flag and exact local Merkle geometry. The
 server reauthenticates stored bytes before responding. A receiver verifies a
@@ -234,10 +246,10 @@ such requests per requester per minute:
 `byte(2), integer(portCount 0..2), integer(port) × portCount`. The candidate
 ports are the observed source port followed by the requested ports, deduplicated,
 at most three. The dial-back address is always the observed source address. The
-relay selects a helper: an authenticated routed peer advertising Relay with
-Public reachability and a Verified or Configured endpoint for the transport and
-address family whose address is in a network distinct from the requester and the
-relay. It generates a random 16-byte nonce and an expiry no later than its
+relay selects a helper at random, one per network, among authenticated routed peers
+advertising Relay with Public reachability and a Verified or Configured endpoint
+for the transport and address family whose address is in a network distinct from
+the requester and the relay. It generates a random 16-byte nonce and an expiry no later than its
 traversal budget, and sends the helper Rendezvous action 3:
 `byte(3), bytes(requesterContact), byte(transport: 0 TCP, 1 UDP),
 string(targetAddress), integer(portCount 1..3), integer(port) × portCount,
@@ -352,15 +364,27 @@ UDP sends a whole request again after loss; large blocks rely on IP fragmentatio
 Use 256 XOR-distance buckets indexed by the most significant set bit of
 `localNodeId XOR remoteNodeId`. Each bucket retains at most k live contacts
 (default k=8), ordered by recent authenticated observation. A full live bucket
-is retained; unsuccessful queries remove failed peers. Referrals are verified
-but admitted to routing buckets only after an authenticated exchange. A higher
+is retained; unsuccessful queries remove failed peers. A contact is admitted only
+after it proved an advertised endpoint: an authenticated response received over a
+selected route to one of its advertised endpoints, or an inbound request whose
+observed source equals one of its advertised endpoints for that transport. Other
+inbound senders refresh an existing entry only and are verified by a direct Ping
+to their advertised endpoints, at most 16 at a time and eight per source network
+per minute. Responses over punched routes, registrations or relays never admit a
+contact. A bucket admits at most two contacts and the table at most ten whose
+verified addresses share one globally routed IPv4 /24 or IPv6 /48. A higher
 contact sequence replaces the stored contact. Private contacts are never
 admitted and remove any earlier contact of the same node, so private nodes
 never appear as lookup referrals; they remain eligible as providers.
 
-Iterative lookups query the nearest unvisited k-set with alpha parallelism
-(default 3). Merge closer referrals, remove failed candidates, and terminate
-when the nearest set is exhausted or the query budget (default 64) is reached.
+Iterative lookups split the nearest k routed contacts round robin into
+`DisjointLookupPaths` paths (default 3). Each path queries its nearest unvisited
+k-set with alpha parallelism (default 3), merges closer referrals, removes failed
+candidates and terminates when its nearest set is exhausted or its share of the
+query budget (default 64 in total) is used. A node queried by one path is never
+queried by another, and referrals already claimed by another path are ignored.
+The lookup merges the paths: the highest valid record revision, the union of
+providers and the nearest responsive contacts.
 Returned contacts, provider sets and candidate counts are bounded. Local
 records are replicated near both key routing IDs and file hashes. A node can
 serve Find and Store independently of its download/provide/relay roles, so any

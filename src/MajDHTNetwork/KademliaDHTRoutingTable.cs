@@ -1,25 +1,54 @@
 using System;
 using System.Buffers;
 using System.Collections.Generic;
+using System.Net;
 using MajDHTNetwork.Protocol;
 
 #nullable enable
 
 namespace MajDHTNetwork
 {
-    /// <summary>The default routing table: bounded Kademlia XOR buckets with lazy allocation and pooled nearest-peer snapshots.</summary>
+    /// <summary>
+    /// The default routing table: bounded Kademlia XOR buckets with lazy allocation, pooled nearest-peer snapshots and
+    /// per-network admission limits that stop one operator network from filling the table with Sybil identities.
+    /// </summary>
     public sealed class KademliaDHTRoutingTable : IDHTRoutingTable
     {
         /// <summary>Protects the routing entries and count.</summary>
         private readonly object _gate = new object();
         /// <summary>The sparse distance buckets; empty buckets allocate no lists.</summary>
-        private readonly List<DHTPeer>?[] _buckets = new List<DHTPeer>?[256];
+        private readonly List<Entry>?[] _buckets = new List<Entry>?[256];
+        /// <summary>The maximum contacts from one globally routed network in a bucket.</summary>
+        private readonly int _maxPerNetworkInBucket;
+        /// <summary>The maximum contacts from one globally routed network in the whole table.</summary>
+        private readonly int _maxPerNetwork;
         /// <summary>The local routing digest, or null before initialization.</summary>
         private byte[]? _self;
         /// <summary>The per-bucket capacity.</summary>
         private int _capacity;
         /// <summary>The total retained entry count.</summary>
         private int _count;
+
+        /// <summary>Creates an unbound table.</summary>
+        /// <param name="maxPerNetworkInBucket">
+        /// The maximum contacts whose verified addresses share one IPv4 /24 or IPv6 /48 in a bucket, from 1; loopback, private and
+        /// link-local addresses are not limited.
+        /// </param>
+        /// <param name="maxPerNetwork">The maximum contacts from one such network in the whole table, from 1.</param>
+        /// <exception cref="ArgumentOutOfRangeException">A limit is below one.</exception>
+        public KademliaDHTRoutingTable(int maxPerNetworkInBucket = 2, int maxPerNetwork = 10)
+        {
+            if (maxPerNetworkInBucket < 1)
+            {
+                throw new ArgumentOutOfRangeException(nameof(maxPerNetworkInBucket));
+            }
+            if (maxPerNetwork < 1)
+            {
+                throw new ArgumentOutOfRangeException(nameof(maxPerNetwork));
+            }
+            _maxPerNetworkInBucket = maxPerNetworkInBucket;
+            _maxPerNetwork = maxPerNetwork;
+        }
 
         /// <inheritdoc />
         /// <exception cref="ArgumentException">The node identifier or bucket size is invalid.</exception>
@@ -65,10 +94,14 @@ namespace MajDHTNetwork
             return -1;
         }
 
-        /// <summary>Records an authenticated contact without displacing a live full bucket; a higher sequence replaces a known contact.</summary>
-        /// <param name="peer">The verified contact.</param>
+        /// <summary>
+        /// Refreshes a known contact, or admits a new one with a verified address when its bucket has room and its network is
+        /// below the per-bucket and per-table limits; a full live bucket is never displaced.
+        /// </summary>
+        /// <param name="peer">The authenticated contact.</param>
+        /// <param name="verifiedAddress">The address that proved an advertised endpoint, or null to refresh only.</param>
         /// <exception cref="InvalidOperationException">The table has not been initialized.</exception>
-        public void Observe(DHTPeer peer)
+        public void Observe(DHTPeer peer, IPAddress? verifiedAddress)
         {
             var index = Bucket(peer.NodeHash);
             if (index < 0 || peer.IsExpired)
@@ -77,30 +110,80 @@ namespace MajDHTNetwork
             }
             lock (_gate)
             {
-                var bucket = _buckets[index] ??= new List<DHTPeer>(_capacity);
+                var bucket = _buckets[index] ??= new List<Entry>(_capacity);
+                Entry? known = null;
                 for (var i = bucket.Count - 1; i >= 0; i--)
                 {
-                    if (bucket[i].NodeId == peer.NodeId)
+                    if (bucket[i].Peer.NodeId == peer.NodeId)
                     {
-                        if (bucket[i].Sequence > peer.Sequence)
-                        {
-                            peer = bucket[i];
-                        }
+                        known = bucket[i];
                         bucket.RemoveAt(i);
                         _count--;
                     }
-                    else if (bucket[i].IsExpired)
+                    else if (bucket[i].Peer.IsExpired)
                     {
                         bucket.RemoveAt(i);
                         _count--;
                     }
                 }
-                if (bucket.Count < _capacity)
+                if (known != null)
                 {
-                    bucket.Add(peer);
+                    // Keep the newest contact and the last verified address, and move the entry to the most recent position.
+                    var newest = known.Peer.Sequence > peer.Sequence ? known.Peer : peer;
+                    bucket.Add(new Entry(newest, verifiedAddress ?? known.Address));
                     _count++;
+                    return;
+                }
+                if (verifiedAddress == null || bucket.Count >= _capacity || !HasNetworkRoomLocked(bucket, verifiedAddress))
+                {
+                    return;
+                }
+                bucket.Add(new Entry(peer, verifiedAddress));
+                _count++;
+            }
+        }
+
+        /// <summary>Checks the per-bucket and per-table network limits for a new verified address.</summary>
+        /// <param name="bucket">The target bucket.</param>
+        /// <param name="address">The verified address.</param>
+        /// <returns>Whether the network may add another contact.</returns>
+        /// <remarks>The caller must hold the table lock.</remarks>
+        private bool HasNetworkRoomLocked(List<Entry> bucket, IPAddress address)
+        {
+            if (!NetworkScope.IsDiversityLimited(address))
+            {
+                return true;
+            }
+            if (CountNetwork(bucket, address) >= _maxPerNetworkInBucket)
+            {
+                return false;
+            }
+            var total = 0;
+            foreach (var other in _buckets)
+            {
+                if (other != null)
+                {
+                    total += CountNetwork(other, address);
                 }
             }
+            return total < _maxPerNetwork;
+        }
+
+        /// <summary>Counts the entries of a bucket whose verified address shares a network with an address.</summary>
+        /// <param name="bucket">The bucket.</param>
+        /// <param name="address">The address.</param>
+        /// <returns>The count.</returns>
+        private static int CountNetwork(List<Entry> bucket, IPAddress address)
+        {
+            var count = 0;
+            foreach (var entry in bucket)
+            {
+                if (entry.Address != null && NetworkScope.SameNetwork(entry.Address, address))
+                {
+                    count++;
+                }
+            }
+            return count;
         }
 
         /// <summary>Removes an unreachable peer using stack-based identifier parsing.</summary>
@@ -124,7 +207,7 @@ namespace MajDHTNetwork
                 }
                 for (var i = bucket.Count - 1; i >= 0; i--)
                 {
-                    if (bucket[i].NodeId == nodeId)
+                    if (bucket[i].Peer.NodeId == nodeId)
                     {
                         bucket.RemoveAt(i);
                         _count--;
@@ -157,14 +240,14 @@ namespace MajDHTNetwork
                     }
                     for (var i = bucket.Count - 1; i >= 0; i--)
                     {
-                        if (bucket[i].IsExpired)
+                        if (bucket[i].Peer.IsExpired)
                         {
                             bucket.RemoveAt(i);
                             _count--;
                         }
                         else
                         {
-                            entries[length++] = bucket[i];
+                            entries[length++] = bucket[i].Peer;
                         }
                     }
                 }
@@ -182,6 +265,24 @@ namespace MajDHTNetwork
             finally
             {
                 ArrayPool<DHTPeer>.Shared.Return(entries, clearArray: true);
+            }
+        }
+
+        /// <summary>Associates a contact with the address at which it proved an advertised endpoint.</summary>
+        private sealed class Entry
+        {
+            /// <summary>Gets the newest contact.</summary>
+            internal DHTPeer Peer { get; }
+            /// <summary>Gets the verified address, or null when unknown.</summary>
+            internal IPAddress? Address { get; }
+
+            /// <summary>Creates an entry.</summary>
+            /// <param name="peer">The contact.</param>
+            /// <param name="address">The verified address.</param>
+            internal Entry(DHTPeer peer, IPAddress? address)
+            {
+                Peer = peer;
+                Address = address;
             }
         }
     }

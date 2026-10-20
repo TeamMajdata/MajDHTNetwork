@@ -261,7 +261,7 @@ namespace MajDHTNetwork
             var packet = new Packet(LocalPeer, Crypto.Random(16), (byte)Operation.Rendezvous, body);
             var result = await ExchangeCountedAsync(relay, transport, endpoint, packet.Seal(_identity, relay), cancellationToken).ConfigureAwait(false);
             var response = AuthenticateResponse(result, relay, packet);
-            ObservePeer(response.Sender);
+            ObservePeer(response.Sender, endpoint.Address);
             return (response.Sender, ReadResponseBody(response), endpoint);
         }
 
@@ -609,10 +609,12 @@ namespace MajDHTNetwork
         /// <param name="peer">The final peer.</param>
         /// <param name="envelope">The sealed request.</param>
         /// <param name="cancellationToken">The request lifetime.</param>
-        /// <returns>The encrypted direct response.</returns>
+        /// <returns>
+        /// The encrypted direct response and, when it arrived over one of the peer's advertised endpoints, that endpoint's address.
+        /// </returns>
         /// <exception cref="IOException">The contact expired or no route answered.</exception>
         /// <exception cref="OperationCanceledException">The request or node lifetime was cancelled.</exception>
-        private async Task<ReadOnlyMemory<byte>> ExchangeDirectAsync(DHTPeer peer, ReadOnlyMemory<byte> envelope, CancellationToken cancellationToken)
+        private async Task<DirectExchange> ExchangeDirectAsync(DHTPeer peer, ReadOnlyMemory<byte> envelope, CancellationToken cancellationToken)
         {
             if (peer.IsExpired)
             {
@@ -637,7 +639,9 @@ namespace MajDHTNetwork
                 }
                 try
                 {
-                    return await ExchangeCountedAsync(peer, transport, route.Endpoint, envelope, cancellationToken).ConfigureAwait(false);
+                    // Punched routes and registrations prove an observed endpoint, not an advertised one.
+                    return new DirectExchange(
+                        await ExchangeCountedAsync(peer, transport, route.Endpoint, envelope, cancellationToken).ConfigureAwait(false), null);
                 }
                 catch (Exception exception) when (IsPeerFailure(exception))
                 {
@@ -657,7 +661,9 @@ namespace MajDHTNetwork
             {
                 try
                 {
-                    return await ExchangeCountedAsync(peer, route.Transport, route.NetworkEndpoint, envelope, cancellationToken).ConfigureAwait(false);
+                    var response = await ExchangeCountedAsync(peer, route.Transport, route.NetworkEndpoint, envelope, cancellationToken)
+                        .ConfigureAwait(false);
+                    return new DirectExchange(response, AdvertisesRoute(peer, route) ? route.NetworkEndpoint.Address : null);
                 }
                 catch (Exception exception) when (IsPeerFailure(exception) || exception is OperationCanceledException
                     || exception is ObjectDisposedException)
@@ -668,6 +674,40 @@ namespace MajDHTNetwork
                 }
             }
             throw new IOException("No selected direct route responded.", last);
+        }
+
+        /// <summary>Checks whether a direct route targets one of a contact's advertised endpoints.</summary>
+        /// <param name="peer">The contact.</param>
+        /// <param name="route">The route.</param>
+        /// <returns>Whether an advertised endpoint has the route's address and transport port.</returns>
+        private static bool AdvertisesRoute(DHTPeer peer, DHTDirectRoute route)
+        {
+            foreach (var endpoint in peer.Endpoints)
+            {
+                if (endpoint.NetworkAddress.Equals(route.NetworkEndpoint.Address) && endpoint.Port(route.Transport) == route.NetworkEndpoint.Port)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>The response of a direct exchange and the advertised address it proved, if any.</summary>
+        private readonly struct DirectExchange
+        {
+            /// <summary>Gets the encrypted response.</summary>
+            internal ReadOnlyMemory<byte> Response { get; }
+            /// <summary>Gets the advertised address that answered, or null for punched, registered or unadvertised routes.</summary>
+            internal IPAddress? VerifiedAddress { get; }
+
+            /// <summary>Creates a direct exchange result.</summary>
+            /// <param name="response">The encrypted response.</param>
+            /// <param name="verifiedAddress">The advertised address that answered, or null.</param>
+            internal DirectExchange(ReadOnlyMemory<byte> response, IPAddress? verifiedAddress)
+            {
+                Response = response;
+                VerifiedAddress = verifiedAddress;
+            }
         }
 
         /// <summary>Reclaims expired relay bindings, introduction tickets and direct routes under the state lock.</summary>
@@ -795,7 +835,7 @@ namespace MajDHTNetwork
             var endpoint = ReadNatEndpoint(reader);
             var token = reader.Bytes(16);
             var expiresAt = DateTimeOffset.FromUnixTimeMilliseconds(reader.Long());
-            if (token.Length != 16 || peer.NodeId == NodeId || _transport.PortFor(transport, endpoint.AddressFamily) == 0
+            if (token.Length != 16 || peer.NodeId == NodeId || !HasRequiredWork(peer) || _transport.PortFor(transport, endpoint.AddressFamily) == 0
                 || expiresAt <= DateTimeOffset.UtcNow || expiresAt > DateTimeOffset.UtcNow.AddMinutes(2)
                 || expiresAt > peer.ExpiresAt || !MaySupportTransport(peer, transport))
             {

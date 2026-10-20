@@ -37,7 +37,7 @@ namespace MajDHTNetwork
         /// <summary>The bounded revision high-water marks retained through the maximum publication lease.</summary>
         private readonly Dictionary<string, (DHTRecord Record, DateTimeOffset RetainUntil)> _revisions = new Dictionary<string, (DHTRecord, DateTimeOffset)>();
         /// <summary>The bounded provider claims indexed by whole-file hash.</summary>
-        private readonly Dictionary<string, Dictionary<string, DHTPeer>> _providers = new Dictionary<string, Dictionary<string, DHTPeer>>();
+        private readonly Dictionary<string, Dictionary<string, ProviderClaim>> _providers = new Dictionary<string, Dictionary<string, ProviderClaim>>();
         /// <summary>The locally available Merkle trees indexed by file hash and block size.</summary>
         private readonly Dictionary<string, LocalContent> _contents = new Dictionary<string, LocalContent>();
         /// <summary>The bounded request replay cache.</summary>
@@ -115,6 +115,8 @@ namespace MajDHTNetwork
                 {
                     throw new InvalidOperationException("A MajDHTNode instance can only be started once.");
                 }
+                // Prove the identity work once before taking the state lock; contacts reuse the cached nonce.
+                _identity.ComputeProofOfWork(_options.IdentityWorkBits);
                 _transport.Bind();
                 lock (_gate)
                 {

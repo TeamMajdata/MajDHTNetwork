@@ -182,6 +182,8 @@ node ID and publisher namespace must survive restarts, and implement
 | `MaxRecords` | `1024` |
 | `MaxFileSize` | `1 GiB` |
 | `BlockSize` | `16384` (1 KiB–32 KiB accepted) |
+| `IdentityWorkBits` | `22` (0–28 accepted; must match across the network) |
+| `DisjointLookupPaths` | `3` (1–8 accepted) |
 | `MaxConcurrentBlockRequests` | `8` (1–64 accepted) |
 | `MaxBlockRequestsPerPeer` | `2` (1–16 accepted) |
 | `RequestTimeout` | `5 s` |
@@ -201,8 +203,8 @@ node ID and publisher namespace must survive restarts, and implement
 
 | Type | Key members |
 | --- | --- |
-| `DHTIdentity` | `DHTIdentity()`, `DHTIdentity(ReadOnlySpan<byte> seed)`, `NodeId`, `PublicKey`, `ExportSeed()`, `ExportSeed(Span<byte>)` |
-| `DHTPeer` | `NodeId`, `Endpoints`, `RelayHints`, `Reachability`, `HasEndpointDependentMapping`, `ExternalAddress`, `Capabilities`, `Sequence`, `ExpiresAt`, `IsExpired` |
+| `DHTIdentity` | `DHTIdentity()`, `DHTIdentity(ReadOnlySpan<byte> seed)`, `NodeId`, `PublicKey`, `ExportSeed()`, `ExportSeed(Span<byte>)`, `ComputeProofOfWork(int bits)` |
+| `DHTPeer` | `NodeId`, `Endpoints`, `RelayHints`, `Reachability`, `HasEndpointDependentMapping`, `ExternalAddress`, `Capabilities`, `WorkNonce`, `IdentityWork`, `Sequence`, `ExpiresAt`, `IsExpired` |
 | `DHTEndpoint` | `DHTEndpoint(IPAddress, int tcpPort, int udpPort, DHTEndpointFlags)`, `Address`, `TcpPort`, `UdpPort`, `Flags` |
 | `DHTReachability` | `Unknown = 0`, `Public = 1`, `Private = 2` |
 | `DHTEndpointFlags` | `None = 0`, `Verified = 1`, `Local = 2`, `Configured = 4` |
@@ -210,8 +212,8 @@ node ID and publisher namespace must survive restarts, and implement
 | `DHTRecord` | `Key`, `FileHash`, `MerkleRoot`, `Length`, `BlockSize`, `BlockCount`, `Revision`, `ExpiresAt`, `IsExpired`, `EncodedLength`, `CopyTo(Span<byte>)`, `ToBytes()`, `Parse(ReadOnlySpan<byte>)` |
 | `IDHTContentStore` | `PutAsync(string blockHash, ReadOnlyMemory<byte>, CancellationToken)`, `GetAsync(string blockHash, CancellationToken)` |
 | `MemoryDHTContentStore` | `MemoryDHTContentStore(long capacity = 64 MiB, int maxEntries = 65536)` |
-| `IDHTRoutingTable` | `Initialize(string localNodeId, int bucketSize)`, `Observe(DHTPeer)`, `Remove(string nodeId)`, `Closest(string routingId, int count)` |
-| `KademliaDHTRoutingTable` | Default routing table: 256 XOR buckets of `BucketSize` contacts |
+| `IDHTRoutingTable` | `Initialize(string localNodeId, int bucketSize)`, `Observe(DHTPeer, IPAddress? verifiedAddress)`, `Remove(string nodeId)`, `Closest(string routingId, int count)` |
+| `KademliaDHTRoutingTable` | `KademliaDHTRoutingTable(int maxPerNetworkInBucket = 2, int maxPerNetwork = 10)`; default table of 256 XOR buckets with per-network limits |
 | `IDHTRouteSelector` | `SelectDirectRoutes(DHTPeer, DHTRouteContext)`, `SelectRelayRoutes(DHTPeer, IReadOnlyList<DHTPeer> knownRelays, DHTRouteContext)` |
 | `DefaultDHTRouteSelector` | Default route selection described in [Custom routing](#custom-routing) |
 | `DHTRouteContext` | `PreferredTransport`, `AlternateTransport`, `NatTraversalEnabled`, `ExternalAddresses`, `MaxRelayAttempts`, `IsRegisteredWith(string)`, `SharesExternalAddress(DHTPeer)`, `GetPeerStatistics(string)`, `PacketLossRate(string)`, `PacketLossRate(string, DHTDirectRoute)` |
@@ -368,6 +370,37 @@ Outgoing requests try configured or verified endpoints first, then unverified
 and local endpoints, each with the preferred transport and then the alternative.
 Host names, external STUN servers and UPnP are outside this library.
 
+### Sybil resistance
+
+An open DHT cannot stop one party from creating many identities, but MajDHT
+makes them costly and limits what they can reach:
+
+- **Identity proof of work.** Every contact carries a signed nonce; the leading
+  zero bits of SHA-256("MajDHT/1/identity-work", node digest, nonce) are its
+  `IdentityWork`. A node proves `IdentityWorkBits` (default 22, about half a
+  second of CPU once per start) and rejects requests, responses, referrals,
+  relays and introductions that prove less. Each extra bit doubles the cost of
+  minting identities, including identities ground to sit next to a key. All nodes
+  of one network must use the same value.
+- **Verified admission.** A contact enters the routing table only after it
+  answered at one of its advertised endpoints: an inbound request admits it at
+  once when it came from that endpoint, otherwise the node pings the advertised
+  endpoint, at most 16 at a time and eight times per source network per minute.
+  Peers reachable only through relays or punched routes are used but never
+  referred to others.
+- **Network diversity.** The routing table keeps at most two contacts per IPv4
+  /24 or IPv6 /48 in a bucket and ten in total, and each file keeps at most three
+  provider claims per such network, counted by observed source addresses.
+  Loopback, private and link-local peers are exempt, so LANs keep working.
+- **Randomized selection.** Dial-back helpers are drawn at random, one per
+  network; routed relays are drawn at random from the nearest candidates; download
+  providers start in random order. Identities ground near a target cannot
+  predictably capture these roles.
+- **Disjoint lookups.** Each lookup follows `DisjointLookupPaths` paths that never
+  query the same node and each have their own share of `MaxLookupQueries`, then
+  merges them. Sybil referrals can exhaust the paths they capture, but a record or
+  provider reached by any honest path is still found.
+
 ## TCP, UDP and NAT traversal
 
 Bootstrapping through a peer advertising `Relay` automatically registers each
@@ -457,10 +490,13 @@ await using var node = new MajDHTNode(options, identity, store,
 - **`IDHTRoutingTable`** decides which authenticated contacts are kept as lookup
   hops and which are returned as nearest to a target. The node calls
   `Initialize` exactly once, so pass a new table to each node. It only passes
-  verified, non-private contacts to `Observe`, calls `Remove` after failures or
-  when a node becomes private, and discards expired, private, duplicate and
-  local contacts that `Closest` returns. The default `KademliaDHTRoutingTable`
-  keeps 256 XOR buckets of `BucketSize` contacts without evicting live entries.
+  authenticated, non-private contacts to `Observe`, with the address at which the
+  contact proved an advertised endpoint, or null when it only refreshes a known
+  contact; it calls `Remove` after failures or when a node becomes private, and
+  discards expired, private, duplicate and local contacts that `Closest` returns.
+  The default `KademliaDHTRoutingTable` keeps 256 XOR buckets of `BucketSize`
+  contacts without evicting live entries, and admits at most two contacts per
+  globally routed network in a bucket and ten in the table.
 - **`IDHTRouteSelector`** decides how a destination is reached. It returns the
   ordered direct attempts (endpoint and transport) and, after they all fail, the
   ordered relay attempts and whether to punch through each relay first. The
@@ -610,8 +646,11 @@ are allocation regressions rather than throughput or cross-runtime claims.
   cannot set the external address or get a foreign address advertised as
   Verified; relays colluding across two networks can, and colluding relays can
   make a node look private. Both affect reachability, never content integrity.
-- Bootstrap endpoints, Hello and Ping admit any identity, so the routing table is
-  open to Sybil identities; lookups and provider claims remain hints.
+- Sybil identities are made expensive and contained (see
+  [Sybil resistance](#sybil-resistance)) but not prevented: an attacker with
+  enough CPU and addresses in many networks can still add identities. Lookups and
+  provider claims remain hints; signatures, Merkle proofs and file hashes remain
+  authoritative.
 - Freshness beyond a lease is the application's responsibility; pin a complete-file
   hash when content must never change.
 

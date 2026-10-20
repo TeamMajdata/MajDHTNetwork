@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Net;
+using MajDHTNetwork.Protocol;
 
 #nullable enable
 
@@ -46,7 +47,8 @@ namespace MajDHTNetwork
         }
 
         /// <summary>
-        /// Lists the destination's relay hints, then at most <see cref="DHTRouteContext.MaxRelayAttempts"/> other routed relays,
+        /// Lists the destination's relay hints, then at most <see cref="DHTRouteContext.MaxRelayAttempts"/> relays drawn from the
+        /// nearest twice that many routed relays in random order,
         /// each group ordered by the relays' measured packet loss. Punching is requested unless the destination reported an
         /// endpoint-dependent mapping, and through a hinted relay only when this node is already registered with it.
         /// </summary>
@@ -75,11 +77,18 @@ namespace MajDHTNetwork
             var routed = new List<DHTPeer>();
             foreach (var relay in knownRelays)
             {
+                if (routed.Count >= context.MaxRelayAttempts * 2)
+                {
+                    break;
+                }
                 if (relay.NodeId != destination.NodeId && (relay.Capabilities & DHTCapabilities.Relay) != 0 && selected.Add(relay.NodeId))
                 {
                     routed.Add(relay);
                 }
             }
+            // Shuffling the nearest candidates before the stable loss ordering randomizes ties, so identities minted near a
+            // destination cannot predictably capture its relay traffic.
+            Crypto.Shuffle(routed);
             var ordered = OrderByLoss(routed, relay => context.PacketLossRate(relay.NodeId));
             for (var index = 0; index < ordered.Count && index < context.MaxRelayAttempts; index++)
             {

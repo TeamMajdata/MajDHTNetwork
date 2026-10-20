@@ -90,6 +90,36 @@ namespace MajDHTNetwork.Protocol
             return Scope.Global;
         }
 
+        /// <summary>Gets a stable key for the operator network of an address, matching <see cref="SameNetwork"/>.</summary>
+        /// <param name="address">The address.</param>
+        /// <returns>The IPv4 /24 or IPv6 /48 prefix for non-loopback addresses, or the exact loopback address.</returns>
+        internal static string NetworkKey(IPAddress address)
+        {
+            if (address.IsIPv4MappedToIPv6)
+            {
+                address = address.MapToIPv4();
+            }
+            if (IPAddress.IsLoopback(address))
+            {
+                return address.ToString();
+            }
+            var bytes = address.GetAddressBytes();
+            var prefix = address.AddressFamily == AddressFamily.InterNetwork ? 3 : 6;
+            Array.Clear(bytes, prefix, bytes.Length - prefix);
+            return new IPAddress(bytes) + (address.AddressFamily == AddressFamily.InterNetwork ? "/24" : "/48");
+        }
+
+        /// <summary>Checks whether Sybil diversity limits apply to an address.</summary>
+        /// <param name="address">The address.</param>
+        /// <returns>
+        /// Whether the address is globally routed; loopback, private and link-local peers share a network by design, for example
+        /// on a LAN, and cannot be minted by a remote attacker.
+        /// </returns>
+        internal static bool IsDiversityLimited(IPAddress address)
+        {
+            return Classify(address) == Scope.Global;
+        }
+
         /// <summary>Checks whether two addresses belong to the same operator network.</summary>
         /// <param name="left">The first address.</param>
         /// <param name="right">The second address.</param>

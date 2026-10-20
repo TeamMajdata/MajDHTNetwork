@@ -57,13 +57,30 @@ namespace MajDHTNetwork.Tests
                 AssertBlock(rightBytes, rightRecord.BlockSize, index, reads[2]);
                 AssertBlock(leftBytes, leftRecord.BlockSize, index, reads[3]);
             }
-            using var leftDestination = new MemoryStream();
-            using var rightDestination = new MemoryStream();
-            await Task.WhenAll(
-                left.DownloadAsync(rightRecord, leftDestination, rightRecord.FileHash, token),
-                right.DownloadAsync(leftRecord, rightDestination, leftRecord.FileHash, token));
-            Assert.Equal(rightBytes, leftDestination.ToArray());
-            Assert.Equal(leftBytes, rightDestination.ToArray());
+            // Peers whose advertised endpoints never answer stay out of routing tables, so the whole files are read
+            // block by block over the punched routes rather than through DHT provider discovery.
+            var leftFile = await ReadWholeFileAsync(left, rightRecord, right.LocalPeer, token);
+            var rightFile = await ReadWholeFileAsync(right, leftRecord, left.LocalPeer, token);
+            Assert.Equal(rightBytes, leftFile);
+            Assert.Equal(leftBytes, rightFile);
+            Assert.DoesNotContain(left.KnownPeers, peer => peer.NodeId == right.NodeId);
+        }
+
+        /// <summary>Reads every verified block of a record from one provider and concatenates them.</summary>
+        /// <param name="reader">The reading node.</param>
+        /// <param name="record">The signed manifest.</param>
+        /// <param name="provider">The provider contact.</param>
+        /// <param name="token">The test deadline.</param>
+        /// <returns>The complete file.</returns>
+        private static async Task<byte[]> ReadWholeFileAsync(MajDHTNode reader, DHTRecord record, DHTPeer provider, CancellationToken token)
+        {
+            using var file = new MemoryStream();
+            for (var index = 0; index < record.BlockCount; index++)
+            {
+                var block = await reader.ReadBlockAsync(record, provider, index, cancellationToken: token);
+                file.Write(block.Span);
+            }
+            return file.ToArray();
         }
 
         /// <summary>Retries an initially failed common transport while maintaining an existing relay registration.</summary>

@@ -55,6 +55,13 @@ namespace MajDHTNetwork
         internal IPAddress? ExternalNetworkAddress => _externalAddress;
         /// <summary>Gets the advertised and signed node capabilities.</summary>
         public DHTCapabilities Capabilities { get; }
+        /// <summary>Gets the signed identity proof-of-work nonce.</summary>
+        public long WorkNonce { get; }
+        /// <summary>
+        /// Gets the identity proof of work carried by the contact: the leading zero bits of
+        /// SHA-256("MajDHT/1/identity-work", node digest, nonce). Nodes reject contacts below their configured difficulty.
+        /// </summary>
+        public int IdentityWork { get; }
         /// <summary>Gets the owner's strictly increasing issue sequence; a higher value supersedes a lower one.</summary>
         public long Sequence { get; }
         /// <summary>Gets the expiry of this contact.</summary>
@@ -99,6 +106,7 @@ namespace MajDHTNetwork
             }
             _signingKey = wire.Bytes(32);
             _agreementKey = wire.Bytes(32);
+            var workNonce = wire.Long();
             var capabilities = (DHTCapabilities)wire.Byte();
             var reachability = wire.Byte();
             var sequence = wire.Long();
@@ -127,13 +135,15 @@ namespace MajDHTNetwork
             wire.End();
             _nodeHash = Crypto.Hash(_signingKey.Span);
             NodeId = Crypto.Hex(_nodeHash);
+            WorkNonce = workNonce;
+            IdentityWork = workNonce < 0 ? 0 : Crypto.IdentityWork(_nodeHash, workNonce);
             _externalAddress = external.Length == 0 ? null : ParseAddress(external);
             Capabilities = capabilities;
             Reachability = (DHTReachability)(reachability & ReachabilityMask);
             HasEndpointDependentMapping = (reachability & EndpointDependentBit) != 0;
             Sequence = sequence;
             ExpiresAt = DateTimeOffset.FromUnixTimeSeconds(expiry);
-            if (_signingKey.Length != 32 || _agreementKey.Length != 32 || sequence < 0
+            if (_signingKey.Length != 32 || _agreementKey.Length != 32 || sequence < 0 || workNonce < 0
                 || (capabilities & ~(DHTCapabilities.Download | DHTCapabilities.Provide | DHTCapabilities.Relay)) != 0
                 || (reachability & ~(ReachabilityMask | EndpointDependentBit)) != 0 || (reachability & ReachabilityMask) == ReachabilityMask
                 || expiry <= DateTimeOffset.UtcNow.ToUnixTimeSeconds()
@@ -154,12 +164,14 @@ namespace MajDHTNetwork
         /// <param name="externalAddress">The confirmed external address, or null.</param>
         /// <param name="relayHints">At most three public relay contacts without nested hints.</param>
         /// <param name="lifetime">The requested lease, shortened to the earliest relay hint expiry.</param>
+        /// <param name="workBits">The identity proof-of-work difficulty the contact must prove.</param>
         /// <returns>A verified contact.</returns>
         /// <exception cref="InvalidDataException">The resulting contact violates the contact rules.</exception>
         internal static DHTPeer Create(DHTIdentity identity, IReadOnlyList<DHTEndpoint> endpoints, DHTCapabilities capabilities,
             DHTReachability reachability, bool endpointDependentMapping, IPAddress? externalAddress, IReadOnlyList<DHTPeer> relayHints,
-            TimeSpan lifetime)
+            TimeSpan lifetime, int workBits = 0)
         {
+            var workNonce = identity.ComputeProofOfWork(workBits);
             var expiry = DateTimeOffset.UtcNow.Add(lifetime).ToUnixTimeSeconds();
             foreach (var hint in relayHints)
             {
@@ -169,6 +181,7 @@ namespace MajDHTNetwork
             payload.PutText("MajDHT/1/contact");
             payload.Put(identity.PublicKey);
             payload.Put(identity.Agreement.GeneratePublicKey().GetEncoded());
+            payload.PutLong(workNonce);
             payload.PutByte((byte)capabilities);
             payload.PutByte((byte)((byte)reachability | (endpointDependentMapping ? EndpointDependentBit : 0)));
             payload.PutLong(identity.NextSequence());

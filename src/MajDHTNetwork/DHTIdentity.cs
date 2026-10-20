@@ -18,6 +18,12 @@ namespace MajDHTNetwork
         private readonly byte[] _publicKey;
         /// <summary>The last contact sequence issued by this process for this identity.</summary>
         private long _lastSequence;
+        /// <summary>Protects the cached proof of work.</summary>
+        private readonly object _workGate = new object();
+        /// <summary>The cached proof-of-work nonce, or minus one before any work was computed.</summary>
+        private long _workNonce = -1;
+        /// <summary>The proof-of-work bits achieved by the cached nonce.</summary>
+        private int _workBits;
         /// <summary>The agreement private key.</summary>
         internal X25519PrivateKeyParameters Agreement { get; }
         /// <summary>Gets the SHA-256 signing-key fingerprint used as the node identifier.</summary>
@@ -67,6 +73,31 @@ namespace MajDHTNetwork
         internal byte[] Sign(ReadOnlyMemory<byte> bytes)
         {
             return Crypto.Sign(_signingKey, bytes);
+        }
+
+        /// <summary>
+        /// Computes, once per process and difficulty, a nonce proving that this identity cost work to create; contacts carry it
+        /// so that minting many identities is expensive.
+        /// </summary>
+        /// <param name="bits">The required number of leading zero bits, from 0 to 32; each extra bit doubles the expected cost.</param>
+        /// <returns>A nonce whose proof of work reaches at least <paramref name="bits"/>.</returns>
+        /// <exception cref="ArgumentOutOfRangeException">The difficulty is outside 0 to 32.</exception>
+        public long ComputeProofOfWork(int bits)
+        {
+            if (bits < 0 || bits > 32)
+            {
+                throw new ArgumentOutOfRangeException(nameof(bits));
+            }
+            lock (_workGate)
+            {
+                if (_workNonce < 0 || _workBits < bits)
+                {
+                    var nodeHash = Crypto.ParseHash(NodeId);
+                    _workNonce = Crypto.FindIdentityWork(nodeHash, bits);
+                    _workBits = Crypto.IdentityWork(nodeHash, _workNonce);
+                }
+                return _workNonce;
+            }
         }
 
         /// <summary>Issues a strictly increasing contact sequence based on the current Unix time in milliseconds.</summary>

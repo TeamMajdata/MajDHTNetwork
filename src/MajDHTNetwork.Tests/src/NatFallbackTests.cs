@@ -80,7 +80,8 @@ namespace MajDHTNetwork.Tests
             Assert.True(Volatile.Read(ref probes) > 0, "The introduced path must first accept an authenticated probe.");
             Assert.True(Volatile.Read(ref droppedDirectRequests) > 0, "The subsequent ordinary direct RPC must fail.");
             Assert.True(Volatile.Read(ref forwardedRequests) > 0, "The same relay must still forward after the direct failure.");
-            Assert.Contains(client.KnownPeers, peer => peer.NodeId == providerPeer.NodeId);
+            // The provider never answered at its advertised endpoint, so it must not be referred to other nodes.
+            Assert.DoesNotContain(client.KnownPeers, peer => peer.NodeId == providerPeer.NodeId);
         }
 
         /// <summary>Creates a short-budget UDP-only participant configuration.</summary>

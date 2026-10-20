@@ -23,11 +23,11 @@ namespace MajDHTNetwork
         private async Task<ReadOnlyMemory<byte>> HandleAsync(ReadOnlyMemory<byte> encoded, DHTTransport transport, IPEndPoint source, CancellationToken cancellationToken)
         {
             var packet = Packet.Open(_identity, encoded);
-            if (packet.Kind >= 128 || packet.Sender.NodeId == NodeId)
+            if (packet.Kind >= 128 || packet.Sender.NodeId == NodeId || !HasRequiredWork(packet.Sender))
             {
                 throw new InvalidDataException("Unexpected incoming response or self request.");
             }
-            ObservePeer(packet.Sender);
+            AdmitInbound(packet.Sender, transport, source);
             var id = packet.Sender.NodeId + ":" + Crypto.Hex(packet.RequestId.Span);
             var fingerprint = packet.Kind.ToString(System.Globalization.CultureInfo.InvariantCulture) + ":" + Crypto.Hex(Crypto.Hash(packet.Body.Span));
             CachedReply cached;
@@ -163,7 +163,7 @@ namespace MajDHTNetwork
                     {
                         throw new InvalidDataException("A provider capability is required to announce content.");
                     }
-                    CacheRecord(record, packet.Sender);
+                    CacheRecord(record, packet.Sender, source.Address);
                     return Array.Empty<byte>();
                 }
                 case Operation.Block:
@@ -209,7 +209,7 @@ namespace MajDHTNetwork
                     {
                         throw new IOException("Relay destination must be an already known peer.");
                     }
-                    var result = await ExchangeDirectAsync(destination, inner, cancellationToken).ConfigureAwait(false);
+                    var result = (await ExchangeDirectAsync(destination, inner, cancellationToken).ConfigureAwait(false)).Response;
                     response.Put(result.Span);
                     return response.ToArray();
                 }
@@ -235,6 +235,7 @@ namespace MajDHTNetwork
             var envelope = request.Seal(_identity, peer);
             ReadOnlyMemory<byte> result;
             Packet? authenticated = null;
+            IPAddress? verifiedAddress = null;
             if (relay != null)
             {
                 result = await ForwardAsync(relay, peer, envelope, cancellationToken).ConfigureAwait(false);
@@ -243,8 +244,10 @@ namespace MajDHTNetwork
             {
                 try
                 {
-                    result = await ExchangeDirectAsync(peer, envelope, cancellationToken).ConfigureAwait(false);
+                    var direct = await ExchangeDirectAsync(peer, envelope, cancellationToken).ConfigureAwait(false);
+                    result = direct.Response;
                     authenticated = AuthenticateResponse(result, peer, request);
+                    verifiedAddress = direct.VerifiedAddress;
                 }
                 catch (Exception exception) when (IsPeerFailure(exception) && allowRelay && operation != Operation.Relay)
                 {
@@ -252,7 +255,7 @@ namespace MajDHTNetwork
                 }
             }
             var response = authenticated ?? AuthenticateResponse(result, peer, request);
-            ObservePeer(response.Sender);
+            ObservePeer(response.Sender, verifiedAddress);
             return ReadResponseBody(response);
         }
 
@@ -302,10 +305,11 @@ namespace MajDHTNetwork
         private Packet AuthenticateResponse(ReadOnlyMemory<byte> encoded, DHTPeer peer, Packet request)
         {
             var response = Packet.Open(_identity, encoded);
-            if (response.Sender.NodeId != peer.NodeId || !CryptographicOperations.FixedTimeEquals(response.RequestId.Span, request.RequestId.Span)
+            if (response.Sender.NodeId != peer.NodeId || !HasRequiredWork(response.Sender)
+                || !CryptographicOperations.FixedTimeEquals(response.RequestId.Span, request.RequestId.Span)
                 || response.Kind != (request.Kind | 128))
             {
-                throw new CryptographicException("Response sender, operation or correlation mismatch.");
+                throw new CryptographicException("Response sender, work, operation or correlation mismatch.");
             }
             return response;
         }
@@ -377,7 +381,7 @@ namespace MajDHTNetwork
                 {
                     try
                     {
-                        var direct = await ExchangeDirectAsync(destination, envelope, cancellationToken).ConfigureAwait(false);
+                        var direct = (await ExchangeDirectAsync(destination, envelope, cancellationToken).ConfigureAwait(false)).Response;
                         AuthenticateResponse(direct, destination, request);
                         return direct;
                     }

@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 using MajDHTNetwork.Protocol;
@@ -135,7 +136,8 @@ namespace MajDHTNetwork
                 try
                 {
                     return DHTPeer.Create(_identity, endpoints, _options.Capabilities, reachability, HasEndpointDependentMappingLocked(),
-                        PreferredExternalAddressLocked(), hints, reachable ? s_publicContactLifetime : s_relayedContactLifetime);
+                        PreferredExternalAddressLocked(), hints, reachable ? s_publicContactLifetime : s_relayedContactLifetime,
+                        _options.IdentityWorkBits);
                 }
                 catch (InvalidDataException) when (hints.Count > 1)
                 {
@@ -637,7 +639,9 @@ namespace MajDHTNetwork
                     own.Add(address);
                 }
             }
-            var result = new List<DHTPeer>();
+            // One candidate per network, in random order: a client cannot steer the choice by minting identities near its own
+            // node identifier, and one operator network cannot supply every helper.
+            var byNetwork = new Dictionary<string, List<DHTPeer>>(StringComparer.Ordinal);
             foreach (var peer in RoutedPeers(client.NodeId, 256))
             {
                 if (peer.NodeId == client.NodeId || peer.NodeId == NodeId || peer.Reachability != DHTReachability.Public
@@ -660,11 +664,23 @@ namespace MajDHTNetwork
                     }
                     if (distinct)
                     {
-                        result.Add(peer);
+                        var key = NetworkScope.NetworkKey(address);
+                        if (!byNetwork.TryGetValue(key, out var members))
+                        {
+                            members = new List<DHTPeer>();
+                            byNetwork.Add(key, members);
+                        }
+                        members.Add(peer);
                         break;
                     }
                 }
             }
+            var result = new List<DHTPeer>(byNetwork.Count);
+            foreach (var members in byNetwork.Values)
+            {
+                result.Add(members[RandomNumberGenerator.GetInt32(members.Count)]);
+            }
+            Crypto.Shuffle(result);
             return result;
         }
 
@@ -687,7 +703,7 @@ namespace MajDHTNetwork
             var nonce = request.Bytes(16).ToArray();
             var expiresAt = DateTimeOffset.FromUnixTimeMilliseconds(request.Long());
             request.End();
-            if (transport > 1 || nonce.Length != 16 || owner.NodeId == NodeId || owner.NodeId == packet.Sender.NodeId
+            if (transport > 1 || nonce.Length != 16 || owner.NodeId == NodeId || !HasRequiredWork(owner) || owner.NodeId == packet.Sender.NodeId
                 || !IPAddress.TryParse(targetText, out var target) || target.ToString() != targetText || !NetworkScope.IsUnicast(target)
                 || expiresAt <= DateTimeOffset.UtcNow || expiresAt > DateTimeOffset.UtcNow.AddMinutes(2))
             {
@@ -946,6 +962,7 @@ namespace MajDHTNetwork
         private List<Task> ReachabilityWorkLocked()
         {
             var work = new List<Task>(_probeWork) { _reachabilityWork, _contactAnnouncement };
+            work.AddRange(_verificationWork);
             return work;
         }
 

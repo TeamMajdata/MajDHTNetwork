@@ -15,6 +15,9 @@ namespace MajDHTNetwork
 {
     public sealed partial class MajDHTNode
     {
+        /// <summary>The maximum provider claims per file from one globally routed network.</summary>
+        internal const int MaxProvidersPerNetwork = 3;
+
         /// <summary>Joins the network through every configured bootstrap endpoint, then discovers neighbors.</summary>
         /// <param name="cancellationToken">Cancels joining and initial discovery.</param>
         /// <returns>The number of bootstrap endpoints that answered.</returns>
@@ -119,7 +122,7 @@ namespace MajDHTNetwork
                     var encoded = await _transport.ExchangeAtAsync(transport, endpoint, request.SealHello(_identity), cancellationToken, counter)
                         .ConfigureAwait(false);
                     var response = Packet.Open(_identity, encoded);
-                    if (response.Sender.NodeId == NodeId || response.Kind != (request.Kind | 128)
+                    if (response.Sender.NodeId == NodeId || !HasRequiredWork(response.Sender) || response.Kind != (request.Kind | 128)
                         || !CryptographicOperations.FixedTimeEquals(response.RequestId.Span, request.RequestId.Span))
                     {
                         throw new CryptographicException("Hello response sender, operation or correlation mismatch.");
@@ -127,7 +130,8 @@ namespace MajDHTNetwork
                     using var reader = new Wire(ReadResponseBody(response));
                     var observed = ReadNatEndpoint(reader);
                     reader.End();
-                    ObservePeer(response.Sender);
+                    // The configured endpoint answered authentically, which proves the responder is reachable there.
+                    ObservePeer(response.Sender, endpoint.Address);
                     RecordObservation(response.Sender, endpoint.Address, transport, observed);
                     // The responder is unknown until it answers, so only answered Hello exchanges enter its statistics.
                     RecordTransmissions(response.Sender.NodeId, transport, endpoint, counter);
@@ -209,23 +213,41 @@ namespace MajDHTNetwork
             return result.Providers.AsReadOnly();
         }
 
-        /// <summary>Queries closer peers in bounded parallel rounds until the nearest known set is exhausted.</summary>
+        /// <summary>
+        /// Runs <see cref="DHTNodeOptions.DisjointLookupPaths"/> independent iterative lookups whose queried node sets never
+        /// overlap, then merges their results, so that Sybil nodes capturing one path cannot hide a record or provider that an
+        /// honest path reaches.
+        /// </summary>
         /// <param name="mode">Zero for neighbors, one for a key, or two for content providers.</param>
         /// <param name="target">The routing identifier or canonical key.</param>
         /// <param name="cancellationToken">The lookup lifetime.</param>
         /// <returns>The discovered peers, record and provider set.</returns>
+        /// <exception cref="InvalidDataException">A publisher signed conflicting content at the same revision.</exception>
         private async Task<LookupResult> LookupAsync(byte mode, string target, CancellationToken cancellationToken)
         {
             var routingId = mode == 1 ? DHTKey.Parse(target).RoutingId : target;
-            var candidates = new Dictionary<string, DHTPeer>();
-            var providers = new Dictionary<string, DHTPeer>();
-            var visited = new HashSet<string>();
-            var responsive = new HashSet<string>();
-            DHTRecord? best = null;
-            foreach (var peer in RoutedPeers(routingId, _options.BucketSize))
+            var seeds = RoutedPeers(routingId, _options.BucketSize);
+            var pathCount = Math.Max(1, Math.Min(_options.DisjointLookupPaths, seeds.Count));
+            var pathSeeds = new List<DHTPeer>[pathCount];
+            for (var path = 0; path < pathCount; path++)
             {
-                candidates[peer.NodeId] = peer;
+                pathSeeds[path] = new List<DHTPeer>();
             }
+            // Distribute the nearest seeds round robin, so every path starts near the target with disjoint nodes.
+            for (var index = 0; index < seeds.Count; index++)
+            {
+                pathSeeds[index % pathCount].Add(seeds[index]);
+            }
+            var budget = new LookupBudget(_options.MaxLookupQueries, pathCount);
+            var paths = new Task<LookupResult>[pathCount];
+            for (var path = 0; path < pathCount; path++)
+            {
+                paths[path] = LookupPathAsync(mode, target, routingId, pathSeeds[path], budget, path, cancellationToken);
+            }
+            var results = await Task.WhenAll(paths).ConfigureAwait(false);
+            DHTRecord? best = null;
+            var closest = new Dictionary<string, DHTPeer>();
+            var providers = new Dictionary<string, DHTPeer>();
             if (mode == 1)
             {
                 lock (_gate)
@@ -243,7 +265,58 @@ namespace MajDHTNetwork
                     providers[peer.NodeId] = peer;
                 }
             }
-            while (visited.Count < _options.MaxLookupQueries)
+            foreach (var result in results)
+            {
+                if (result.Record != null)
+                {
+                    best = Newer(best, result.Record);
+                }
+                foreach (var peer in result.Peers)
+                {
+                    closest[peer.NodeId] = peer;
+                }
+                foreach (var provider in result.Providers)
+                {
+                    providers[provider.NodeId] = provider;
+                }
+            }
+            var closestList = new List<DHTPeer>(closest.Values);
+            XorDistanceComparer.Sort(closestList, routingId);
+            if (closestList.Count > _options.BucketSize)
+            {
+                closestList.RemoveRange(_options.BucketSize, closestList.Count - _options.BucketSize);
+            }
+            var providerList = new List<DHTPeer>(providers.Values);
+            XorDistanceComparer.Sort(providerList, routingId);
+            if (providerList.Count > 16)
+            {
+                providerList.RemoveRange(16, providerList.Count - 16);
+            }
+            return new LookupResult(closestList, best, providerList);
+        }
+
+        /// <summary>Queries closer peers of one lookup path in bounded parallel rounds until its nearest set is exhausted.</summary>
+        /// <param name="mode">Zero for neighbors, one for a key, or two for content providers.</param>
+        /// <param name="target">The routing identifier or canonical key.</param>
+        /// <param name="routingId">The routing identifier of the target.</param>
+        /// <param name="seeds">The path's initial contacts.</param>
+        /// <param name="budget">The node claims shared by every path and the per-path query budgets.</param>
+        /// <param name="path">The index of this path in the budget.</param>
+        /// <param name="cancellationToken">The lookup lifetime.</param>
+        /// <returns>The path's responsive nearest contacts, best record and providers.</returns>
+        /// <exception cref="InvalidDataException">A publisher signed conflicting content at the same revision.</exception>
+        private async Task<LookupResult> LookupPathAsync(byte mode, string target, string routingId, List<DHTPeer> seeds, LookupBudget budget, int path,
+            CancellationToken cancellationToken)
+        {
+            var candidates = new Dictionary<string, DHTPeer>();
+            var providers = new Dictionary<string, DHTPeer>();
+            var responsive = new HashSet<string>();
+            DHTRecord? best = null;
+            foreach (var peer in seeds)
+            {
+                candidates[peer.NodeId] = peer;
+            }
+            while (!budget.Exhausted(path))
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var ordered = new List<DHTPeer>(candidates.Values);
@@ -256,13 +329,14 @@ namespace MajDHTNetwork
                 var queried = new List<DHTPeer>();
                 foreach (var peer in ordered)
                 {
-                    if (!visited.Add(peer.NodeId))
+                    // A node claimed by another path is never queried again, which keeps the paths disjoint.
+                    if (!budget.TryClaim(path, peer.NodeId))
                     {
                         continue;
                     }
                     queried.Add(peer);
                     batch.Add(QueryLookupAsync(peer, mode, target, cancellationToken));
-                    if (batch.Count >= _options.LookupParallelism || visited.Count >= _options.MaxLookupQueries)
+                    if (batch.Count >= _options.LookupParallelism || budget.Exhausted(path))
                     {
                         break;
                     }
@@ -284,7 +358,7 @@ namespace MajDHTNetwork
                     foreach (var peer in reply.Peers)
                     {
                         if (peer.NodeId != NodeId && peer.Reachability != DHTReachability.Private
-                            && (!visited.Contains(peer.NodeId) || responsive.Contains(peer.NodeId))
+                            && (!budget.IsClaimed(peer.NodeId) || responsive.Contains(peer.NodeId))
                             && (candidates.Count < _options.MaxLookupQueries * 16 || candidates.ContainsKey(peer.NodeId)))
                         {
                             if (!candidates.TryGetValue(peer.NodeId, out var existing) || peer.Sequence > existing.Sequence)
@@ -317,18 +391,71 @@ namespace MajDHTNetwork
                     closest.Add(candidate);
                 }
             }
-            XorDistanceComparer.Sort(closest, routingId);
-            if (closest.Count > _options.BucketSize)
+            return new LookupResult(closest, best, new List<DHTPeer>(providers.Values));
+        }
+
+        /// <summary>
+        /// Shares the claimed nodes between the disjoint paths of one lookup and gives every path its own query budget, so a
+        /// path captured by Sybil referrals cannot exhaust the queries of the honest paths.
+        /// </summary>
+        private sealed class LookupBudget
+        {
+            /// <summary>Protects the claimed nodes and counters.</summary>
+            private readonly object _gate = new object();
+            /// <summary>The nodes claimed by any path.</summary>
+            private readonly HashSet<string> _claimed = new HashSet<string>(StringComparer.Ordinal);
+            /// <summary>The queries used by each path.</summary>
+            private readonly int[] _used;
+            /// <summary>The maximum queries of one path.</summary>
+            private readonly int _limitPerPath;
+
+            /// <summary>Creates a budget.</summary>
+            /// <param name="limit">The maximum queried nodes of the whole lookup, divided between the paths.</param>
+            /// <param name="paths">The number of paths.</param>
+            internal LookupBudget(int limit, int paths)
             {
-                closest.RemoveRange(_options.BucketSize, closest.Count - _options.BucketSize);
+                _used = new int[paths];
+                _limitPerPath = Math.Max(1, (limit + paths - 1) / paths);
             }
-            var providerList = new List<DHTPeer>(providers.Values);
-            XorDistanceComparer.Sort(providerList, routingId);
-            if (providerList.Count > 16)
+
+            /// <summary>Gets whether a path has used all of its queries.</summary>
+            /// <param name="path">The path index.</param>
+            /// <returns>Whether the path's budget is exhausted.</returns>
+            internal bool Exhausted(int path)
             {
-                providerList.RemoveRange(16, providerList.Count - 16);
+                lock (_gate)
+                {
+                    return _used[path] >= _limitPerPath;
+                }
             }
-            return new LookupResult(closest, best, providerList);
+
+            /// <summary>Claims a node for a path.</summary>
+            /// <param name="path">The path index.</param>
+            /// <param name="nodeId">The node identifier.</param>
+            /// <returns>Whether the node was unclaimed and the path's budget allowed another query.</returns>
+            internal bool TryClaim(int path, string nodeId)
+            {
+                lock (_gate)
+                {
+                    if (_used[path] >= _limitPerPath || !_claimed.Add(nodeId))
+                    {
+                        return false;
+                    }
+                    _used[path]++;
+                    return true;
+                }
+            }
+
+            /// <summary>Checks whether any path has claimed a node.</summary>
+            /// <param name="nodeId">The node identifier.</param>
+            /// <returns>Whether the node is claimed.</returns>
+            internal bool IsClaimed(string nodeId)
+            {
+                lock (_gate)
+                {
+                    return _claimed.Contains(nodeId);
+                }
+            }
         }
 
         /// <summary>Performs one authenticated lookup and validates all signed returned values.</summary>
@@ -349,7 +476,9 @@ namespace MajDHTNetwork
                 var signedRecord = reader.Bytes(2200);
                 var record = signedRecord.Length == 0 ? null : DHTRecord.Parse(signedRecord.Span);
                 var peers = ReadPeers(reader);
+                peers.RemoveAll(peer => !HasRequiredWork(peer));
                 var providers = ReadPeers(reader);
+                providers.RemoveAll(peer => !HasRequiredWork(peer));
                 reader.End();
                 if (record != null && (mode != 1 || record.Key.ToString() != target || record.Length > _options.MaxFileSize))
                 {
@@ -411,12 +540,16 @@ namespace MajDHTNetwork
             return true;
         }
 
-        /// <summary>Caches a signed binding and an optional authenticated provider claim within fixed quotas.</summary>
+        /// <summary>
+        /// Caches a signed binding and an optional authenticated provider claim within fixed quotas, keeping at most
+        /// <see cref="MaxProvidersPerNetwork"/> claims per globally routed network for each file.
+        /// </summary>
         /// <param name="record">The signed record.</param>
         /// <param name="provider">The authenticated announcing peer, or null for a lookup cache.</param>
+        /// <param name="providerAddress">The observed source address of the announcement, or null for local claims.</param>
         /// <exception cref="IOException">The record quota is full.</exception>
         /// <exception cref="InvalidDataException">The record is expired, too large or conflicts with its revision.</exception>
-        private void CacheRecord(DHTRecord record, DHTPeer? provider)
+        private void CacheRecord(DHTRecord record, DHTPeer? provider, IPAddress? providerAddress = null)
         {
             if (record.IsExpired || record.Length > _options.MaxFileSize)
             {
@@ -451,14 +584,39 @@ namespace MajDHTNetwork
                     {
                         return;
                     }
-                    providers = new Dictionary<string, DHTPeer>();
+                    providers = new Dictionary<string, ProviderClaim>();
                     _providers[record.FileHash] = providers;
                 }
-                if (providers.Count < 16 || providers.ContainsKey(provider.NodeId))
+                if (providers.TryGetValue(provider.NodeId, out var known))
                 {
-                    providers[provider.NodeId] = provider;
+                    providers[provider.NodeId] = new ProviderClaim(provider, providerAddress ?? known.Address);
+                }
+                else if (providers.Count < 16 && HasProviderRoom(providers, providerAddress))
+                {
+                    providers[provider.NodeId] = new ProviderClaim(provider, providerAddress);
                 }
             }
+        }
+
+        /// <summary>Checks whether a new provider claim from an address stays within the per-network limit.</summary>
+        /// <param name="providers">The claims for one file.</param>
+        /// <param name="address">The announcement's source address, or null for local claims.</param>
+        /// <returns>Whether the claim may be added.</returns>
+        internal static bool HasProviderRoom(Dictionary<string, ProviderClaim> providers, IPAddress? address)
+        {
+            if (address == null || !NetworkScope.IsDiversityLimited(address))
+            {
+                return true;
+            }
+            var count = 0;
+            foreach (var claim in providers.Values)
+            {
+                if (claim.Address != null && NetworkScope.SameNetwork(claim.Address, address))
+                {
+                    count++;
+                }
+            }
+            return count < MaxProvidersPerNetwork;
         }
 
         /// <summary>Returns a bounded snapshot of live locally indexed providers.</summary>
@@ -471,8 +629,9 @@ namespace MajDHTNetwork
             {
                 if (_providers.TryGetValue(fileHash, out var providers))
                 {
-                    foreach (var peer in providers.Values)
+                    foreach (var claim in providers.Values)
                     {
+                        var peer = claim.Peer;
                         if (!peer.IsExpired && (peer.Capabilities & DHTCapabilities.Provide) != 0)
                         {
                             result.Add(peer.NodeId == NodeId ? _self! : peer);
@@ -523,7 +682,7 @@ namespace MajDHTNetwork
                 var peers = new List<string>();
                 foreach (var peer in entry.Value)
                 {
-                    if (peer.Value.IsExpired)
+                    if (peer.Value.Peer.IsExpired)
                     {
                         peers.Add(peer.Key);
                     }
@@ -629,6 +788,24 @@ namespace MajDHTNetwork
                     cancellationToken.ThrowIfCancellationRequested();
                     Log(LogLevel.Warning, "Maintenance announcement failed: ", exception);
                 }
+            }
+        }
+
+        /// <summary>Associates an authenticated provider claim with the source address of its announcement.</summary>
+        internal sealed class ProviderClaim
+        {
+            /// <summary>Gets the provider contact.</summary>
+            internal DHTPeer Peer { get; }
+            /// <summary>Gets the announcement's observed source address, or null for local claims.</summary>
+            internal IPAddress? Address { get; }
+
+            /// <summary>Creates a claim.</summary>
+            /// <param name="peer">The provider contact.</param>
+            /// <param name="address">The announcement's source address.</param>
+            internal ProviderClaim(DHTPeer peer, IPAddress? address)
+            {
+                Peer = peer;
+                Address = address;
             }
         }
 

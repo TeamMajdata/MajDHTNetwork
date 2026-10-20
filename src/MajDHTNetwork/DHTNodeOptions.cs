@@ -17,6 +17,12 @@ namespace MajDHTNetwork
         private const int MaxBootstrapEndpoints = 16;
 
         /// <summary>
+        /// Gets or sets the initial <see cref="IdentityWorkBits"/> of new option instances. Only test hosts change it, to avoid
+        /// computing proofs of work for every short-lived test identity.
+        /// </summary>
+        internal static int DefaultIdentityWorkBits { get; set; } = 22;
+
+        /// <summary>
         /// Gets or sets one or two local interfaces, at most one per address family; wildcard interfaces are allowed.
         /// Listing an IPv4 and an IPv6 address enables dual-stack listeners on the same configured ports.
         /// </summary>
@@ -51,6 +57,13 @@ namespace MajDHTNetwork
         public long MaxFileSize { get; set; } = 1024L * 1024 * 1024;
         /// <summary>Gets or sets the block size for new publications, between 1 KiB and 32 KiB.</summary>
         public int BlockSize { get; set; } = 16384;
+        /// <summary>
+        /// Gets or sets the identity proof-of-work difficulty in leading zero bits, from 0 to 28. This node proves it in its own
+        /// contact and rejects contacts that prove less; every node of one network must use the same value.
+        /// </summary>
+        public int IdentityWorkBits { get; set; } = DefaultIdentityWorkBits;
+        /// <summary>Gets or sets the number of disjoint paths each iterative lookup follows, from 1 to 8.</summary>
+        public int DisjointLookupPaths { get; set; } = 3;
         /// <summary>Gets or sets the maximum block requests one download keeps in flight across all providers, from 1 to 64.</summary>
         public int MaxConcurrentBlockRequests { get; set; } = 8;
         /// <summary>Gets or sets the maximum block requests one download keeps in flight to a single provider, from 1 to 16.</summary>
@@ -107,6 +120,7 @@ namespace MajDHTNetwork
                 || MaxConcurrentRequests < 1 || MaxConcurrentRequests > 1024
                 || MaxRecords < 1 || MaxRecords > 65536 || MaxFileSize < 0 || MaxFileSize > 1024L * 1024 * 1024
                 || BlockSize < 1024 || BlockSize > 32768 || UdpAttempts < 1 || UdpAttempts > 5
+                || IdentityWorkBits < 0 || IdentityWorkBits > 28 || DisjointLookupPaths < 1 || DisjointLookupPaths > 8
                 || MaxConcurrentBlockRequests < 1 || MaxConcurrentBlockRequests > 64
                 || MaxBlockRequestsPerPeer < 1 || MaxBlockRequestsPerPeer > 16
                 || RequestTimeout < TimeSpan.FromMilliseconds(50) || RequestTimeout > TimeSpan.FromMinutes(2)

@@ -1,5 +1,7 @@
 using System;
 using System.Buffers;
+using System.Buffers.Binary;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -22,6 +24,80 @@ namespace MajDHTNetwork.Protocol
         private static readonly SecureRandom s_random = new SecureRandom();
         /// <summary>The immutable HKDF domain label.</summary>
         private static readonly byte[] s_envelopeInfo = Encoding.ASCII.GetBytes("MajDHT/1/envelope");
+        /// <summary>The immutable identity proof-of-work domain label.</summary>
+        private static readonly byte[] s_workDomain = Encoding.ASCII.GetBytes("MajDHT/1/identity-work");
+
+        /// <summary>Shuffles a list in place with a cryptographic random source, so attackers cannot predict selections.</summary>
+        /// <typeparam name="T">The element type.</typeparam>
+        /// <param name="items">The list to shuffle.</param>
+        internal static void Shuffle<T>(IList<T> items)
+        {
+            for (var index = items.Count - 1; index > 0; index--)
+            {
+                var other = RandomNumberGenerator.GetInt32(index + 1);
+                var swap = items[index];
+                items[index] = items[other];
+                items[other] = swap;
+            }
+        }
+
+        /// <summary>Counts the identity proof-of-work of a nonce: the leading zero bits of its domain-separated digest.</summary>
+        /// <param name="nodeHash">The 32-byte node digest.</param>
+        /// <param name="nonce">The proof-of-work nonce.</param>
+        /// <returns>The number of leading zero bits, from 0 to 256.</returns>
+        internal static int IdentityWork(ReadOnlySpan<byte> nodeHash, long nonce)
+        {
+            using var sha = SHA256.Create();
+            return IdentityWork(sha, nodeHash, nonce);
+        }
+
+        /// <summary>Finds the smallest non-negative nonce whose identity proof-of-work reaches a difficulty.</summary>
+        /// <param name="nodeHash">The 32-byte node digest.</param>
+        /// <param name="bits">The required number of leading zero bits.</param>
+        /// <returns>The nonce.</returns>
+        internal static long FindIdentityWork(ReadOnlySpan<byte> nodeHash, int bits)
+        {
+            using var sha = SHA256.Create();
+            for (long nonce = 0; ; nonce++)
+            {
+                if (IdentityWork(sha, nodeHash, nonce) >= bits)
+                {
+                    return nonce;
+                }
+            }
+        }
+
+        /// <summary>Counts the leading zero bits of SHA-256(domain, node digest, big-endian nonce) with a reusable hash.</summary>
+        /// <param name="sha">The reusable hash algorithm.</param>
+        /// <param name="nodeHash">The 32-byte node digest.</param>
+        /// <param name="nonce">The proof-of-work nonce.</param>
+        /// <returns>The number of leading zero bits.</returns>
+        private static int IdentityWork(SHA256 sha, ReadOnlySpan<byte> nodeHash, long nonce)
+        {
+            Span<byte> input = stackalloc byte[s_workDomain.Length + 40];
+            s_workDomain.CopyTo(input);
+            nodeHash.Slice(0, 32).CopyTo(input.Slice(s_workDomain.Length));
+            BinaryPrimitives.WriteInt64BigEndian(input.Slice(s_workDomain.Length + 32), nonce);
+            Span<byte> digest = stackalloc byte[32];
+            sha.TryComputeHash(input, digest, out _);
+            var bits = 0;
+            foreach (var value in digest)
+            {
+                if (value == 0)
+                {
+                    bits += 8;
+                    continue;
+                }
+                var mask = 0x80;
+                while ((value & mask) == 0)
+                {
+                    bits++;
+                    mask >>= 1;
+                }
+                break;
+            }
+            return bits;
+        }
 
         /// <summary>Generates independently owned random bytes.</summary>
         /// <param name="count">The byte count.</param>

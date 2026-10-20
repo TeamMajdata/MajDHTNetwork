@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Net;
 
 #nullable enable
 
@@ -22,9 +23,17 @@ namespace MajDHTNetwork
         /// <exception cref="InvalidOperationException">The table is already bound to a node.</exception>
         void Initialize(string localNodeId, int bucketSize);
 
-        /// <summary>Records an authenticated contact after a successful exchange; a higher sequence supersedes a known contact.</summary>
-        /// <param name="peer">The verified, non-private contact.</param>
-        void Observe(DHTPeer peer);
+        /// <summary>
+        /// Records an authenticated contact; a higher sequence supersedes a known contact. A new contact may only be admitted
+        /// when <paramref name="verifiedAddress"/> is supplied; otherwise the call only refreshes a contact already present.
+        /// </summary>
+        /// <param name="peer">The authenticated, non-private contact.</param>
+        /// <param name="verifiedAddress">
+        /// The address at which the node proved it controls an advertised endpoint, used for per-network admission limits;
+        /// null when the exchange did not prove an advertised endpoint, such as an inbound request from another source or a
+        /// relayed response.
+        /// </param>
+        void Observe(DHTPeer peer, IPAddress? verifiedAddress);
 
         /// <summary>Removes a node after it failed or became private.</summary>
         /// <param name="nodeId">The node identifier.</param>
