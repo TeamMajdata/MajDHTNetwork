@@ -452,7 +452,8 @@ var block = await downloader.ReadBlockAsync(record, provider.LocalPeer, 0,
 `MaxConcurrentRequests` 个出站交换：只有两次查找合计不超出预算时才会同时进行，同时进行的复制
 数量为 `MaxConcurrentRequests` 除以该占用量，至少为一（默认值下为一；需要更多时请调高
 `MaxConcurrentRequests`）。维护流程以同样的上限重新宣告记录，因此大量发布的维护也会在预算允许
-的范围内并行进行。
+的范围内并行进行。记录、修订号、提供者声明与本地 Merkle 树的索引在缓存或登记记录的路径上每秒最多
+清理一次，配额看似用尽时则立即清理，因此发布或接收大量记录的耗时与记录数成线性关系。
 
 `ListenAddresses` 接受一个地址，或者一个 IPv4 地址加一个 IPv6 地址，以便在相同的配置端口上
 双栈监听；允许使用通配地址。支持任意 TCP/UDP 端口、相同或不同的 TCP/UDP 端口号，TCP 与

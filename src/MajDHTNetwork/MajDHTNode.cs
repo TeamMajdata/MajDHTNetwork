@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -48,6 +49,15 @@ namespace MajDHTNetwork
         private readonly Dictionary<string, Dictionary<string, ProviderClaim>> _providers = new Dictionary<string, Dictionary<string, ProviderClaim>>();
         /// <summary>The locally available Merkle trees indexed by file hash and block size.</summary>
         private readonly Dictionary<string, LocalContent> _contents = new Dictionary<string, LocalContent>();
+        /// <summary>
+        /// The shortest interval between two opportunistic prunes of the index, in <see cref="Stopwatch"/> ticks. A prune
+        /// walks every record, revision, provider claim and local tree, so pruning on every cached record made a node with
+        /// many records quadratic; postponing the walk is safe because every reader checks expiry itself and the quota
+        /// checks prune before refusing.
+        /// </summary>
+        private static readonly long s_pruneInterval = Stopwatch.Frequency;
+        /// <summary>The <see cref="Stopwatch"/> timestamp of the last prune, which lets the hot paths prune at most once per interval.</summary>
+        private long _lastPrune = Stopwatch.GetTimestamp() - s_pruneInterval;
         /// <summary>The bounded request replay cache, keyed without strings so every request can be matched allocation-free.</summary>
         private readonly Dictionary<ReplayKey, CachedReply> _replies = new Dictionary<ReplayKey, CachedReply>();
         /// <summary>The owned socket listeners and exchange implementation.</summary>

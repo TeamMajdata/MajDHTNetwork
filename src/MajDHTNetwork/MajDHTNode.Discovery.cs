@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Security.Cryptography;
@@ -616,21 +617,14 @@ namespace MajDHTNetwork
             }
             lock (_gate)
             {
-                PruneLocked();
+                PruneIfDueLocked();
                 var key = record.Key.ToString();
                 if (!IsCurrentRevision(record))
                 {
                     throw new InvalidDataException("The publication is below the retained publisher revision.");
                 }
-                if (!_revisions.ContainsKey(key) && _revisions.Count >= _options.MaxRecords * 4)
-                {
-                    throw new IOException("The retained revision quota is full.");
-                }
+                EnsureRecordRoomLocked(key);
                 _records.TryGetValue(key, out var existing);
-                if (existing == null && _records.Count >= _options.MaxRecords)
-                {
-                    throw new IOException("The local DHT record quota is full.");
-                }
                 _records[key] = Newer(existing, record);
                 _revisions[key] = (record, DateTimeOffset.UtcNow.AddDays(7).AddMinutes(2));
                 if (record.IsWithdrawn)
@@ -707,9 +701,46 @@ namespace MajDHTNetwork
             return result;
         }
 
+        /// <summary>
+        /// Checks the revision and record quotas for caching a key. A quota that appears full is pruned first, so only live
+        /// entries can fill it, while the common case stays free of the full walk.
+        /// </summary>
+        /// <param name="key">The canonical lookup key about to be cached.</param>
+        /// <exception cref="IOException">The revision or record quota is full of unexpired entries.</exception>
+        private void EnsureRecordRoomLocked(string key)
+        {
+            var revisionQuota = _options.MaxRecords * 4;
+            if ((!_revisions.ContainsKey(key) && _revisions.Count >= revisionQuota)
+                || (!_records.ContainsKey(key) && _records.Count >= _options.MaxRecords))
+            {
+                PruneLocked();
+                if (!_revisions.ContainsKey(key) && _revisions.Count >= revisionQuota)
+                {
+                    throw new IOException("The retained revision quota is full.");
+                }
+                if (!_records.ContainsKey(key) && _records.Count >= _options.MaxRecords)
+                {
+                    throw new IOException("The local DHT record quota is full.");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Prunes the index unless it was pruned less than <see cref="s_pruneInterval"/> ago, so the paths that cache or
+        /// register one record pay for one full walk per interval instead of one per record.
+        /// </summary>
+        private void PruneIfDueLocked()
+        {
+            if (Stopwatch.GetTimestamp() - _lastPrune >= s_pruneInterval)
+            {
+                PruneLocked();
+            }
+        }
+
         /// <summary>Removes expired records, provider claims and unreferenced local tree metadata under the index lock.</summary>
         private void PruneLocked()
         {
+            _lastPrune = Stopwatch.GetTimestamp();
             var expired = new List<string>();
             foreach (var observed in _revisions)
             {

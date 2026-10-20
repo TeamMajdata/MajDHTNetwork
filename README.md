@@ -540,7 +540,10 @@ run at once only when both fit, and the number of replications in flight is
 `MaxConcurrentRequests` divided by that footprint, at least one (one with the
 defaults, raise `MaxConcurrentRequests` for more). Maintenance reannounces
 records with the same bound, so the maintenance of many publications also runs
-in parallel where the budget allows.
+in parallel where the budget allows. The index of records, revisions, provider
+claims and local trees is pruned at most once per second on the paths that
+cache or register a record, and at once when a quota appears full, so
+publishing or receiving many records costs time linear in their number.
 
 `ListenAddresses` takes one address, or one IPv4 and one IPv6 address for
 dual-stack listeners on the same configured ports; wildcard addresses are

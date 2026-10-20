@@ -442,23 +442,36 @@ namespace MajDHTNetwork
             }
             lock (_gate)
             {
-                PruneLocked();
+                PruneIfDueLocked();
                 var id = ContentId(record);
-                var leaves = tree.Count;
-                foreach (var entry in _contents)
+                if (CountOtherLeavesLocked(id) + tree.Count > _options.MaxLocalLeaves)
                 {
-                    if (entry.Key != id)
+                    // Trees of expired records count until they are pruned; refuse only when live trees fill the quota.
+                    PruneLocked();
+                    if (CountOtherLeavesLocked(id) + tree.Count > _options.MaxLocalLeaves)
                     {
-                        leaves += entry.Value.Tree.Count;
+                        throw new IOException("The local Merkle metadata quota is full.");
                     }
-                }
-                if (leaves > _options.MaxLocalLeaves)
-                {
-                    throw new IOException("The local Merkle metadata quota is full.");
                 }
                 CacheRecord(record, (_options.Capabilities & DHTCapabilities.Provide) == 0 ? null : _self);
                 _contents[id] = new LocalContent(record, tree);
             }
+        }
+
+        /// <summary>Counts the Merkle leaves of every registered tree except the geometry about to be registered or replaced.</summary>
+        /// <param name="id">The geometry identifier being registered.</param>
+        /// <returns>The leaves held by the other local trees.</returns>
+        private long CountOtherLeavesLocked(string id)
+        {
+            long leaves = 0;
+            foreach (var entry in _contents)
+            {
+                if (entry.Key != id)
+                {
+                    leaves += entry.Value.Tree.Count;
+                }
+            }
+            return leaves;
         }
 
         /// <summary>Replicates a signed publication near both its key and complete-file hash.</summary>

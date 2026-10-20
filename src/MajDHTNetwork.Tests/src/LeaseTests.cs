@@ -83,6 +83,37 @@ namespace MajDHTNetwork.Tests
             Assert.True(replacement.Key.Name == "after-expiry", "Expired records must release the record quota.");
         }
 
+        /// <summary>
+        /// Frees the record quota from expired entries at the moment a publication needs it, even when no maintenance has
+        /// pruned the index and the last opportunistic prune was moments ago.
+        /// </summary>
+        /// <returns>Completion after the publication that depends on the reclaimed quota.</returns>
+        [Fact]
+        public async Task QuotaChecksPruneExpiredRecordsWithoutMaintenance()
+        {
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            var token = deadline.Token;
+            var options = new DHTNodeOptions
+            {
+                UdpPort = null,
+                MaxRecords = 1,
+                RecordLifetime = TimeSpan.FromSeconds(1),
+                MaintenanceInterval = TimeSpan.FromHours(1)
+            };
+            await using var node = new MajDHTNode(options);
+            await node.StartAsync(token);
+            using var first = new MemoryStream(new byte[16]);
+            var record = await node.PublishAsync("first", first, cancellationToken: token);
+            using var blocked = new MemoryStream(new byte[16]);
+            await Assert.ThrowsAnyAsync<IOException>(() => node.PublishAsync("second", blocked, cancellationToken: token));
+            await Task.Delay(TimeSpan.FromSeconds(1.1), token);
+            // Resolving the expired key caches nothing new, so the prune that follows it is the throttled one.
+            Assert.Null(await node.ResolveAsync(record.Key, token));
+            using var second = new MemoryStream(new byte[16]);
+            var replacement = await node.PublishAsync("second", second, cancellationToken: token);
+            Assert.Equal("second", replacement.Key.Name);
+        }
+
         /// <summary>Preserves the raw blocks and Merkle metadata when a signed alias is renewed after expiry.</summary>
         /// <returns>Completion after the regression assertions and node cleanup.</returns>
         [Fact]
