@@ -165,11 +165,13 @@ process.
 | `RestoreRoutingTableAsync(ReadOnlyMemory<byte>, CancellationToken)` | Re-contacts the nodes of an exported routing table, admits those that still answer under their saved identity and returns how many did. |
 | `FindNodesAsync(string routingId, CancellationToken)` | Iterative XOR-distance lookup. |
 | `PublishAsync(string, Stream, long revision, CancellationToken)` | Publishes a stream under the local publisher namespace. |
+| `PublishAsync(string, ReadOnlyMemory<byte> leaves, string fileHash, long length, long revision, CancellationToken)` | Signs and announces a record for blocks already in the content store from their Merkle leaves, whole-file hash and length, without reading them. |
 | `PublishAliasAsync(string, DHTRecord, long revision, CancellationToken)` | Publishes a second name for already published content. |
 | `AnnounceAsync(DHTRecord, CancellationToken)` | Replicates an existing signature or any withdrawal; returns the remote replica count. |
 | `UnpublishAsync(string name, long revision, CancellationToken)` | Signs and replicates a withdrawal of a key in the local publisher namespace; revision 0 picks the next one. |
 | `StopProviding(string fileHash)` | Stops serving a file locally without withdrawing any key. |
 | `ImportContentAsync(DHTRecord, Stream, CancellationToken)` | Verifies a local copy against an existing signed record, of any publisher, serves it and returns the remote replica count. |
+| `ImportContentAsync(DHTRecord, ReadOnlyMemory<byte> leaves, CancellationToken)` | Serves content whose blocks are already in the content store from its Merkle leaves, checked against the signed record, without reading them; returns the remote replica count. |
 | `ResolveAsync(DHTKey, CancellationToken)` | Looks up a signed publication for a key. |
 | `FindProvidersAsync(string fileHash, CancellationToken)` | Finds providers of a complete-file hash, independently of keys. |
 | `DownloadAsync(DHTKey, Stream, string? expectedFileHash, CancellationToken)` | Resolves, downloads and verifies the complete file. |
@@ -408,7 +410,10 @@ A node can provide content it did not publish itself. `ImportContentAsync(record
 stream)` reads a local copy, for example a file kept by a replica across restarts,
 checks it against the signed length, Merkle root and complete-file hash of an
 existing publication, registers it and announces this node as a provider, without
-downloading anything. A node constructed with an `IDHTContentFallback` asks it
+downloading anything. `ImportContentAsync(record, leaves)` registers the same
+content from the persisted Merkle leaves of blocks the content store already
+holds, without reading them (see [Publishing many files](#publishing-many-files)).
+A node constructed with an `IDHTContentFallback` asks it
 whenever a peer requests a block of signed content that is not registered locally;
 the fallback can import a local copy or download the file, after which the block is
 served. A peer can address such a pull-through replica directly with
@@ -544,6 +549,19 @@ in parallel where the budget allows. The index of records, revisions, provider
 claims and local trees is pruned at most once per second on the paths that
 cache or register a record, and at once when a quota appears full, so
 publishing or receiving many records costs time linear in their number.
+
+A publisher with many files need not read them again after a restart. Besides
+the blocks themselves, all the node needs to serve a file is its leaves: the
+32-byte block digests `MerkleTree.Leaf` computes, concatenated in block order.
+An application that keeps its blocks in a persistent `IDHTContentStore` and
+persists each file's leaves, whole-file hash and length can resume serving with
+`ImportContentAsync(record, leaves)` while the signed record is unexpired, and
+sign a fresh revision with `PublishAsync(name, leaves, fileHash, length,
+revision)` once it is not; neither call reads the content. Both check the leaves
+against the record's block count and Merkle root, or against the length at the
+configured block size, and apply the same expiry and leaf-quota checks as their
+stream-based counterparts; neither checks that the blocks are present, so a
+missing or altered block fails only the requests for that block.
 
 `ListenAddresses` takes one address, or one IPv4 and one IPv6 address for
 dual-stack listeners on the same configured ports; wildcard addresses are

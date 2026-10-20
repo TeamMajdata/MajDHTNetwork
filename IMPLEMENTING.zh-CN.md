@@ -136,6 +136,9 @@
    发布即为续期。
 5. `Unpublish` 签名一条撤销记录，其修订号高于该密钥见过的所有修订号、过期时间覆盖被撤销的
    发布，并以同样方式复制。撤销取代的是绑定，不会删除副本。
+6. 把每个文件的叶子、整文件哈希与长度和持久化内容存储一起保存的发布者，重启后无需读取文件即可
+   恢复：`ImportContentAsync(record, leaves)` 重新登记未过期的记录，
+   `PublishAsync(name, leaves, fileHash, length, revision)` 签名新记录。
 
 `Store` 的服务端校验记录，内容记录要求已认证发送方具有 `Provide` 能力，撤销记录接受任何
 发送方，强制修订号单调与相同修订号内容一致，在过期后仍保留有界的修订下限，记录数不超过
@@ -241,7 +244,9 @@
 `MerkleTree.AppendLeaf(writer, block)` 把一个叶子追加到连续的叶子缓冲区并返回用作内容存储键的
 叶子哈希；`new MerkleTree(leaves)` 构建树；`Root` 即记录的 Merkle 根；`WriteProof(writer, index)`
 把证明写入结果；`MerkleTree.Verify` 按记录、位置与证明校验块；`VerifyLocal` 在提供之前把存储的
-块与已构建的树重新核对。`Crypto.Hash` 与 `Crypto.Hex` 以规范形式计算整文件哈希。
+块与已构建的树重新核对。`Crypto.Hash` 与 `Crypto.Hex` 以规范形式计算整文件哈希。连续的叶子
+缓冲区也是 `ImportContentAsync` 与 `PublishAsync` 可以代替流接受的输入，因此应用可以持久化它，
+并在不读取内容的情况下重新登记内容。
 
 ### 身份、联系人与记录
 

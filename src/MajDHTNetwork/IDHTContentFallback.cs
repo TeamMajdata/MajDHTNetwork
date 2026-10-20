@@ -15,7 +15,8 @@ namespace MajDHTNetwork
     {
         /// <summary>
         /// Tries to register the requested content locally, typically through
-        /// <see cref="MajDHTNode.ImportContentAsync"/> or <see cref="MajDHTNode.DownloadAsync(DHTRecord, System.IO.Stream, string, CancellationToken)"/>.
+        /// <see cref="MajDHTNode.ImportContentAsync(DHTRecord, System.IO.Stream, CancellationToken)"/> or
+        /// <see cref="MajDHTNode.DownloadAsync(DHTRecord, System.IO.Stream, string, CancellationToken)"/>.
         /// The node serves the block afterwards when the content geometry is registered; otherwise the peer receives an
         /// error and fails over to other providers.
         /// </summary>

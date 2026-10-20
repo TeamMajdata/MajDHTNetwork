@@ -53,6 +53,53 @@ namespace MajDHTNetwork
             return record;
         }
 
+        /// <summary>
+        /// Signs and announces a manifest for content whose blocks are already in the content store, from its precomputed
+        /// Merkle leaves, whole-file hash and length, without reading the content. Use it to renew or re-sign the
+        /// publications of many files after a restart when the application persisted each file's leaves and hash next to a
+        /// content store that keeps the blocks, for example on disk. The hash and leaves are signed as given: a wrong hash
+        /// fails every download of the key at its final verification, and a missing or altered block is not detected here
+        /// but fails the later requests for that block.
+        /// </summary>
+        /// <param name="name">The case-sensitive name in this identity's key namespace.</param>
+        /// <param name="leaves">
+        /// The contiguous 32-byte leaf digests of every block in block order at the configured block size, as
+        /// <see cref="MerkleTree.AppendLeaf"/> produces them; the buffer is copied and never retained.
+        /// </param>
+        /// <param name="fileHash">The lowercase SHA-256 of the complete content.</param>
+        /// <param name="length">The complete content length in bytes.</param>
+        /// <param name="revision">A positive revision strictly greater than any locally observed revision of this key.</param>
+        /// <param name="cancellationToken">Cancels registering and announcing content.</param>
+        /// <returns>The signed publication; it remains locally usable if no remote replicas are reachable.</returns>
+        /// <exception cref="ArgumentException">
+        /// The name, revision or hash is invalid, the length exceeds the configured file limit, or the leaves are malformed,
+        /// exceed the local leaf quota or do not cover the length at the configured block size.
+        /// </exception>
+        /// <exception cref="InvalidOperationException">The local Provide capability is disabled.</exception>
+        /// <exception cref="IOException">Metadata quotas prevent publication.</exception>
+        /// <exception cref="OperationCanceledException">Publication was cancelled.</exception>
+        public async Task<DHTRecord> PublishAsync(string name, ReadOnlyMemory<byte> leaves, string fileHash, long length, long revision = 1,
+            CancellationToken cancellationToken = default)
+        {
+            Crypto.ParseHash(fileHash);
+            var blockCount = CountLeaves(leaves);
+            if (length < 0 || length > _options.MaxFileSize || blockCount > _options.MaxLocalLeaves
+                || blockCount != Math.Max(1L, (length + _options.BlockSize - 1) / _options.BlockSize))
+            {
+                throw new ArgumentException("The leaves do not describe content of this length within the configured limits.", nameof(leaves));
+            }
+            RequireProvider();
+            using var cancellation = OperationCancellation(cancellationToken);
+            ValidateRevision(name, revision);
+            var tree = new MerkleTree(leaves.Span);
+            var record = DHTRecord.Create(_identity, name, fileHash, tree.Root, length, _options.BlockSize, revision,
+                DateTimeOffset.UtcNow.Add(_options.RecordLifetime));
+            await RegisterPublicationAsync(record, tree, cancellation.Token).ConfigureAwait(false);
+            await AnnounceRecordAsync(record, cancellation.Token).ConfigureAwait(false);
+            Log(LogLevel.Information, "Content publication from precomputed leaves completed.");
+            return record;
+        }
+
         /// <summary>Publishes another key for already available content without reading or copying the file.</summary>
         /// <param name="name">The new or updated name in this identity's namespace.</param>
         /// <param name="content">A manifest whose exact block geometry is registered locally.</param>
@@ -192,6 +239,57 @@ namespace MajDHTNetwork
             RegisterContent(record, new MerkleTree(leaves.WrittenSpan));
             var replicas = await AnnounceRecordAsync(record, cancellation.Token).ConfigureAwait(false);
             Log(LogLevel.Information, "Local content import completed.");
+            return replicas;
+        }
+
+        /// <summary>
+        /// Serves locally available content under an existing signed publication, of this node or any publisher, from the
+        /// precomputed Merkle leaves of its blocks without reading the content: builds the tree from the leaves, checks it
+        /// against the signed block count and Merkle root, registers it and announces this node as a provider. Use it to
+        /// resume serving many files after a restart when the application persisted each file's leaves next to a content
+        /// store that keeps the blocks, for example on disk. The blocks must already be in the content store under their
+        /// leaf identifiers: a missing or altered block is not detected here but fails the later requests for that block.
+        /// </summary>
+        /// <param name="record">The publisher-signed, unexpired content manifest.</param>
+        /// <param name="leaves">
+        /// The contiguous 32-byte leaf digests of every block in block order, as <see cref="MerkleTree.AppendLeaf"/>
+        /// produces them; the buffer is copied and never retained.
+        /// </param>
+        /// <param name="cancellationToken">Cancels announcing content.</param>
+        /// <returns>The number of remote nodes accepting this node's provider announcement.</returns>
+        /// <exception cref="ArgumentNullException">The record is null.</exception>
+        /// <exception cref="ArgumentException">The record is a withdrawal, or the leaves are empty or not whole 32-byte digests.</exception>
+        /// <exception cref="InvalidOperationException">The local Provide capability is disabled.</exception>
+        /// <exception cref="InvalidDataException">
+        /// The record is expired, exceeds configured limits or is below a retained revision, or the leaves differ from its
+        /// block count or Merkle root.
+        /// </exception>
+        /// <exception cref="IOException">The metadata quota prevents registration.</exception>
+        /// <exception cref="OperationCanceledException">The import was cancelled.</exception>
+        public async Task<int> ImportContentAsync(DHTRecord record, ReadOnlyMemory<byte> leaves, CancellationToken cancellationToken = default)
+        {
+            if (record == null)
+            {
+                throw new ArgumentNullException(nameof(record));
+            }
+            if (record.IsWithdrawn)
+            {
+                throw new ArgumentException("A signed content manifest, not a withdrawal, is required.", nameof(record));
+            }
+            var blockCount = CountLeaves(leaves);
+            RequireProvider();
+            if (record.IsExpired || record.Length > _options.MaxFileSize || record.BlockCount > _options.MaxLocalLeaves)
+            {
+                throw new InvalidDataException("The manifest is expired or exceeds configured resource limits.");
+            }
+            if (blockCount != record.BlockCount)
+            {
+                throw new InvalidDataException("The leaf count differs from the signed block count.");
+            }
+            using var cancellation = OperationCancellation(cancellationToken);
+            RegisterContent(record, new MerkleTree(leaves.Span));
+            var replicas = await AnnounceRecordAsync(record, cancellation.Token).ConfigureAwait(false);
+            Log(LogLevel.Information, "Local content import from precomputed leaves completed.");
             return replicas;
         }
 
@@ -631,6 +729,19 @@ namespace MajDHTNetwork
                 }
             }
             return (Crypto.Hex(digest.GetHashAndReset()), length);
+        }
+
+        /// <summary>Counts the leaves of a caller-supplied contiguous leaf buffer before a tree is built from it.</summary>
+        /// <param name="leaves">The concatenated 32-byte leaf digests in block order.</param>
+        /// <returns>The number of complete leaves, at least one.</returns>
+        /// <exception cref="ArgumentException">The buffer is empty or not a whole number of 32-byte digests.</exception>
+        private static int CountLeaves(ReadOnlyMemory<byte> leaves)
+        {
+            if (leaves.Length == 0 || (leaves.Length % 32) != 0)
+            {
+                throw new ArgumentException("Expected contiguous 32-byte Merkle leaves.", nameof(leaves));
+            }
+            return leaves.Length / 32;
         }
 
         /// <summary>Validates a new locally signed key revision before reading its content.</summary>

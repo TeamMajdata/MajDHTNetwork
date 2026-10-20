@@ -173,6 +173,10 @@ response stays inside the envelope limit.
 5. `Unpublish` signs a withdrawal whose revision exceeds every revision seen for
    the key and whose expiry covers the withdrawn publications, and replicates it
    the same way. A withdrawal supersedes the binding; it does not delete copies.
+6. A publisher that persists each file's leaves, whole-file hash and length next
+   to a persistent content store resumes after a restart without reading the
+   file: `ImportContentAsync(record, leaves)` re-registers an unexpired record,
+   `PublishAsync(name, leaves, fileHash, length, revision)` signs a new one.
 
 The server side of `Store` verifies the record, requires the `Provide`
 capability of the authenticated sender for content records, accepts a
@@ -321,7 +325,10 @@ buffer and returns the leaf hash used as the content-store key;
 `WriteProof(writer, index)` writes a proof into a result; `MerkleTree.Verify`
 checks a block against a record, position and proof; `VerifyLocal` re-checks a
 stored block against an already built tree before serving it. `Crypto.Hash`
-and `Crypto.Hex` compute the whole-file hash in its canonical form.
+and `Crypto.Hex` compute the whole-file hash in its canonical form. The
+contiguous leaf buffer is also what `ImportContentAsync` and `PublishAsync`
+accept in place of a stream, so an application can persist it and re-register
+content without reading it.
 
 ### Identities, contacts and records
 

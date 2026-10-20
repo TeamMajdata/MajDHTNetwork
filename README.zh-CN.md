@@ -153,11 +153,13 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | `RestoreRoutingTableAsync(ReadOnlyMemory<byte>, CancellationToken)` | 重新联系导出路由表中的节点，准入仍以保存的身份作出应答的节点，并返回准入数量。 |
 | `FindNodesAsync(string routingId, CancellationToken)` | 迭代式 XOR 距离查找。 |
 | `PublishAsync(string, Stream, long revision, CancellationToken)` | 在本地发布者命名空间下发布一个流。 |
+| `PublishAsync(string, ReadOnlyMemory<byte> leaves, string fileHash, long length, long revision, CancellationToken)` | 用 Merkle 叶子、整文件哈希与长度为内容存储中已有的数据块签名并宣告记录，不读取数据块。 |
 | `PublishAliasAsync(string, DHTRecord, long revision, CancellationToken)` | 为已发布内容再发布一个名称。 |
 | `AnnounceAsync(DHTRecord, CancellationToken)` | 复制已有签名或任意撤销记录；返回远端副本数量。 |
 | `UnpublishAsync(string name, long revision, CancellationToken)` | 签名并复制本地发布者命名空间中某个密钥的撤销记录；修订号为 0 时自动取下一个。 |
 | `StopProviding(string fileHash)` | 本节点停止提供某个文件，不撤销任何密钥。 |
 | `ImportContentAsync(DHTRecord, Stream, CancellationToken)` | 用已有签名记录（可来自任意发布者）校验本地副本并开始提供，返回接受提供者声明的远端副本数。 |
+| `ImportContentAsync(DHTRecord, ReadOnlyMemory<byte> leaves, CancellationToken)` | 用与签名记录核对过的 Merkle 叶子开始提供内容存储中已有的数据块，不读取数据块；返回远端副本数。 |
 | `ResolveAsync(DHTKey, CancellationToken)` | 按密钥查找签名发布记录。 |
 | `FindProvidersAsync(string fileHash, CancellationToken)` | 按完整文件哈希查找提供者，与密钥无关。 |
 | `DownloadAsync(DHTKey, Stream, string? expectedFileHash, CancellationToken)` | 解析、下载并校验完整文件。 |
@@ -366,7 +368,9 @@ transport.Run();
 
 节点可以提供并非由自己发布的内容。`ImportContentAsync(record, stream)` 读取本地副本（例如
 副本节点跨重启保留的文件），按已有发布记录中签名的长度、Merkle 根与完整文件哈希进行校验，
-注册后宣告本节点为提供者，整个过程无需下载。构造节点时传入 `IDHTContentFallback` 后，每当
+注册后宣告本节点为提供者，整个过程无需下载。`ImportContentAsync(record, leaves)` 则用持久化的
+Merkle 叶子登记内容存储中已有数据块的同一内容，不读取数据块（见[批量发布](#批量发布)）。
+构造节点时传入 `IDHTContentFallback` 后，每当
 对端请求本地尚未注册的已签名内容的数据块时，节点都会询问它；回退实现可以导入本地副本或下载
 文件，之后节点即提供该数据块。对端可以用 `ReadBlockAsync(record, replicaPeer, index)` 直接向
 这种回源副本请求。请求只在自身超时内等待，因此回退实现应限制等待时间、让较长的工作在后台
@@ -454,6 +458,14 @@ var block = await downloader.ReadBlockAsync(record, provider.LocalPeer, 0,
 `MaxConcurrentRequests`）。维护流程以同样的上限重新宣告记录，因此大量发布的维护也会在预算允许
 的范围内并行进行。记录、修订号、提供者声明与本地 Merkle 树的索引在缓存或登记记录的路径上每秒最多
 清理一次，配额看似用尽时则立即清理，因此发布或接收大量记录的耗时与记录数成线性关系。
+
+拥有大量文件的发布者在重启后不必再次读取它们。除了数据块本身，节点提供一个文件所需的只有它的
+叶子：`MerkleTree.Leaf` 计算出的 32 字节块摘要，按块顺序拼接。把数据块保存在持久化的
+`IDHTContentStore` 中，并为每个文件持久化叶子、整文件哈希与长度的应用，可以在签名记录尚未过期时用
+`ImportContentAsync(record, leaves)` 恢复提供，在记录过期后用
+`PublishAsync(name, leaves, fileHash, length, revision)` 签名新的修订号；两者都不读取内容。两者都会把
+叶子与记录的块数和 Merkle 根核对，或与配置块大小下的长度核对，并执行与基于流的同名方法相同的过期与
+叶子配额检查；但都不检查数据块是否存在，因此缺失或被改动的数据块只会让针对该块的请求失败。
 
 `ListenAddresses` 接受一个地址，或者一个 IPv4 地址加一个 IPv6 地址，以便在相同的配置端口上
 双栈监听；允许使用通配地址。支持任意 TCP/UDP 端口、相同或不同的 TCP/UDP 端口号，TCP 与
