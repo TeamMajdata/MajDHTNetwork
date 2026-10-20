@@ -81,16 +81,23 @@ A record is `bytes(payload), bytes(ed25519Signature(payload))` with payload:
 | Domain | string `MajDHT/1/record` |
 | Publisher signing key | bytes, exactly 32 |
 | Canonical key | string, owner fingerprint must match the signing key |
-| File hash | string, SHA-256 of the complete raw file |
-| Merkle root | string, SHA-256 domain-separated tree root |
-| Length | integer 0..1073741824 |
-| Block size | integer 1024..32768 |
+| Flags | byte: Withdrawn=1, other bits zero |
+| File hash | string, SHA-256 of the complete raw file; empty for a withdrawal |
+| Merkle root | string, SHA-256 domain-separated tree root; empty for a withdrawal |
+| Length | integer 0..1073741824; zero for a withdrawal |
+| Block size | integer 1024..32768; zero for a withdrawal |
 | Revision | strictly positive integer |
 | Expiry | Unix seconds, future and at most seven days ahead |
 
 Maximum accepted serialized record: 2,200 bytes. Block count is
 `max(1, ceil(length / blockSize))`. Empty files have one zero-length block.
 Only the final block may be shorter than `blockSize`.
+
+A withdrawal is a record with the Withdrawn flag, empty file hash and Merkle root,
+and zero length and block size. It has no blocks and supersedes every lower
+revision of its key like any higher revision; equal revisions of a withdrawal and
+content are equivocation. Its expiry must cover the withdrawn publications, so a
+publisher signs it with an expiry no earlier than the latest one it supersedes.
 
 Leaves are `SHA256(0x00 || rawBlock)`. Parents are
 `SHA256(0x01 || leftDigest || rightDigest)`. Duplicate the last node at each odd
@@ -169,7 +176,11 @@ exact requested key. Mode 1 returns providers for the returned record; mode 2
 returns providers for its target hash. Other cases have an empty provider list.
 
 Store records an authenticated sender's provider claim and requires its Provide
-flag; it never trusts an unrelated provider supplied in the body. Indexes enforce
+flag; it never trusts an unrelated provider supplied in the body. A withdrawal
+is accepted from any authenticated sender and records no provider claim; the
+receiver then drops provider claims and local content geometries that no
+unexpired, non-withdrawn record references, and Find mode 1 returns the
+withdrawal with an empty provider list. Indexes enforce
 size quotas, expiry, monotonic revisions and equal-revision content consistency.
 Receivers retain bounded revision floors past record expiry. Store success is
 not proof that the provider owns every block. For each file, a node keeps at most

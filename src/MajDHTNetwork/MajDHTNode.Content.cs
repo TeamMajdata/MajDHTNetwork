@@ -129,17 +129,26 @@ namespace MajDHTNetwork
             return record;
         }
 
-        /// <summary>Reannounces an unexpired signed record for locally registered content.</summary>
-        /// <param name="record">The existing signed publication; its revision and expiry are preserved.</param>
+        /// <summary>
+        /// Reannounces an unexpired signed record for locally registered content, or replicates any publisher's withdrawal.
+        /// </summary>
+        /// <param name="record">The existing signed publication or withdrawal; its revision and expiry are preserved.</param>
         /// <param name="cancellationToken">Cancels announcement.</param>
         /// <returns>The number of remote nodes accepting a replica.</returns>
         /// <exception cref="ArgumentException">The content is not registered locally.</exception>
+        /// <exception cref="InvalidDataException">The record is expired or below a retained revision.</exception>
         /// <exception cref="OperationCanceledException">Announcement was cancelled.</exception>
         public async Task<int> AnnounceAsync(DHTRecord record, CancellationToken cancellationToken = default)
         {
             if (record == null)
             {
                 throw new ArgumentNullException(nameof(record));
+            }
+            if (record.IsWithdrawn)
+            {
+                using var withdrawal = OperationCancellation(cancellationToken);
+                CacheRecord(record, null);
+                return await AnnounceWithdrawalAsync(record, null, withdrawal.Token).ConfigureAwait(false);
             }
             RequireProvider();
             using var cancellation = OperationCancellation(cancellationToken);
@@ -162,7 +171,7 @@ namespace MajDHTNetwork
         /// <param name="expectedFileHash">An optional independently trusted SHA-256 pin.</param>
         /// <param name="cancellationToken">Cancels discovery, downloading and storage.</param>
         /// <returns>The authenticated manifest after all blocks and the whole-file hash match.</returns>
-        /// <exception cref="FileNotFoundException">No publication could be found.</exception>
+        /// <exception cref="FileNotFoundException">No publication could be found, or the publisher withdrew the key.</exception>
         /// <exception cref="InvalidDataException">The trusted hash or content verification failed.</exception>
         /// <exception cref="IOException">No usable provider or writable destination is available.</exception>
         /// <exception cref="OperationCanceledException">Download was cancelled.</exception>
@@ -173,6 +182,10 @@ namespace MajDHTNetwork
             if (record == null)
             {
                 throw new FileNotFoundException("No reachable signed publication exists for the requested key.");
+            }
+            if (record.IsWithdrawn)
+            {
+                throw new FileNotFoundException("The publisher withdrew the requested key.");
             }
             return await DownloadAsync(record, destination, expectedFileHash, cancellationToken).ConfigureAwait(false);
         }
@@ -187,15 +200,16 @@ namespace MajDHTNetwork
         /// <param name="cancellationToken">Cancels the complete operation.</param>
         /// <returns>The manifest after complete verification and optional provider announcement.</returns>
         /// <exception cref="InvalidOperationException">The local Download capability is disabled.</exception>
+        /// <exception cref="ArgumentException">The record is a withdrawal or the destination is not writable.</exception>
         /// <exception cref="InvalidDataException">Manifest, block, Merkle or whole-file verification failed.</exception>
         /// <exception cref="IOException">No provider supplied a valid block or a stream/store operation failed.</exception>
         /// <exception cref="OperationCanceledException">The operation was cancelled.</exception>
         public async Task<DHTRecord> DownloadAsync(DHTRecord record, Stream destination, string? expectedFileHash = null, CancellationToken cancellationToken = default)
         {
             RequireDownloader();
-            if (record == null || destination == null || !destination.CanWrite)
+            if (record == null || destination == null || !destination.CanWrite || record.IsWithdrawn)
             {
-                throw new ArgumentException("A signed manifest and writable destination are required.");
+                throw new ArgumentException("A signed content manifest, not a withdrawal, and a writable destination are required.");
             }
             if (record.IsExpired || record.Length > _options.MaxFileSize || record.BlockCount > MaxLocalLeaves)
             {
@@ -249,6 +263,7 @@ namespace MajDHTNetwork
         /// <param name="cancellationToken">Cancels transfer.</param>
         /// <returns>The raw block after exact length, position and Merkle authentication.</returns>
         /// <exception cref="InvalidOperationException">A remote transfer was requested with the local Download capability disabled.</exception>
+        /// <exception cref="ArgumentException">The record is a withdrawal.</exception>
         /// <exception cref="ArgumentOutOfRangeException">The index is outside the signed file.</exception>
         /// <exception cref="InvalidDataException">The manifest or returned block is invalid.</exception>
         /// <exception cref="IOException">The provider or relay is unavailable.</exception>
@@ -259,6 +274,10 @@ namespace MajDHTNetwork
             if (record == null || provider == null)
             {
                 throw new ArgumentNullException(nameof(record));
+            }
+            if (record.IsWithdrawn)
+            {
+                throw new ArgumentException("A withdrawal has no content blocks.", nameof(record));
             }
             if (index < 0 || index >= record.BlockCount)
             {

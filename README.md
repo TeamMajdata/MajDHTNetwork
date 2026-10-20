@@ -158,7 +158,9 @@ process.
 | `FindNodesAsync(string routingId, CancellationToken)` | Iterative XOR-distance lookup. |
 | `PublishAsync(string, Stream, long revision, CancellationToken)` | Publishes a stream under the local publisher namespace. |
 | `PublishAliasAsync(string, DHTRecord, long revision, CancellationToken)` | Publishes a second name for already published content. |
-| `AnnounceAsync(DHTRecord, CancellationToken)` | Replicates an existing signature; returns the remote replica count. |
+| `AnnounceAsync(DHTRecord, CancellationToken)` | Replicates an existing signature or any withdrawal; returns the remote replica count. |
+| `UnpublishAsync(string name, long revision, CancellationToken)` | Signs and replicates a withdrawal of a key in the local publisher namespace; revision 0 picks the next one. |
+| `StopProviding(string fileHash)` | Stops serving a file locally without withdrawing any key. |
 | `ResolveAsync(DHTKey, CancellationToken)` | Looks up a signed publication for a key. |
 | `FindProvidersAsync(string fileHash, CancellationToken)` | Finds providers of a complete-file hash, independently of keys. |
 | `DownloadAsync(DHTKey, Stream, string? expectedFileHash, CancellationToken)` | Resolves, downloads and verifies the complete file. |
@@ -212,7 +214,7 @@ process.
 | `DHTReachability` | `Unknown = 0`, `Public = 1`, `Private = 2` |
 | `DHTEndpointFlags` | `None = 0`, `Verified = 1`, `Local = 2`, `Configured = 4` |
 | `DHTKey` | `DHTKey(string publisherId, string name)`, `Parse(string)`, `IsValid`, `PublisherId`, `Name`, `RoutingId`, equality and hashing |
-| `DHTRecord` | `Key`, `FileHash`, `MerkleRoot`, `Length`, `BlockSize`, `BlockCount`, `Revision`, `ExpiresAt`, `IsExpired`, `EncodedLength`, `CopyTo(Span<byte>)`, `ToBytes()`, `Parse(ReadOnlySpan<byte>)` |
+| `DHTRecord` | `Key`, `IsWithdrawn`, `FileHash`, `MerkleRoot`, `Length`, `BlockSize`, `BlockCount`, `Revision`, `ExpiresAt`, `IsExpired`, `EncodedLength`, `CopyTo(Span<byte>)`, `ToBytes()`, `Parse(ReadOnlySpan<byte>)` |
 | `IDHTContentStore` | `PutAsync(string blockHash, ReadOnlyMemory<byte>, CancellationToken)`, `GetAsync(string blockHash, CancellationToken)` |
 | `MemoryDHTContentStore` | `MemoryDHTContentStore(long capacity = 64 MiB, int maxEntries = 65536)` |
 | `IDHTRoutingTable` | `Initialize(string localNodeId, int bucketSize)`, `Observe(DHTPeer, IPAddress? verifiedAddress)`, `Remove(string nodeId)`, `Closest(string routingId, int count)` |
@@ -272,6 +274,28 @@ increase and must be persisted by the publisher. New publications have a
 one-day lease by default, configurable from one second through seven days;
 maintenance reannounces existing signatures without extending their expiry.
 Renew by publishing a higher revision, including through `PublishAliasAsync`.
+
+### Withdrawing a publication
+
+`UnpublishAsync(name)` signs a withdrawal: a record of the same key with a
+higher revision, `IsWithdrawn` set and no content. Its revision exceeds every
+revision known locally and found in the DHT, and its lease lasts at least as long
+as the latest withdrawn publication, so the old signature cannot be reannounced
+after the withdrawal expires. The node replicates it near the key and the
+withdrawn file hash, and maintenance reannounces it until it expires. Any node
+may replicate a withdrawal with `AnnounceAsync`. Honest nodes that receive it
+resolve the key as withdrawn (`ResolveAsync` returns the withdrawal and
+`DownloadAsync(key)` throws `FileNotFoundException`), drop provider claims and
+local content that no other live publication references, and keep refusing older
+revisions through the revision floor. Publishing the name again requires a
+revision above the withdrawal.
+
+A withdrawal revokes the binding from a key to content, not the content: nodes
+that already downloaded the file keep their copies, other keys or publishers can
+bind the same file hash, and dishonest nodes can ignore the withdrawal.
+`StopProviding(fileHash)` only stops this node from serving a file; other nodes
+keep its earlier provider claims until they expire and fail over to other
+providers.
 
 ## Encryption and relays
 

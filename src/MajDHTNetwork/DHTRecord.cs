@@ -6,23 +6,33 @@ using MajDHTNetwork.Protocol;
 
 namespace MajDHTNetwork
 {
-    /// <summary>An immutable publisher-signed key binding and Merkle content manifest.</summary>
+    /// <summary>
+    /// An immutable publisher-signed key binding: either a Merkle content manifest, or a withdrawal that states the publisher
+    /// no longer binds the key to any content.
+    /// </summary>
     public sealed class DHTRecord
     {
+        /// <summary>The flag marking a withdrawal.</summary>
+        private const byte WithdrawnFlag = 1;
         /// <summary>The signed wire representation.</summary>
         private readonly byte[] _encoded;
         /// <summary>Gets the publisher-scoped lookup key.</summary>
         public DHTKey Key { get; }
-        /// <summary>Gets the SHA-256 digest of the complete raw file.</summary>
+        /// <summary>
+        /// Gets whether the publisher withdrew the key. A withdrawal has no content: its file hash and Merkle root are empty and
+        /// its length, block size and block count are zero. It supersedes every lower revision of the key.
+        /// </summary>
+        public bool IsWithdrawn { get; }
+        /// <summary>Gets the SHA-256 digest of the complete raw file, or an empty string for a withdrawal.</summary>
         public string FileHash { get; }
-        /// <summary>Gets the domain-separated Merkle root used to verify individual blocks.</summary>
+        /// <summary>Gets the domain-separated Merkle root used to verify individual blocks, or an empty string for a withdrawal.</summary>
         public string MerkleRoot { get; }
         /// <summary>Gets the complete file length.</summary>
         public long Length { get; }
         /// <summary>Gets the maximum bytes in each block.</summary>
         public int BlockSize { get; }
-        /// <summary>Gets the block count, including one empty block for an empty file.</summary>
-        public int BlockCount => Math.Max(1, (int)((Length + BlockSize - 1) / BlockSize));
+        /// <summary>Gets the block count, including one empty block for an empty file, or zero for a withdrawal.</summary>
+        public int BlockCount => IsWithdrawn ? 0 : Math.Max(1, (int)((Length + BlockSize - 1) / BlockSize));
         /// <summary>Gets the strictly positive publisher-assigned revision.</summary>
         public long Revision { get; }
         /// <summary>Gets the absolute publication expiry.</summary>
@@ -47,6 +57,7 @@ namespace MajDHTNetwork
             }
             var publicKey = wire.Bytes(32);
             Key = DHTKey.Parse(wire.Text(1024));
+            var flags = wire.Byte();
             FileHash = wire.Text(64);
             MerkleRoot = wire.Text(64);
             Length = wire.Long();
@@ -54,10 +65,24 @@ namespace MajDHTNetwork
             Revision = wire.Long();
             var expiry = wire.Long();
             wire.End();
-            Crypto.ParseHash(FileHash);
-            Crypto.ParseHash(MerkleRoot);
-            if (Length < 0 || Length > 1024L * 1024 * 1024 || blockSize < 1024 || blockSize > 32768
-                || Revision <= 0 || expiry <= DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+            IsWithdrawn = (flags & WithdrawnFlag) != 0;
+            if (IsWithdrawn)
+            {
+                if (FileHash.Length != 0 || MerkleRoot.Length != 0 || Length != 0 || blockSize != 0)
+                {
+                    throw new InvalidDataException("A withdrawal must not describe content.");
+                }
+            }
+            else
+            {
+                Crypto.ParseHash(FileHash);
+                Crypto.ParseHash(MerkleRoot);
+                if (Length < 0 || Length > 1024L * 1024 * 1024 || blockSize < 1024 || blockSize > 32768)
+                {
+                    throw new InvalidDataException("Invalid publication geometry.");
+                }
+            }
+            if ((flags & ~WithdrawnFlag) != 0 || Revision <= 0 || expiry <= DateTimeOffset.UtcNow.ToUnixTimeSeconds()
                 || expiry > DateTimeOffset.UtcNow.AddDays(7).ToUnixTimeSeconds()
                 || Crypto.Hex(Crypto.Hash(publicKey.Span)) != Key.PublisherId
                 || !Crypto.Verify(publicKey, payload, signature))
@@ -81,11 +106,40 @@ namespace MajDHTNetwork
         internal static DHTRecord Create(DHTIdentity identity, string name, string fileHash, string root, long length,
             int blockSize, long revision, DateTimeOffset expiresAt)
         {
+            return Sign(identity, name, 0, fileHash, root, length, blockSize, revision, expiresAt);
+        }
+
+        /// <summary>Signs a withdrawal that supersedes every lower revision of a key without describing content.</summary>
+        /// <param name="identity">The key owner.</param>
+        /// <param name="name">The owner-scoped name.</param>
+        /// <param name="revision">A revision above every revision being withdrawn.</param>
+        /// <param name="expiresAt">The withdrawal expiry, which must outlive the withdrawn publications.</param>
+        /// <returns>The verified signed withdrawal.</returns>
+        internal static DHTRecord CreateWithdrawal(DHTIdentity identity, string name, long revision, DateTimeOffset expiresAt)
+        {
+            return Sign(identity, name, WithdrawnFlag, string.Empty, string.Empty, 0, 0, revision, expiresAt);
+        }
+
+        /// <summary>Encodes and signs a record payload.</summary>
+        /// <param name="identity">The key owner.</param>
+        /// <param name="name">The owner-scoped name.</param>
+        /// <param name="flags">The record flags.</param>
+        /// <param name="fileHash">The whole-file hash, or empty for a withdrawal.</param>
+        /// <param name="root">The Merkle root, or empty for a withdrawal.</param>
+        /// <param name="length">The file length.</param>
+        /// <param name="blockSize">The block size.</param>
+        /// <param name="revision">The revision.</param>
+        /// <param name="expiresAt">The expiry.</param>
+        /// <returns>The verified signed record.</returns>
+        private static DHTRecord Sign(DHTIdentity identity, string name, byte flags, string fileHash, string root, long length,
+            int blockSize, long revision, DateTimeOffset expiresAt)
+        {
             var key = new DHTKey(identity.NodeId, name);
             using var payload = new Wire();
             payload.PutText("MajDHT/1/record");
             payload.Put(identity.PublicKey);
             payload.PutText(key.ToString());
+            payload.PutByte(flags);
             payload.PutText(fileHash);
             payload.PutText(root);
             payload.PutLong(length);
@@ -132,12 +186,12 @@ namespace MajDHTNetwork
             return new DHTRecord(encoded);
         }
 
-        /// <summary>Checks whether another publication describes identical block geometry and content.</summary>
+        /// <summary>Checks whether another publication describes identical block geometry and content, or is also a withdrawal.</summary>
         /// <param name="other">The comparison publication.</param>
         /// <returns>Whether complete content metadata matches.</returns>
         internal bool SameContent(DHTRecord other)
         {
-            return FileHash == other.FileHash && MerkleRoot == other.MerkleRoot
+            return IsWithdrawn == other.IsWithdrawn && FileHash == other.FileHash && MerkleRoot == other.MerkleRoot
                 && Length == other.Length && BlockSize == other.BlockSize;
         }
     }

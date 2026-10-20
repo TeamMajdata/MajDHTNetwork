@@ -574,6 +574,12 @@ namespace MajDHTNetwork
                 }
                 _records[key] = Newer(existing, record);
                 _revisions[key] = (record, DateTimeOffset.UtcNow.AddDays(7).AddMinutes(2));
+                if (record.IsWithdrawn)
+                {
+                    // Drop provider claims and local content that no remaining publication references.
+                    PruneLocked();
+                    return;
+                }
                 if (provider == null || provider.IsExpired || (provider.Capabilities & DHTCapabilities.Provide) == 0)
                 {
                     return;
@@ -666,7 +672,7 @@ namespace MajDHTNetwork
                 {
                     expired.Add(entry.Key);
                 }
-                else
+                else if (!entry.Value.IsWithdrawn)
                 {
                     referenced.Add(entry.Value.FileHash);
                     geometries.Add(ContentId(entry.Value));
@@ -757,7 +763,7 @@ namespace MajDHTNetwork
             }
         }
 
-        /// <summary>Reannounces every unexpired locally available publication.</summary>
+        /// <summary>Reannounces every unexpired locally available publication and this publisher's own withdrawals.</summary>
         /// <param name="cancellationToken">The node lifetime.</param>
         /// <returns>Completion after every announcement attempt.</returns>
         /// <exception cref="OperationCanceledException">The node stopped.</exception>
@@ -768,7 +774,8 @@ namespace MajDHTNetwork
             {
                 foreach (var record in _records.Values)
                 {
-                    if ((_options.Capabilities & DHTCapabilities.Provide) != 0 && _contents.ContainsKey(ContentId(record)))
+                    if (record.IsWithdrawn ? record.Key.PublisherId == NodeId
+                        : (_options.Capabilities & DHTCapabilities.Provide) != 0 && _contents.ContainsKey(ContentId(record)))
                     {
                         publications.Add(record);
                     }
@@ -778,7 +785,15 @@ namespace MajDHTNetwork
             {
                 try
                 {
-                    if (!record.IsExpired)
+                    if (record.IsExpired)
+                    {
+                        continue;
+                    }
+                    if (record.IsWithdrawn)
+                    {
+                        await AnnounceWithdrawalAsync(record, null, cancellationToken).ConfigureAwait(false);
+                    }
+                    else
                     {
                         await AnnounceRecordAsync(record, cancellationToken).ConfigureAwait(false);
                     }

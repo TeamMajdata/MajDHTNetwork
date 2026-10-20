@@ -147,7 +147,9 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | `FindNodesAsync(string routingId, CancellationToken)` | 迭代式 XOR 距离查找。 |
 | `PublishAsync(string, Stream, long revision, CancellationToken)` | 在本地发布者命名空间下发布一个流。 |
 | `PublishAliasAsync(string, DHTRecord, long revision, CancellationToken)` | 为已发布内容再发布一个名称。 |
-| `AnnounceAsync(DHTRecord, CancellationToken)` | 复制已有签名；返回远端副本数量。 |
+| `AnnounceAsync(DHTRecord, CancellationToken)` | 复制已有签名或任意撤销记录；返回远端副本数量。 |
+| `UnpublishAsync(string name, long revision, CancellationToken)` | 签名并复制本地发布者命名空间中某个密钥的撤销记录；修订号为 0 时自动取下一个。 |
+| `StopProviding(string fileHash)` | 本节点停止提供某个文件，不撤销任何密钥。 |
 | `ResolveAsync(DHTKey, CancellationToken)` | 按密钥查找签名发布记录。 |
 | `FindProvidersAsync(string fileHash, CancellationToken)` | 按完整文件哈希查找提供者，与密钥无关。 |
 | `DownloadAsync(DHTKey, Stream, string? expectedFileHash, CancellationToken)` | 解析、下载并校验完整文件。 |
@@ -201,7 +203,7 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | `DHTReachability` | `Unknown = 0`、`Public = 1`、`Private = 2` |
 | `DHTEndpointFlags` | `None = 0`、`Verified = 1`、`Local = 2`、`Configured = 4` |
 | `DHTKey` | `DHTKey(string publisherId, string name)`、`Parse(string)`、`IsValid`、`PublisherId`、`Name`、`RoutingId`、相等比较与哈希 |
-| `DHTRecord` | `Key`、`FileHash`、`MerkleRoot`、`Length`、`BlockSize`、`BlockCount`、`Revision`、`ExpiresAt`、`IsExpired`、`EncodedLength`、`CopyTo(Span<byte>)`、`ToBytes()`、`Parse(ReadOnlySpan<byte>)` |
+| `DHTRecord` | `Key`、`IsWithdrawn`、`FileHash`、`MerkleRoot`、`Length`、`BlockSize`、`BlockCount`、`Revision`、`ExpiresAt`、`IsExpired`、`EncodedLength`、`CopyTo(Span<byte>)`、`ToBytes()`、`Parse(ReadOnlySpan<byte>)` |
 | `IDHTContentStore` | `PutAsync(string blockHash, ReadOnlyMemory<byte>, CancellationToken)`、`GetAsync(string blockHash, CancellationToken)` |
 | `MemoryDHTContentStore` | `MemoryDHTContentStore(long capacity = 64 MiB, int maxEntries = 65536)` |
 | `IDHTRoutingTable` | `Initialize(string localNodeId, int bucketSize)`、`Observe(DHTPeer, IPAddress? verifiedAddress)`、`Remove(string nodeId)`、`Closest(string routingId, int count)` |
@@ -248,6 +250,20 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 修订号，或改为固定完整文件哈希。发布修订号必须递增，而且必须由发布者持久化。新发布的默认
 租约为一天，可配置为一秒到七天；维护流程只重新宣告已有签名，不会延长其过期时间。续期的方式
 是发布更高的修订号，包括通过 `PublishAliasAsync` 发布。
+
+### 撤销发布
+
+`UnpublishAsync(name)` 会签名一条撤销记录：同一密钥、更高修订号、置位 `IsWithdrawn` 且不含内容。
+它的修订号高于本地已知以及在 DHT 中找到的所有修订号，租约至少与被撤销的最新发布一样长，因此撤销
+记录过期后旧签名也无法再被宣告。节点会把它复制到密钥附近以及被撤销文件哈希附近，维护流程会持续
+重新宣告，直到它过期。任何节点都可以用 `AnnounceAsync` 复制撤销记录。遵守协议的节点收到后会把该
+密钥解析为已撤销（`ResolveAsync` 返回撤销记录，`DownloadAsync(key)` 抛出
+`FileNotFoundException`），删除不再被其他有效发布引用的提供者声明与本地内容，并借助修订号下限继续
+拒绝旧修订号。再次发布该名称需要高于撤销记录的修订号。
+
+撤销针对的是"密钥 → 内容"的绑定，而不是内容本身：已下载文件的节点仍保有副本，其他密钥或发布者
+可以绑定同一个文件哈希，不诚实的节点也可以无视撤销。`StopProviding(fileHash)` 只是让本节点停止
+提供某个文件；其他节点会保留它之前的提供者声明直到过期，并改由其他提供者获取。
 
 ## 加密与中继
 

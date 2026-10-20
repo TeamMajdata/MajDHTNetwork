@@ -76,6 +76,7 @@ and requires the DLL, XML documentation, README, protocol document and license.
 | `src/SybilResistanceTests.cs` | Identity proof-of-work enforcement for senders and referrals, verified routing admission with bounded verification of forged endpoints, per-network routing and provider limits, one-helper-per-network dial-back selection, and disjoint lookups that still find a record hidden behind Sybil referrals. |
 | `src/TestDefaults.cs` | Module initializer that disables the default identity work for short-lived test nodes; Sybil tests set `IdentityWorkBits` explicitly. |
 | `src/IdentityPuzzleTests.cs` | Exclusive check that floods of uncached identities beyond the per-second Argon2id budget are not evaluated. |
+| `src/WithdrawalTests.cs` | Signed withdrawals without content, key withdrawal with resolution, download refusal, provider and content pruning, replay refusal and republication, and local `StopProviding`. |
 | `src/MemoryTests.cs`, `src/ContentStoreTests.cs` | Span APIs, borrowed/owned memory, immutable snapshots and bounded cache eviction. |
 | `src/RoutingTests.cs`, `src/LoggingTests.cs` | Default Kademlia table XOR distance ordering, routing removal and structured logging contracts. |
 | `src/MerkleTests.cs`, `src/NetworkTests.cs` | File geometry, signatures, discovery, aliases, relays and malicious-provider recovery. |

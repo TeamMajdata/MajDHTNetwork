@@ -151,7 +151,8 @@ namespace MajDHTNetwork
                         response.Put(record.Encoded);
                     }
                     PutPeers(response, RoutedPeers(routingId, _options.BucketSize), ContactListBudget);
-                    PutPeers(response, mode == 2 ? LocalProviders(target) : record == null ? new List<DHTPeer>() : LocalProviders(record.FileHash),
+                    PutPeers(response, mode == 2 ? LocalProviders(target)
+                        : record == null || record.IsWithdrawn ? new List<DHTPeer>() : LocalProviders(record.FileHash),
                         ContactListBudget);
                     return response.ToArray();
                 }
@@ -159,11 +160,12 @@ namespace MajDHTNetwork
                 {
                     var record = DHTRecord.Parse(request.Bytes(2200).Span);
                     request.End();
-                    if ((packet.Sender.Capabilities & DHTCapabilities.Provide) == 0)
+                    // A withdrawal is signed by its publisher and claims no content, so any node may replicate it.
+                    if (!record.IsWithdrawn && (packet.Sender.Capabilities & DHTCapabilities.Provide) == 0)
                     {
                         throw new InvalidDataException("A provider capability is required to announce content.");
                     }
-                    CacheRecord(record, packet.Sender, source.Address);
+                    CacheRecord(record, record.IsWithdrawn ? null : packet.Sender, source.Address);
                     return Array.Empty<byte>();
                 }
                 case Operation.Block:
