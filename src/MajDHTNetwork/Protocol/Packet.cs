@@ -7,7 +7,7 @@ using System.Security.Cryptography;
 namespace MajDHTNetwork.Protocol
 {
     /// <summary>Identifies a signed encrypted request operation.</summary>
-    internal enum Operation : byte
+    public enum Operation : byte
     {
         /// <summary>Returns the current authenticated contact.</summary>
         Ping = 1,
@@ -31,18 +31,18 @@ namespace MajDHTNetwork.Protocol
 
     /// <summary>An immutable request or response view, encrypted to its final recipient.</summary>
     /// <remarks>Copies share their memory. Borrowed constructor buffers must remain stable until encryption finishes.</remarks>
-    internal readonly struct Packet
+    public readonly struct Packet
     {
         /// <summary>The Ed25519 signature length.</summary>
         private const int SignatureLength = 64;
         /// <summary>The correlation identifier length.</summary>
-        private const int RequestIdLength = 16;
+        public const int RequestIdLength = 16;
         /// <summary>The sender contact, or null for an uninitialized packet.</summary>
         private readonly DHTPeer? _sender;
 
         /// <summary>Gets the authenticated sender contact.</summary>
         /// <exception cref="InvalidOperationException">The packet is uninitialized.</exception>
-        internal DHTPeer Sender
+        public DHTPeer Sender
         {
             get
             {
@@ -50,11 +50,11 @@ namespace MajDHTNetwork.Protocol
             }
         }
         /// <summary>Gets the random 128-bit correlation identifier.</summary>
-        internal ReadOnlyMemory<byte> RequestId { get; }
+        public ReadOnlyMemory<byte> RequestId { get; }
         /// <summary>Gets the operation with the high bit set for responses.</summary>
-        internal byte Kind { get; }
+        public byte Kind { get; }
         /// <summary>Gets the decrypted operation body.</summary>
-        internal ReadOnlyMemory<byte> Body { get; }
+        public ReadOnlyMemory<byte> Body { get; }
 
         /// <summary>Creates an immutable view of borrowed message memory before encryption.</summary>
         /// <param name="sender">The sender contact.</param>
@@ -63,7 +63,7 @@ namespace MajDHTNetwork.Protocol
         /// <param name="body">The borrowed operation body.</param>
         /// <exception cref="ArgumentNullException">The sender is null.</exception>
         /// <exception cref="ArgumentException">The correlation identifier is not 16 bytes long.</exception>
-        internal Packet(DHTPeer sender, ReadOnlyMemory<byte> requestId, byte kind, ReadOnlyMemory<byte> body)
+        public Packet(DHTPeer sender, ReadOnlyMemory<byte> requestId, byte kind, ReadOnlyMemory<byte> body)
         {
             if (requestId.Length != RequestIdLength)
             {
@@ -82,7 +82,7 @@ namespace MajDHTNetwork.Protocol
         /// <exception cref="InvalidDataException">The encoded packet exceeds protocol limits.</exception>
         /// <exception cref="InvalidOperationException">The packet is uninitialized.</exception>
         /// <exception cref="CryptographicException">The cryptographic provider cannot seal the packet.</exception>
-        internal byte[] Seal(DHTIdentity identity, DHTPeer recipient)
+        public byte[] Seal(DHTIdentity identity, DHTPeer recipient)
         {
             using var header = new Wire();
             WriteHeader(header, recipient.NodeHash);
@@ -111,7 +111,7 @@ namespace MajDHTNetwork.Protocol
         /// <returns>The bounded signed plaintext envelope.</returns>
         /// <exception cref="InvalidDataException">The packet is not a Hello request or exceeds protocol limits.</exception>
         /// <exception cref="InvalidOperationException">The packet is uninitialized.</exception>
-        internal byte[] SealHello(DHTIdentity identity)
+        public byte[] SealHello(DHTIdentity identity)
         {
             if (Kind != (byte)Operation.Hello)
             {
@@ -227,7 +227,7 @@ namespace MajDHTNetwork.Protocol
         /// <param name="encoded">The opaque inner packet.</param>
         /// <param name="recipient">The expected final node identifier.</param>
         /// <exception cref="InvalidDataException">The packet is a response, a control operation or addressed elsewhere.</exception>
-        internal static void CheckForward(ReadOnlyMemory<byte> encoded, string recipient)
+        public static void CheckForward(ReadOnlyMemory<byte> encoded, string recipient)
         {
             var header = Header(encoded);
             if (!Crypto.AsciiEquals(header.Recipient.Span, recipient) || header.Kind < (byte)Operation.Ping || header.Kind > (byte)Operation.Block)
@@ -245,7 +245,7 @@ namespace MajDHTNetwork.Protocol
         /// <returns>The verified sender and plaintext operation, borrowing the envelope buffer.</returns>
         /// <exception cref="CryptographicException">Recipient, signature or ciphertext authentication failed.</exception>
         /// <exception cref="InvalidDataException">The message is malformed or outside the clock-skew window.</exception>
-        internal static Packet Open(DHTIdentity identity, ReadOnlyMemory<byte> encoded)
+        public static Packet Open(DHTIdentity identity, ReadOnlyMemory<byte> encoded)
         {
             var header = Header(encoded);
             ReadOnlyMemory<byte> bytes;
@@ -305,17 +305,17 @@ namespace MajDHTNetwork.Protocol
         private readonly struct EnvelopeHeader
         {
             /// <summary>Gets the operation with the response bit.</summary>
-            internal byte Kind { get; }
+            public byte Kind { get; }
             /// <summary>Gets the 64-digit recipient identifier.</summary>
-            internal ReadOnlyMemory<byte> Recipient { get; }
+            public ReadOnlyMemory<byte> Recipient { get; }
             /// <summary>Gets the ephemeral public key, or zeros for a Hello request.</summary>
-            internal ReadOnlyMemory<byte> PublicKey { get; }
+            public ReadOnlyMemory<byte> PublicKey { get; }
             /// <summary>Gets the nonce.</summary>
-            internal ReadOnlyMemory<byte> Nonce { get; }
+            public ReadOnlyMemory<byte> Nonce { get; }
             /// <summary>Gets the complete authenticated header bytes.</summary>
-            internal ReadOnlyMemory<byte> Bytes { get; }
+            public ReadOnlyMemory<byte> Bytes { get; }
             /// <summary>Gets the ciphertext, or the plaintext payload of a Hello request.</summary>
-            internal ReadOnlyMemory<byte> Cipher { get; }
+            public ReadOnlyMemory<byte> Cipher { get; }
 
             /// <summary>Retains the parsed views.</summary>
             /// <param name="kind">The operation with the response bit.</param>
@@ -324,7 +324,7 @@ namespace MajDHTNetwork.Protocol
             /// <param name="nonce">The nonce.</param>
             /// <param name="bytes">The complete header.</param>
             /// <param name="cipher">The ciphertext or Hello payload.</param>
-            internal EnvelopeHeader(byte kind, ReadOnlyMemory<byte> recipient, ReadOnlyMemory<byte> publicKey, ReadOnlyMemory<byte> nonce,
+            public EnvelopeHeader(byte kind, ReadOnlyMemory<byte> recipient, ReadOnlyMemory<byte> publicKey, ReadOnlyMemory<byte> nonce,
                 ReadOnlyMemory<byte> bytes, ReadOnlyMemory<byte> cipher)
             {
                 Kind = kind;

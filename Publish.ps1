@@ -38,7 +38,7 @@ try {
             $distributionFiles.Add($destination)
         }
     }
-    foreach ($document in @('README.md', 'PROTOCOL.md')) {
+    foreach ($document in @('README.md', 'PROTOCOL.md', 'IMPLEMENTING.md')) {
         $destination = Join-Path $distributionDirectory $document
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot $document) -Destination $destination -Force
         $distributionFiles.Add($destination)

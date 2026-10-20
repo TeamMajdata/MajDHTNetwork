@@ -128,9 +128,8 @@ namespace MajDHTNetwork
                     {
                         throw new CryptographicException("Hello response sender, operation or correlation mismatch.");
                     }
-                    using var reader = new Wire(ReadResponseBody(response));
-                    var observed = ReadNatEndpoint(reader);
-                    reader.End();
+                    using var reader = new Wire(ResponseStatus.ReadResult(response.Body));
+                    var observed = HelloMessage.ReadResponse(reader);
                     // The configured endpoint answered authentically, which proves the responder is reachable there.
                     ObservePeer(response.Sender, endpoint.Address);
                     RecordObservation(response.Sender, endpoint.Address, transport, observed);
@@ -468,19 +467,17 @@ namespace MajDHTNetwork
         private async Task<LookupResult?> QueryLookupAsync(DHTPeer peer, byte mode, string target, CancellationToken cancellationToken)
         {
             using var body = new Wire();
-            body.PutByte(mode);
-            body.PutText(target);
+            FindMessage.WriteRequest(body, (FindMode)mode, target);
             try
             {
                 using var response = await RequestAsync(peer, Operation.Find, body.WrittenMemory, cancellationToken).ConfigureAwait(false);
                 using var reader = new Wire(response.Bytes);
-                var signedRecord = reader.Bytes(DHTRecord.MaxEncodedLength);
-                var record = signedRecord.Length == 0 ? null : DHTRecord.ParseCached(signedRecord);
-                var peers = ReadPeers(reader);
+                var found = FindMessage.ReadResponse(reader);
+                var record = found.Record;
+                var peers = found.Peers;
                 peers.RemoveAll(peer => !HasRequiredWork(peer));
-                var providers = ReadPeers(reader);
+                var providers = found.Providers;
                 providers.RemoveAll(peer => !HasRequiredWork(peer));
-                reader.End();
                 if (record != null && (mode != 1 || record.Key.ToString() != target || record.Length > _options.MaxFileSize))
                 {
                     throw new InvalidDataException("Lookup returned a record for an unrelated key or excessive size.");

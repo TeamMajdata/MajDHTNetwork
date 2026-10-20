@@ -68,6 +68,8 @@ and requires the DLL, XML documentation, README, protocol document and license.
 | `MajDHTNetwork.Tests.csproj`, `global.json`, `packages.lock.json`, `xunit.runner.json` | Test project, stable SDK selection, locked dependencies and runner parallelism. |
 | `ValidatePackage.ps1`, `ConsumerSmoke/Program.cs` | Isolated NuGet and loose-DLL consumption of distributed artifacts. |
 | `src/ProtocolTests.cs`, `src/UdpCookieTests.cs` | Identity, authenticated envelopes, malformed protocol input and address cookies. |
+| `src/ProtocolMessageTests.cs` | Round trips and rejection rules of the public operation codecs: response status, contact lists, Find, Store, Block, Relay, Hello, Punch, Probe and every Rendezvous action. |
+| `src/CustomNodeTests.cs`, `src/MinimalProtocolNode.cs` | A node written only against the public protocol API that serves, indexes, downloads from and is downloaded from by reference nodes. |
 | `src/ContactTests.cs`, `src/BootstrapTests.cs` | Contact reachability rules, Hello envelopes, address options, endpoint bootstrap and dual-stack listeners. |
 | `src/ReachabilityTests.cs` | External-address voting, independent dial-back verification and relay-hinted private nodes over distinct loopback hosts. |
 | `src/RoutingCustomizationTests.cs` | Default route ordering, custom routing-table initialization and result filtering, and a custom route selector forcing a relay path. |
@@ -113,6 +115,8 @@ and requires the DLL, XML documentation, README, protocol document and license.
   nullable semantics, constructor validation and borrowed/owned memory contracts.
 - Authenticated envelope round trips, recipient substitution, sender impersonation,
   ciphertext modification, nested relays and invalid wire lengths.
+- Public operation codecs shared with the reference node, and interoperability of a
+  custom node built only on the public API with `MajDHTNode` in both directions.
 - Publisher-scoped keys, signed-record modification, empty/exact/partial/odd
   Merkle geometry, changed blocks, wrong positions and modified proof paths.
 - Real three-node TCP-only and UDP-only discovery, indirect alias resolution,

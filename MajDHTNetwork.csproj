@@ -38,5 +38,6 @@
     <None Update="LICENSE" Pack="true" PackagePath="/" />
     <None Update="README.md" Pack="true" PackagePath="/" />
     <None Update="PROTOCOL.md" Pack="true" PackagePath="/" />
+    <None Update="IMPLEMENTING.md" Pack="true" PackagePath="/" />
   </ItemGroup>
 </Project>

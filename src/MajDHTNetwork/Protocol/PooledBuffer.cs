@@ -6,7 +6,7 @@ using System.Buffers;
 namespace MajDHTNetwork.Protocol
 {
     /// <summary>Owns a bounded pooled buffer and clears its contents before returning storage.</summary>
-    internal sealed class PooledBuffer : IMemoryOwner<byte>
+    public sealed class PooledBuffer : IMemoryOwner<byte>
     {
         /// <summary>The rented array while ownership is active.</summary>
         private byte[]? _buffer;
@@ -15,7 +15,7 @@ namespace MajDHTNetwork.Protocol
 
         /// <summary>Rents one buffer for a complete operation.</summary>
         /// <param name="length">The logical byte count.</param>
-        internal PooledBuffer(int length)
+        public PooledBuffer(int length)
         {
             _length = length;
             _buffer = ArrayPool<byte>.Shared.Rent(length);
@@ -28,7 +28,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Rents a buffer of exactly the given length and copies bytes into it.</summary>
         /// <param name="bytes">The bytes to copy, such as a datagram in a reusable receive buffer.</param>
         /// <returns>An owned buffer holding the copy.</returns>
-        internal static PooledBuffer Copy(ReadOnlySpan<byte> bytes)
+        public static PooledBuffer Copy(ReadOnlySpan<byte> bytes)
         {
             var buffer = new PooledBuffer(bytes.Length);
             bytes.CopyTo(buffer.Memory.Span);

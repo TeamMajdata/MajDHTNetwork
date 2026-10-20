@@ -7,10 +7,10 @@ using System.Net.Sockets;
 namespace MajDHTNetwork.Protocol
 {
     /// <summary>Classifies IP addresses by routing scope and compares their network prefixes.</summary>
-    internal static class NetworkScope
+    public static class NetworkScope
     {
         /// <summary>The routing scope of an address.</summary>
-        internal enum Scope
+        public enum Scope
         {
             /// <summary>A host-local loopback address.</summary>
             Loopback,
@@ -25,7 +25,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Copies an address from its bytes, so defensive copies do not format and parse text.</summary>
         /// <param name="address">The address to copy.</param>
         /// <returns>An independent equal address, including the IPv6 scope identifier.</returns>
-        internal static IPAddress CopyAddress(IPAddress address)
+        public static IPAddress CopyAddress(IPAddress address)
         {
             return address.AddressFamily == AddressFamily.InterNetworkV6
                 ? new IPAddress(address.GetAddressBytes(), address.ScopeId)
@@ -35,7 +35,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Copies an endpoint from its address bytes and port, so callers and handlers cannot mutate cached endpoints.</summary>
         /// <param name="endpoint">The endpoint to copy.</param>
         /// <returns>An independent equal endpoint.</returns>
-        internal static IPEndPoint CopyEndpoint(IPEndPoint endpoint)
+        public static IPEndPoint CopyEndpoint(IPEndPoint endpoint)
         {
             return new IPEndPoint(CopyAddress(endpoint.Address), endpoint.Port);
         }
@@ -43,7 +43,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Checks whether an address can identify one remote interface.</summary>
         /// <param name="address">The address to inspect.</param>
         /// <returns>Whether the address is a canonical unicast address.</returns>
-        internal static bool IsUnicast(IPAddress address)
+        public static bool IsUnicast(IPAddress address)
         {
             if (address.AddressFamily != AddressFamily.InterNetwork && address.AddressFamily != AddressFamily.InterNetworkV6)
             {
@@ -65,7 +65,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Checks whether an address is a wildcard listener address.</summary>
         /// <param name="address">The address to inspect.</param>
         /// <returns>Whether the address is the IPv4 or IPv6 wildcard.</returns>
-        internal static bool IsWildcard(IPAddress address)
+        public static bool IsWildcard(IPAddress address)
         {
             return address.Equals(IPAddress.Any) || address.Equals(IPAddress.IPv6Any);
         }
@@ -73,7 +73,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Classifies an address by routing scope.</summary>
         /// <param name="address">The unicast address.</param>
         /// <returns>The routing scope.</returns>
-        internal static Scope Classify(IPAddress address)
+        public static Scope Classify(IPAddress address)
         {
             if (address.IsIPv4MappedToIPv6)
             {
@@ -111,7 +111,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Gets a stable key for the operator network of an address, matching <see cref="SameNetwork"/>.</summary>
         /// <param name="address">The address.</param>
         /// <returns>The IPv4 /24 or IPv6 /32 prefix for non-loopback addresses, or the exact loopback address.</returns>
-        internal static string NetworkKey(IPAddress address)
+        public static string NetworkKey(IPAddress address)
         {
             if (address.IsIPv4MappedToIPv6)
             {
@@ -133,7 +133,7 @@ namespace MajDHTNetwork.Protocol
         /// Whether the address is globally routed; loopback, private and link-local peers share a network by design, for example
         /// on a LAN, and cannot be minted by a remote attacker.
         /// </returns>
-        internal static bool IsDiversityLimited(IPAddress address)
+        public static bool IsDiversityLimited(IPAddress address)
         {
             return Classify(address) == Scope.Global;
         }
@@ -145,7 +145,7 @@ namespace MajDHTNetwork.Protocol
         /// Whether the addresses share an IPv4 /24 or IPv6 /32 prefix; loopback addresses compare exactly so that
         /// distinct loopback hosts can model distinct networks.
         /// </returns>
-        internal static bool SameNetwork(IPAddress left, IPAddress right)
+        public static bool SameNetwork(IPAddress left, IPAddress right)
         {
             if (left.IsIPv4MappedToIPv6)
             {

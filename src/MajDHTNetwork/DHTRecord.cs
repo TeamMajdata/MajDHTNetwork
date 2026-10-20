@@ -15,7 +15,7 @@ namespace MajDHTNetwork
         /// <summary>The flag marking a withdrawal.</summary>
         private const byte WithdrawnFlag = 1;
         /// <summary>The maximum accepted encoded record length.</summary>
-        internal const int MaxEncodedLength = 2200;
+        public const int MaxEncodedLength = 2200;
         /// <summary>The maximum number of distinct records whose verification is cached process-wide.</summary>
         private const int CacheCapacity = 256;
         /// <summary>
@@ -117,7 +117,7 @@ namespace MajDHTNetwork
         /// <param name="revision">The monotonically increasing revision.</param>
         /// <param name="expiresAt">The publication expiry.</param>
         /// <returns>The verified signed record.</returns>
-        internal static DHTRecord Create(DHTIdentity identity, string name, string fileHash, string root, long length,
+        public static DHTRecord Create(DHTIdentity identity, string name, string fileHash, string root, long length,
             int blockSize, long revision, DateTimeOffset expiresAt)
         {
             return Sign(identity, name, 0, fileHash, root, length, blockSize, revision, expiresAt);
@@ -129,7 +129,7 @@ namespace MajDHTNetwork
         /// <param name="revision">A revision above every revision being withdrawn.</param>
         /// <param name="expiresAt">The withdrawal expiry, which must outlive the withdrawn publications.</param>
         /// <returns>The verified signed withdrawal.</returns>
-        internal static DHTRecord CreateWithdrawal(DHTIdentity identity, string name, long revision, DateTimeOffset expiresAt)
+        public static DHTRecord CreateWithdrawal(DHTIdentity identity, string name, long revision, DateTimeOffset expiresAt)
         {
             return Sign(identity, name, WithdrawnFlag, string.Empty, string.Empty, 0, 0, revision, expiresAt);
         }
@@ -169,7 +169,7 @@ namespace MajDHTNetwork
         /// <summary>Gets the encoded manifest length for caller-owned serialization buffers.</summary>
         public int EncodedLength => _encoded.Length;
         /// <summary>Gets an internal borrowed manifest view without allocating.</summary>
-        internal ReadOnlySpan<byte> Encoded => _encoded;
+        public ReadOnlySpan<byte> Encoded => _encoded;
 
         /// <summary>Copies the signed manifest into caller-owned storage without allocating.</summary>
         /// <param name="destination">At least EncodedLength writable bytes.</param>
@@ -204,7 +204,7 @@ namespace MajDHTNetwork
         /// <param name="encoded">The borrowed canonical record; it is never retained.</param>
         /// <returns>The authenticated, unexpired publication.</returns>
         /// <exception cref="InvalidDataException">The record is oversized or cannot be authenticated.</exception>
-        internal static DHTRecord ParseCached(ReadOnlyMemory<byte> encoded)
+        public static DHTRecord ParseCached(ReadOnlyMemory<byte> encoded)
         {
             if (encoded.Length > MaxEncodedLength)
             {
@@ -216,7 +216,7 @@ namespace MajDHTNetwork
         /// <summary>Checks whether another publication describes identical block geometry and content, or is also a withdrawal.</summary>
         /// <param name="other">The comparison publication.</param>
         /// <returns>Whether complete content metadata matches.</returns>
-        internal bool SameContent(DHTRecord other)
+        public bool SameContent(DHTRecord other)
         {
             return IsWithdrawn == other.IsWithdrawn && FileHash == other.FileHash && MerkleRoot == other.MerkleRoot
                 && Length == other.Length && BlockSize == other.BlockSize;

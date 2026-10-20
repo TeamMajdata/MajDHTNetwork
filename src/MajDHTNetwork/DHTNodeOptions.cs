@@ -102,7 +102,7 @@ namespace MajDHTNetwork
         /// <summary>Gets the validated listen address for an address family, or null when none is configured.</summary>
         /// <param name="family">The address family.</param>
         /// <returns>The configured listen address.</returns>
-        internal IPAddress? ListenAddress(AddressFamily family)
+        public IPAddress? ListenAddress(AddressFamily family)
         {
             foreach (var address in ListenAddresses)
             {
@@ -117,7 +117,7 @@ namespace MajDHTNetwork
         /// <summary>Validates options and returns a separate instance for node ownership.</summary>
         /// <returns>A validated snapshot.</returns>
         /// <exception cref="ArgumentException">An address, endpoint, port, limit or timeout is invalid.</exception>
-        internal DHTNodeOptions Snapshot()
+        public DHTNodeOptions Snapshot()
         {
             if ((TcpPort == null && UdpPort == null)
                 || TcpPort < 0 || TcpPort > 65535 || UdpPort < 0 || UdpPort > 65535

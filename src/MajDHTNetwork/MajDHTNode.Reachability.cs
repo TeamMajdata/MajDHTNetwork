@@ -37,8 +37,6 @@ namespace MajDHTNetwork
         private const int DialBackHelperAttempts = 3;
         /// <summary>The number of failed dial-backs, from distinct relay networks, that marks the node private.</summary>
         private const int PrivateFailureThreshold = 2;
-        /// <summary>The maximum contacts byte budget of one Find response list.</summary>
-        private const int ContactListBudget = 26000;
         /// <summary>The relay-observed endpoints keyed by reporter, address family and transport.</summary>
         private readonly Dictionary<(string Reporter, AddressFamily Family, DHTTransport Transport), ObservedEndpoint> _observations =
             new Dictionary<(string, AddressFamily, DHTTransport), ObservedEndpoint>();
@@ -440,30 +438,29 @@ namespace MajDHTNetwork
         private async Task<bool> DialBackAsync(DHTPeer relay, DHTTransport transport, CancellationToken cancellationToken)
         {
             var relayEndpoint = NatEndpoint(relay, transport) ?? throw new IOException("The relay has no endpoint for this transport.");
+            var localPort = _transport.PortFor(transport, relayEndpoint.AddressFamily);
+            if (localPort == 0)
+            {
+                throw new IOException("This node has no listener for the transport being verified.");
+            }
             using var body = new Wire();
-            body.PutByte(2);
-            body.PutLong(1);
-            body.PutLong(_transport.PortFor(transport, relayEndpoint.AddressFamily));
+            RendezvousMessage.WriteDialBackRequest(body, new[] { localPort });
             var response = await RequestNatAsync(relay, transport, body.WrittenMemory, cancellationToken).ConfigureAwait(false);
             DialBackJob job;
             string id;
-            using (var arrangement = response.Body)
-            using (var reader = new Wire(arrangement.Bytes))
+            using (var arrangementBody = response.Body)
+            using (var reader = new Wire(arrangementBody.Bytes))
             {
-                var observed = ReadNatEndpoint(reader);
-                var helper = reader.Text(64);
-                var nonce = reader.Bytes(16);
-                var expiresAt = DateTimeOffset.FromUnixTimeMilliseconds(reader.Long());
-                var ports = ReadProbePorts(reader);
-                reader.End();
-                Crypto.ParseHash(helper);
-                if (nonce.Length != 16 || helper == NodeId || helper == relay.NodeId || expiresAt > DateTimeOffset.UtcNow.AddMinutes(2))
+                var arrangement = RendezvousMessage.ReadDialBackResponse(reader);
+                var helper = arrangement.HelperId;
+                var expiresAt = arrangement.ExpiresAt;
+                if (helper == NodeId || helper == relay.NodeId || expiresAt > DateTimeOffset.UtcNow.AddMinutes(2))
                 {
                     throw new InvalidDataException("Invalid dial-back arrangement.");
                 }
-                RecordObservation(response.Peer, response.Endpoint.Address, transport, observed);
-                id = Crypto.Hex(nonce.Span);
-                job = new DialBackJob(helper, transport, observed.Address, ports, expiresAt);
+                RecordObservation(response.Peer, response.Endpoint.Address, transport, arrangement.Observed);
+                id = Crypto.Hex(arrangement.Nonce.Span);
+                job = new DialBackJob(helper, transport, arrangement.Observed.Address, arrangement.Ports, expiresAt);
                 lock (_gate)
                 {
                     if (_dialBacks.Count >= _options.MaxConcurrentRequests || _dialBacks.ContainsKey(id))
@@ -560,35 +557,18 @@ namespace MajDHTNetwork
                     throw new IOException("The dial-back request quota was reached.");
                 }
             }
-            var count = request.Long();
-            if (count < 0 || count > 2)
-            {
-                throw new InvalidDataException("Invalid dial-back candidate count.");
-            }
             var ports = new List<int> { source.Port };
-            for (var index = 0; index < count; index++)
+            foreach (var port in RendezvousMessage.ReadDialBackRequest(request))
             {
-                var port = request.Long();
-                if (port < 1 || port > 65535)
+                if (!ports.Contains(port))
                 {
-                    throw new InvalidDataException("Invalid dial-back candidate port.");
-                }
-                if (!ports.Contains((int)port))
-                {
-                    ports.Add((int)port);
+                    ports.Add(port);
                 }
             }
-            request.End();
             var nonce = Crypto.Random(16);
             var expiresAt = DateTimeOffset.UtcNow + _options.NatTraversalTimeout;
             using var assist = new Wire();
-            assist.PutByte(3);
-            assist.Put(packet.Sender.Encoded);
-            assist.PutByte((byte)transport);
-            assist.PutText(source.Address.ToString());
-            WriteProbePorts(assist, ports);
-            assist.Put(nonce);
-            assist.PutLong(expiresAt.ToUnixTimeMilliseconds());
+            RendezvousMessage.WriteDialBackAssistRequest(assist, new DialBackDelegation(packet.Sender, transport, source.Address, ports, nonce, expiresAt));
             var attempts = 0;
             foreach (var helper in DialBackHelpers(packet.Sender, source, transport))
             {
@@ -607,11 +587,7 @@ namespace MajDHTNetwork
                     Log(LogLevel.Debug, "Dial-back helper declined: ", exception);
                     continue;
                 }
-                PutNatEndpoint(response, source);
-                response.PutText(helper.NodeId);
-                response.Put(nonce);
-                response.PutLong(expiresAt.ToUnixTimeMilliseconds());
-                WriteProbePorts(response, ports);
+                RendezvousMessage.WriteDialBackResponse(response, new DialBackArrangement(source, helper.NodeId, nonce, expiresAt, ports));
                 return;
             }
             throw new IOException("No independent dial-back helper is available.");
@@ -696,15 +672,11 @@ namespace MajDHTNetwork
             {
                 throw new InvalidDataException("Only relays may delegate dial-backs.");
             }
-            var owner = DHTPeer.Parse(request.Bytes(DHTPeer.MaxEncodedLength));
-            var transport = request.Byte();
-            var targetText = request.Text(96);
-            var ports = ReadProbePorts(request);
-            var nonce = request.Bytes(16).ToArray();
-            var expiresAt = DateTimeOffset.FromUnixTimeMilliseconds(request.Long());
-            request.End();
-            if (transport > 1 || nonce.Length != 16 || owner.NodeId == NodeId || !HasRequiredWork(owner) || owner.NodeId == packet.Sender.NodeId
-                || !IPAddress.TryParse(targetText, out var target) || target.ToString() != targetText || !NetworkScope.IsUnicast(target)
+            var delegation = RendezvousMessage.ReadDialBackAssistRequest(request);
+            var owner = delegation.Owner;
+            var target = delegation.TargetAddress;
+            var expiresAt = delegation.ExpiresAt;
+            if (owner.NodeId == NodeId || !HasRequiredWork(owner) || owner.NodeId == packet.Sender.NodeId
                 || expiresAt <= DateTimeOffset.UtcNow || expiresAt > DateTimeOffset.UtcNow.AddMinutes(2))
             {
                 throw new InvalidDataException("Invalid dial-back delegation.");
@@ -725,7 +697,8 @@ namespace MajDHTNetwork
                 {
                     throw new IOException("The dial-back helper is busy.");
                 }
-                _probeWork.Add(SendProbesAsync(owner, (DHTTransport)transport, target, ports, nonce, expiresAt));
+                // The probes outlive the request frame, so the nonce is copied out of it.
+                _probeWork.Add(SendProbesAsync(owner, delegation.Transport, target, delegation.Ports, delegation.Nonce.ToArray(), expiresAt));
             }
         }
 
@@ -810,7 +783,7 @@ namespace MajDHTNetwork
         /// rejected probe is retried with a fresh request identifier. A relay can name any target, so the helper never sends
         /// more than <see cref="MaxProbeRounds"/> rounds and never probes longer than its own traversal budget.
         /// </remarks>
-        private async Task SendProbesAsync(DHTPeer owner, DHTTransport transport, IPAddress target, List<int> ports, byte[] nonce,
+        private async Task SendProbesAsync(DHTPeer owner, DHTTransport transport, IPAddress target, IReadOnlyList<int> ports, byte[] nonce,
             DateTimeOffset expiresAt)
         {
             await Task.Yield();
@@ -862,13 +835,12 @@ namespace MajDHTNetwork
             try
             {
                 using var body = new Wire();
-                body.Put(nonce);
-                body.PutLong(index);
+                ProbeMessage.WriteRequest(body, nonce, index);
                 var probe = new Packet(LocalPeer, Crypto.Random(16), (byte)Operation.Probe, body.ToArray());
                 var encoded = await _transport.ExchangeAtAsync(transport, endpoint, probe.Seal(_identity, owner), cancellationToken)
                     .ConfigureAwait(false);
                 using var response = AuthenticateResponse(encoded, owner, probe);
-                ReadResponseBody(response.Packet);
+                ResponseStatus.ReadResult(response.Packet.Body);
                 return true;
             }
             catch (Exception exception) when (IsPeerFailure(exception) || exception is InvalidOperationException)
@@ -885,55 +857,17 @@ namespace MajDHTNetwork
         private void DispatchProbe(Packet packet, DHTTransport transport)
         {
             using var reader = new Wire(packet.Body);
-            var nonce = reader.Bytes(16);
-            var index = reader.Long();
-            reader.End();
+            var probe = ProbeMessage.ReadRequest(reader);
             lock (_gate)
             {
-                if (nonce.Length != 16 || !_dialBacks.TryGetValue(Crypto.Hex(nonce.Span), out var job)
+                if (!_dialBacks.TryGetValue(Crypto.Hex(probe.Nonce.Span), out var job)
                     || job.HelperId != packet.Sender.NodeId || job.Transport != transport
-                    || index < 0 || index >= job.Ports.Count || job.ExpiresAt <= DateTimeOffset.UtcNow)
+                    || probe.PortIndex >= job.Ports.Count || job.ExpiresAt <= DateTimeOffset.UtcNow)
                 {
                     throw new InvalidDataException("The probe does not match a pending dial-back.");
                 }
-                job.Success.TrySetResult((int)index);
+                job.Success.TrySetResult(probe.PortIndex);
             }
-        }
-
-        /// <summary>Encodes a bounded dial-back candidate port list.</summary>
-        /// <param name="writer">The destination encoder.</param>
-        /// <param name="ports">One to three candidate ports.</param>
-        private static void WriteProbePorts(Wire writer, List<int> ports)
-        {
-            writer.PutLong(ports.Count);
-            foreach (var port in ports)
-            {
-                writer.PutLong(port);
-            }
-        }
-
-        /// <summary>Decodes a bounded dial-back candidate port list.</summary>
-        /// <param name="reader">The source decoder.</param>
-        /// <returns>One to three valid ports.</returns>
-        /// <exception cref="InvalidDataException">The list is empty, too long or contains an invalid port.</exception>
-        private static List<int> ReadProbePorts(Wire reader)
-        {
-            var count = reader.Long();
-            if (count < 1 || count > 3)
-            {
-                throw new InvalidDataException("Invalid dial-back port count.");
-            }
-            var ports = new List<int>((int)count);
-            for (var index = 0; index < count; index++)
-            {
-                var port = reader.Long();
-                if (port < 1 || port > 65535)
-                {
-                    throw new InvalidDataException("Invalid dial-back port.");
-                }
-                ports.Add((int)port);
-            }
-            return ports;
         }
 
         /// <summary>Announces local publications soon after the local contact changed, so provider indexes hold the new contact.</summary>
@@ -1014,7 +948,7 @@ namespace MajDHTNetwork
             /// <summary>Gets the relay-observed address being verified.</summary>
             internal IPAddress Address { get; }
             /// <summary>Gets the candidate ports.</summary>
-            internal List<int> Ports { get; }
+            internal IReadOnlyList<int> Ports { get; }
             /// <summary>Gets the job expiry.</summary>
             internal DateTimeOffset ExpiresAt { get; }
             /// <summary>Gets the signal carrying the index of the first port that a probe reached.</summary>
@@ -1026,7 +960,7 @@ namespace MajDHTNetwork
             /// <param name="address">The observed address.</param>
             /// <param name="ports">The candidate ports.</param>
             /// <param name="expiresAt">The expiry.</param>
-            internal DialBackJob(string helperId, DHTTransport transport, IPAddress address, List<int> ports, DateTimeOffset expiresAt)
+            internal DialBackJob(string helperId, DHTTransport transport, IPAddress address, IReadOnlyList<int> ports, DateTimeOffset expiresAt)
             {
                 HelperId = helperId;
                 Transport = transport;

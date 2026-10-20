@@ -332,47 +332,18 @@ namespace MajDHTNetwork
                 return new OwnedMemory((await ReadLocalBlockAsync(record, index, cancellationToken).ConfigureAwait(false)).Bytes);
             }
             using var body = new Wire();
-            body.Put(record.Encoded);
-            body.PutLong(index);
+            BlockMessage.WriteRequest(body, record, index);
             var response = await RequestAsync(provider, Operation.Block, body.WrittenMemory, cancellationToken, relay).ConfigureAwait(false);
             try
             {
-                return response.Narrow(VerifyRemoteBlock(record, index, response.Bytes));
+                using var reader = new Wire(response.Bytes);
+                return response.Narrow(BlockMessage.ReadResponse(reader, record, index));
             }
             catch
             {
                 response.Dispose();
                 throw;
             }
-        }
-
-        /// <summary>Parses a remote proof into stack storage and returns a verified borrowed block.</summary>
-        /// <param name="record">The trusted manifest.</param>
-        /// <param name="index">The requested block index.</param>
-        /// <param name="response">The owned decrypted response memory.</param>
-        /// <returns>A block view retaining the response owner.</returns>
-        private static ReadOnlyMemory<byte> VerifyRemoteBlock(DHTRecord record, int index, ReadOnlyMemory<byte> response)
-        {
-            using var reader = new Wire(response);
-            var bytes = reader.Bytes(record.BlockSize);
-            var count = reader.Long();
-            if (count < 0 || count > 20)
-            {
-                throw new InvalidDataException("Invalid Merkle proof size.");
-            }
-            Span<byte> proof = stackalloc byte[640];
-            for (var level = 0; level < count; level++)
-            {
-                var sibling = reader.Bytes(32);
-                if (sibling.Length != 32)
-                {
-                    throw new InvalidDataException("Invalid Merkle sibling length.");
-                }
-                sibling.Span.CopyTo(proof.Slice(level * 32, 32));
-            }
-            reader.End();
-            MerkleTree.Verify(record, index, bytes.Span, proof.Slice(0, (int)count * 32));
-            return bytes;
         }
 
         /// <summary>
@@ -498,7 +469,7 @@ namespace MajDHTNetwork
             }
             var accepted = 0;
             using var body = new Wire();
-            body.Put(record.Encoded);
+            StoreMessage.WriteRequest(body, record);
             foreach (var peer in peers.Values)
             {
                 try

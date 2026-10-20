@@ -12,7 +12,7 @@ using MajDHTNetwork.Protocol;
 
 namespace MajDHTNetwork.Transport
 {
-    internal sealed partial class SocketTransport
+    public sealed partial class SocketTransport
     {
         /// <summary>Enables a TCP listener and its active-open sockets to share a local endpoint.</summary>
         /// <param name="socket">The unbound TCP socket.</param>

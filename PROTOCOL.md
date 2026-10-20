@@ -10,6 +10,13 @@ are Unix seconds. Identifiers are 64 lowercase hexadecimal characters. There
 is no implicit string normalization. Maximum encrypted envelope: 60,000 bytes.
 The reference implementation rejects unsupported version strings.
 
+The library exposes this protocol as a public API: the envelope, the operation
+codecs, the Merkle tree, the identity work and the socket transport live in the
+`MajDHTNetwork.Protocol` and `MajDHTNetwork.Transport` namespaces, so an
+independent node implementation can reuse the reference encoders instead of
+re-implementing this document. See "Implementing a node with the protocol API"
+in [README.md](README.md).
+
 ## Identity and contacts
 
 Generate a 32-byte random Ed25519 seed. Node ID is lowercase SHA-256 of its

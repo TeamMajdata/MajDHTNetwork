@@ -12,15 +12,15 @@ namespace MajDHTNetwork
     public sealed class DHTPeer
     {
         /// <summary>The maximum accepted signed payload length.</summary>
-        internal const int MaxPayloadLength = 2048;
+        public const int MaxPayloadLength = 2048;
         /// <summary>The maximum accepted encoded contact length, including framing and signature.</summary>
-        internal const int MaxEncodedLength = 2200;
+        public const int MaxEncodedLength = 2200;
         /// <summary>The maximum number of advertised endpoints.</summary>
-        internal const int MaxEndpoints = 4;
+        public const int MaxEndpoints = 4;
         /// <summary>The maximum number of embedded relay hints.</summary>
-        internal const int MaxRelayHints = 3;
+        public const int MaxRelayHints = 3;
         /// <summary>The maximum accepted encoded length of one embedded relay hint.</summary>
-        internal const int MaxHintLength = 1024;
+        public const int MaxHintLength = 1024;
         /// <summary>The reachability bits that encode <see cref="DHTReachability"/>.</summary>
         private const byte ReachabilityMask = 0x03;
         /// <summary>The reachability bit marking an endpoint-dependent NAT mapping.</summary>
@@ -76,13 +76,13 @@ namespace MajDHTNetwork
         /// <summary>Gets whether the contact lease is still valid.</summary>
         public bool IsExpired => ExpiresAt <= DateTimeOffset.UtcNow;
         /// <summary>Gets a borrowed view of the owned immutable signed contact.</summary>
-        internal ReadOnlySpan<byte> Encoded => _encoded;
+        public ReadOnlySpan<byte> Encoded => _encoded;
         /// <summary>Gets the cached node digest without allocation.</summary>
-        internal ReadOnlySpan<byte> NodeHash => _nodeHash;
+        public ReadOnlySpan<byte> NodeHash => _nodeHash;
         /// <summary>Gets the signing public key for protocol verification.</summary>
-        internal ReadOnlyMemory<byte> SigningKey => _signingKey;
+        public ReadOnlyMemory<byte> SigningKey => _signingKey;
         /// <summary>Gets the agreement public key for envelope encryption.</summary>
-        internal ReadOnlyMemory<byte> AgreementKey => _agreementKey;
+        public ReadOnlyMemory<byte> AgreementKey => _agreementKey;
 
         /// <summary>Parses and verifies canonical contact bytes.</summary>
         /// <param name="encoded">The signed bytes.</param>
@@ -95,7 +95,7 @@ namespace MajDHTNetwork
         /// <param name="encoded">The borrowed signed bytes; they are never retained.</param>
         /// <returns>The verified, unexpired contact.</returns>
         /// <exception cref="InvalidDataException">The contact is malformed, expired or forged.</exception>
-        internal static DHTPeer Parse(ReadOnlyMemory<byte> encoded)
+        public static DHTPeer Parse(ReadOnlyMemory<byte> encoded)
         {
             if (encoded.Length > MaxEncodedLength)
             {
@@ -183,7 +183,7 @@ namespace MajDHTNetwork
         /// <param name="lifetime">The requested lease, shortened to the earliest relay hint expiry.</param>
         /// <returns>A verified contact.</returns>
         /// <exception cref="InvalidDataException">The resulting contact violates the contact rules.</exception>
-        internal static DHTPeer Create(DHTIdentity identity, IReadOnlyList<DHTEndpoint> endpoints, DHTCapabilities capabilities,
+        public static DHTPeer Create(DHTIdentity identity, IReadOnlyList<DHTEndpoint> endpoints, DHTCapabilities capabilities,
             DHTReachability reachability, bool endpointDependentMapping, IPAddress? externalAddress, IReadOnlyList<DHTPeer> relayHints,
             TimeSpan lifetime)
         {
@@ -227,7 +227,7 @@ namespace MajDHTNetwork
         /// <param name="udpPort">The UDP port or zero.</param>
         /// <param name="capabilities">The permitted node services.</param>
         /// <returns>A verified contact with unknown reachability.</returns>
-        internal static DHTPeer Create(DHTIdentity identity, IPAddress address, int tcpPort, int udpPort, DHTCapabilities capabilities)
+        public static DHTPeer Create(DHTIdentity identity, IPAddress address, int tcpPort, int udpPort, DHTCapabilities capabilities)
         {
             return Create(identity, new[] { new DHTEndpoint(address, tcpPort, udpPort, DHTEndpointFlags.None) }, capabilities,
                 DHTReachability.Unknown, false, null, Array.Empty<DHTPeer>(), TimeSpan.FromDays(1));
@@ -236,7 +236,7 @@ namespace MajDHTNetwork
         /// <summary>Checks whether two contacts advertise the same reachability, endpoints and relays.</summary>
         /// <param name="other">The other contact.</param>
         /// <returns>Whether only the sequence, lease or signature differ.</returns>
-        internal bool SameAdvertisement(DHTPeer other)
+        public bool SameAdvertisement(DHTPeer other)
         {
             if (Capabilities != other.Capabilities || Reachability != other.Reachability
                 || HasEndpointDependentMapping != other.HasEndpointDependentMapping

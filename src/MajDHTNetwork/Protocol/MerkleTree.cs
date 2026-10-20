@@ -8,21 +8,21 @@ using System.Security.Cryptography;
 namespace MajDHTNetwork.Protocol
 {
     /// <summary>Stores a domain-separated Merkle tree in one contiguous owned node buffer.</summary>
-    internal sealed class MerkleTree
+    public sealed class MerkleTree
     {
         /// <summary>The complete immutable tree, with levels packed from leaves to root.</summary>
         private readonly byte[] _nodes;
         /// <summary>The byte offset of each level.</summary>
         private readonly int[] _offsets;
         /// <summary>Gets the cached canonical root identifier.</summary>
-        internal string Root { get; }
+        public string Root { get; }
         /// <summary>Gets the leaf count.</summary>
-        internal int Count { get; }
+        public int Count { get; }
 
         /// <summary>Builds a tree from contiguous 32-byte leaf digests.</summary>
         /// <param name="leaves">At least one complete SHA-256 leaf digest.</param>
         /// <exception cref="ArgumentException">The input has no complete leaves.</exception>
-        internal MerkleTree(ReadOnlySpan<byte> leaves)
+        public MerkleTree(ReadOnlySpan<byte> leaves)
         {
             if (leaves.Length == 0 || (leaves.Length % 32) != 0)
             {
@@ -59,7 +59,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Creates an owned leaf digest for callers needing retained storage.</summary>
         /// <param name="bytes">The raw block.</param>
         /// <returns>The 32-byte leaf.</returns>
-        internal static byte[] Leaf(ReadOnlySpan<byte> bytes)
+        public static byte[] Leaf(ReadOnlySpan<byte> bytes)
         {
             var digest = new byte[32];
             Leaf(bytes, digest);
@@ -70,7 +70,7 @@ namespace MajDHTNetwork.Protocol
         /// <param name="bytes">The raw block.</param>
         /// <param name="destination">At least 32 writable digest bytes.</param>
         /// <exception cref="ArgumentException">The destination is too short.</exception>
-        internal static void Leaf(ReadOnlySpan<byte> bytes, Span<byte> destination)
+        public static void Leaf(ReadOnlySpan<byte> bytes, Span<byte> destination)
         {
             Crypto.HashPrefixed(0, bytes, destination);
         }
@@ -92,7 +92,7 @@ namespace MajDHTNetwork.Protocol
         /// <param name="writer">The contiguous leaf writer.</param>
         /// <param name="block">The borrowed raw block.</param>
         /// <returns>The lowercase leaf hash.</returns>
-        internal static string AppendLeaf(Wire writer, ReadOnlySpan<byte> block)
+        public static string AppendLeaf(Wire writer, ReadOnlySpan<byte> block)
         {
             Span<byte> digest = stackalloc byte[32];
             Leaf(block, digest);
@@ -103,7 +103,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Gets the storage identifier of one retained leaf.</summary>
         /// <param name="index">The block index.</param>
         /// <returns>The lowercase leaf digest.</returns>
-        internal string LeafId(int index)
+        public string LeafId(int index)
         {
             return Crypto.Hex(_nodes.AsSpan(index * 32, 32));
         }
@@ -111,7 +111,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Writes an authentication path directly into an operation buffer.</summary>
         /// <param name="writer">The operation writer.</param>
         /// <param name="index">The block index.</param>
-        internal void WriteProof(Wire writer, int index)
+        public void WriteProof(Wire writer, int index)
         {
             writer.PutLong(_offsets.Length - 1);
             var width = Count;
@@ -126,7 +126,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Creates one contiguous proof when a caller needs to retain it.</summary>
         /// <param name="index">The block index.</param>
         /// <returns>The packed sibling digests.</returns>
-        internal ReadOnlyMemory<byte> Proof(int index)
+        public ReadOnlyMemory<byte> Proof(int index)
         {
             var proof = new byte[(_offsets.Length - 1) * 32];
             var width = Count;
@@ -156,7 +156,7 @@ namespace MajDHTNetwork.Protocol
         /// <param name="record">The signed geometry.</param>
         /// <param name="index">The block index.</param>
         /// <param name="bytes">The stored block.</param>
-        internal void VerifyLocal(DHTRecord record, int index, ReadOnlySpan<byte> bytes)
+        public void VerifyLocal(DHTRecord record, int index, ReadOnlySpan<byte> bytes)
         {
             CheckGeometry(record, index, bytes.Length);
             Span<byte> digest = stackalloc byte[32];
@@ -173,7 +173,7 @@ namespace MajDHTNetwork.Protocol
         /// <param name="bytes">The raw block.</param>
         /// <param name="proof">Packed 32-byte sibling digests.</param>
         /// <exception cref="InvalidDataException">The geometry, proof or content is invalid.</exception>
-        internal static void Verify(DHTRecord record, int index, ReadOnlySpan<byte> bytes, ReadOnlySpan<byte> proof)
+        public static void Verify(DHTRecord record, int index, ReadOnlySpan<byte> bytes, ReadOnlySpan<byte> proof)
         {
             CheckGeometry(record, index, bytes.Length);
             var levels = 0;

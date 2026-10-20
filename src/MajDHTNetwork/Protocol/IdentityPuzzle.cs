@@ -16,14 +16,14 @@ namespace MajDHTNetwork.Protocol
     /// Argon2id over its node digest. Because the puzzle has no separate nonce, every candidate key costs one evaluation, so
     /// grinding an identifier towards a chosen position multiplies the cost instead of adding to it.
     /// </summary>
-    internal static class IdentityPuzzle
+    public static class IdentityPuzzle
     {
         /// <summary>The Argon2id memory cost in KiB, which limits the advantage of massively parallel hardware.</summary>
-        internal const int MemoryKiB = 1024;
+        public const int MemoryKiB = 1024;
         /// <summary>The Argon2id iteration count.</summary>
-        internal const int Iterations = 1;
+        public const int Iterations = 1;
         /// <summary>The maximum process-wide evaluations of uncached identities per second; excess identities count as zero work.</summary>
-        internal const int EvaluationsPerSecond = 128;
+        public const int EvaluationsPerSecond = 128;
         /// <summary>The maximum cached identities.</summary>
         private const int CacheCapacity = 16384;
         /// <summary>The domain-separating Argon2id salt.</summary>
@@ -44,7 +44,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Computes the work of a node digest without caching or rate limiting.</summary>
         /// <param name="nodeHash">The 32-byte node digest.</param>
         /// <returns>The number of leading zero bits of the Argon2id output.</returns>
-        internal static int Evaluate(ReadOnlySpan<byte> nodeHash)
+        public static int Evaluate(ReadOnlySpan<byte> nodeHash)
         {
             var parameters = new Argon2Parameters.Builder(Argon2Parameters.Argon2id)
                 .WithVersion(Argon2Parameters.Version13)
@@ -66,7 +66,7 @@ namespace MajDHTNetwork.Protocol
         /// <param name="nodeId">The node identifier used as the cache key.</param>
         /// <param name="nodeHash">The 32-byte node digest.</param>
         /// <returns>The work, or zero when the identity is uncached and the evaluation budget of this second is spent.</returns>
-        internal static int Work(string nodeId, ReadOnlySpan<byte> nodeHash)
+        public static int Work(string nodeId, ReadOnlySpan<byte> nodeHash)
         {
             lock (s_gate)
             {
@@ -106,7 +106,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Records the known work of an identity, for example one this process generated.</summary>
         /// <param name="nodeId">The node identifier.</param>
         /// <param name="work">The evaluated work.</param>
-        internal static void Remember(string nodeId, int work)
+        public static void Remember(string nodeId, int work)
         {
             lock (s_gate)
             {
@@ -128,7 +128,7 @@ namespace MajDHTNetwork.Protocol
         /// <param name="cancellationToken">Cancels the search.</param>
         /// <returns>The 32-byte seed of a qualifying identity and its work.</returns>
         /// <exception cref="OperationCanceledException">The search was cancelled.</exception>
-        internal static (byte[] Seed, int Work) Search(int bits, CancellationToken cancellationToken)
+        public static (byte[] Seed, int Work) Search(int bits, CancellationToken cancellationToken)
         {
             if (bits <= 0)
             {

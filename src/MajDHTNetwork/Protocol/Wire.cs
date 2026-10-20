@@ -9,10 +9,10 @@ using System.Text;
 namespace MajDHTNetwork.Protocol
 {
     /// <summary>Writes canonical values into a pooled buffer or reads borrowed immutable memory without copying fields.</summary>
-    internal sealed class Wire : IDisposable
+    public sealed class Wire : IDisposable
     {
         /// <summary>The protocol-wide maximum encrypted datagram size.</summary>
-        internal const int MaxPacket = 60000;
+        public const int MaxPacket = 60000;
         /// <summary>The strict UTF-8 codec used by canonical signatures.</summary>
         private static readonly UTF8Encoding s_utf8 = new UTF8Encoding(false, true);
         /// <summary>The owned pooled writer buffer, or null for a reader or disposed writer.</summary>
@@ -27,27 +27,27 @@ namespace MajDHTNetwork.Protocol
         private bool _disposed;
 
         /// <summary>Creates an initially small pooled writer.</summary>
-        internal Wire()
+        public Wire()
         {
             _buffer = ArrayPool<byte>.Shared.Rent(256);
         }
 
         /// <summary>Creates a zero-copy reader whose source must remain stable throughout use.</summary>
         /// <param name="bytes">The borrowed input memory.</param>
-        internal Wire(ReadOnlyMemory<byte> bytes)
+        public Wire(ReadOnlyMemory<byte> bytes)
         {
             _input = bytes;
             _reading = true;
         }
 
         /// <summary>Gets the unread input byte count.</summary>
-        internal int Remaining => _reading ? _input.Length - _position : 0;
+        public int Remaining => _reading ? _input.Length - _position : 0;
         /// <summary>Gets the number of encoded bytes.</summary>
-        internal int Length => _position;
+        public int Length => _position;
         /// <summary>Gets borrowed encoded memory, valid until the writer grows or is disposed.</summary>
-        internal ReadOnlyMemory<byte> WrittenMemory => Buffer.AsMemory(0, _position);
+        public ReadOnlyMemory<byte> WrittenMemory => Buffer.AsMemory(0, _position);
         /// <summary>Gets borrowed encoded bytes, valid until the writer grows or is disposed.</summary>
-        internal ReadOnlySpan<byte> WrittenSpan => Buffer.AsSpan(0, _position);
+        public ReadOnlySpan<byte> WrittenSpan => Buffer.AsSpan(0, _position);
         /// <summary>Gets the live writer buffer while rejecting mode or lifetime misuse.</summary>
         private byte[] Buffer
         {
@@ -84,7 +84,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Reserves writable array-backed memory for a legacy cryptographic provider.</summary>
         /// <param name="count">The exact byte count to reserve.</param>
         /// <returns>A borrowed destination valid until the writer grows or is disposed.</returns>
-        internal Memory<byte> Allocate(int count)
+        public Memory<byte> Allocate(int count)
         {
             var offset = _position;
             Reserve(count);
@@ -93,7 +93,7 @@ namespace MajDHTNetwork.Protocol
 
         /// <summary>Writes one byte.</summary>
         /// <param name="value">The value.</param>
-        internal void PutByte(byte value)
+        public void PutByte(byte value)
         {
             Reserve(1)[0] = value;
         }
@@ -101,7 +101,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Reads one byte.</summary>
         /// <returns>The next byte.</returns>
         /// <exception cref="InvalidDataException">The input is truncated.</exception>
-        internal byte Byte()
+        public byte Byte()
         {
             if (!_reading || _disposed || Remaining < 1)
             {
@@ -112,7 +112,7 @@ namespace MajDHTNetwork.Protocol
 
         /// <summary>Writes a signed 64-bit big-endian integer.</summary>
         /// <param name="value">The integer.</param>
-        internal void PutLong(long value)
+        public void PutLong(long value)
         {
             BinaryPrimitives.WriteInt64BigEndian(Reserve(8), value);
         }
@@ -120,7 +120,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Reads a signed 64-bit big-endian integer.</summary>
         /// <returns>The decoded integer.</returns>
         /// <exception cref="InvalidDataException">The integer is truncated.</exception>
-        internal long Long()
+        public long Long()
         {
             if (!_reading || _disposed || Remaining < 8)
             {
@@ -133,7 +133,7 @@ namespace MajDHTNetwork.Protocol
 
         /// <summary>Writes a length-prefixed borrowed byte sequence.</summary>
         /// <param name="bytes">The sequence.</param>
-        internal void Put(ReadOnlySpan<byte> bytes)
+        public void Put(ReadOnlySpan<byte> bytes)
         {
             PutLong(bytes.Length);
             PutRaw(bytes);
@@ -141,14 +141,14 @@ namespace MajDHTNetwork.Protocol
 
         /// <summary>Writes raw bytes without a prefix.</summary>
         /// <param name="bytes">The raw sequence.</param>
-        internal void PutRaw(ReadOnlySpan<byte> bytes)
+        public void PutRaw(ReadOnlySpan<byte> bytes)
         {
             bytes.CopyTo(Reserve(bytes.Length));
         }
 
         /// <summary>Writes a length-prefixed lowercase hexadecimal identifier directly from its digest without a string.</summary>
         /// <param name="digest">The digest to format.</param>
-        internal void PutHex(ReadOnlySpan<byte> digest)
+        public void PutHex(ReadOnlySpan<byte> digest)
         {
             PutLong(digest.Length * 2);
             Crypto.HexTo(digest, Reserve(digest.Length * 2));
@@ -158,7 +158,7 @@ namespace MajDHTNetwork.Protocol
         /// <param name="expected">The expected label bytes.</param>
         /// <returns>Whether the value equals the label.</returns>
         /// <exception cref="InvalidDataException">The value is longer than the label or truncated.</exception>
-        internal bool Tag(ReadOnlySpan<byte> expected)
+        public bool Tag(ReadOnlySpan<byte> expected)
         {
             return Bytes(expected.Length).Span.SequenceEqual(expected);
         }
@@ -167,7 +167,7 @@ namespace MajDHTNetwork.Protocol
         /// <param name="limit">The maximum accepted length.</param>
         /// <returns>A borrowed immutable slice retaining its input owner.</returns>
         /// <exception cref="InvalidDataException">The value is negative, too large or truncated.</exception>
-        internal ReadOnlyMemory<byte> Bytes(int limit)
+        public ReadOnlyMemory<byte> Bytes(int limit)
         {
             var length = Long();
             if (length < 0 || length > limit || length > Remaining)
@@ -181,7 +181,7 @@ namespace MajDHTNetwork.Protocol
 
         /// <summary>Writes UTF-8 directly into the destination without a temporary encoded array.</summary>
         /// <param name="text">The text.</param>
-        internal void PutText(string text)
+        public void PutText(string text)
         {
             var count = s_utf8.GetByteCount(text);
             PutLong(count);
@@ -191,14 +191,14 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Reads a bounded strict UTF-8 string.</summary>
         /// <param name="limit">The byte limit.</param>
         /// <returns>The decoded text.</returns>
-        internal string Text(int limit)
+        public string Text(int limit)
         {
             return s_utf8.GetString(Bytes(limit).Span);
         }
 
         /// <summary>Rejects trailing bytes in a canonical input value.</summary>
         /// <exception cref="InvalidDataException">Unconsumed bytes remain.</exception>
-        internal void End()
+        public void End()
         {
             if (Remaining != 0)
             {
@@ -208,7 +208,7 @@ namespace MajDHTNetwork.Protocol
 
         /// <summary>Makes one owned copy when bytes must outlive the pooled writer.</summary>
         /// <returns>An independently owned encoded array.</returns>
-        internal byte[] ToArray()
+        public byte[] ToArray()
         {
             return WrittenSpan.ToArray();
         }

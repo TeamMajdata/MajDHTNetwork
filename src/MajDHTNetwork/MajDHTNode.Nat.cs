@@ -14,7 +14,7 @@ namespace MajDHTNetwork
     public sealed partial class MajDHTNode
     {
         /// <summary>The immutable empty-poll arguments reused by every registration refresh.</summary>
-        private static readonly byte[] s_natRegistration = new byte[] { 0 };
+        private static readonly byte[] s_natRegistration = new byte[] { (byte)RendezvousAction.Register };
         /// <summary>The bounded observed registrations hosted by a relay.</summary>
         private readonly Dictionary<string, NatRegistration> _natRegistrations = new Dictionary<string, NatRegistration>();
         /// <summary>The bounded client registration loops owned by this node.</summary>
@@ -135,13 +135,11 @@ namespace MajDHTNetwork
                 // Refresh this exact mapping before asking the relay to distribute it.
                 await RegisterNatTransportAsync(relay, transport, timeout.Token).ConfigureAwait(false);
                 using var body = new Wire();
-                body.PutByte(1);
-                body.PutText(peer.NodeId);
+                RendezvousMessage.WriteIntroduceRequest(body, peer.NodeId);
                 var response = await RequestNatAsync(relay, transport, body.WrittenMemory, timeout.Token).ConfigureAwait(false);
                 using var introduction = response.Body;
                 using var reader = new Wire(introduction.Bytes);
-                var invitation = ReadNatInvitation(reader, transport);
-                reader.End();
+                var invitation = ToNatInvitation(RendezvousMessage.ReadIntroduceResponse(reader), transport);
                 if (invitation.Peer.NodeId != peer.NodeId)
                 {
                     throw new InvalidDataException("The rendezvous target was substituted.");
@@ -287,15 +285,9 @@ namespace MajDHTNetwork
             var response = await RequestNatAsync(relay, transport, s_natRegistration, cancellationToken).ConfigureAwait(false);
             using var body = response.Body;
             using var reader = new Wire(body.Bytes);
-            var observed = ReadNatEndpoint(reader);
-            RecordObservation(response.Peer, response.Endpoint.Address, transport, observed);
-            var hasInvitation = reader.Byte();
-            if (hasInvitation > 1)
-            {
-                throw new InvalidDataException("Invalid rendezvous poll response.");
-            }
-            NatInvitation? invitation = hasInvitation == 0 ? null : ReadNatInvitation(reader, transport);
-            reader.End();
+            var poll = RendezvousMessage.ReadPollResponse(reader);
+            RecordObservation(response.Peer, response.Endpoint.Address, transport, poll.Observed);
+            NatInvitation? invitation = poll.Introduction.HasValue ? ToNatInvitation(poll.Introduction.Value, transport) : null;
             if (invitation.HasValue)
             {
                 StartNatSession(invitation.Value, _lifetime.Token);
@@ -381,13 +373,13 @@ namespace MajDHTNetwork
             {
                 throw new IOException("Rendezvous assistance requires relay capability.");
             }
-            var action = request.Byte();
+            var action = RendezvousMessage.ReadAction(request);
             switch (action)
             {
-                case 2:
+                case RendezvousAction.DialBack:
                     await DispatchDialBackAsync(packet, request, transport, source, response, cancellationToken).ConfigureAwait(false);
                     return;
-                case 3:
+                case RendezvousAction.DialBackAssist:
                     DispatchDialBackAssist(packet, request);
                     return;
                 default:
@@ -399,19 +391,26 @@ namespace MajDHTNetwork
         /// <summary>Executes authenticated relay registration or introduction using the actual transport source.</summary>
         /// <param name="packet">The authenticated requester.</param>
         /// <param name="request">The operation arguments after the action byte.</param>
-        /// <param name="action">Zero to register and poll, or one to request an introduction.</param>
+        /// <param name="action">Register to refresh and poll, or Introduce to request an introduction.</param>
         /// <param name="transport">The receiving transport.</param>
         /// <param name="source">The socket's validated remote endpoint.</param>
         /// <param name="response">The encoder receiving the observed mapping or peer introduction.</param>
         /// <exception cref="IOException">A mapping is absent, or a quota was reached.</exception>
         /// <exception cref="InvalidDataException">The request is invalid.</exception>
-        private void DispatchRendezvous(Packet packet, Wire request, byte action, DHTTransport transport, IPEndPoint source, Wire response)
+        private void DispatchRendezvous(Packet packet, Wire request, RendezvousAction action, DHTTransport transport, IPEndPoint source, Wire response)
         {
-            var targetId = action == 1 ? request.Text(64) : string.Empty;
-            request.End();
-            if (action > 1 || targetId == packet.Sender.NodeId)
+            var targetId = string.Empty;
+            if (action == RendezvousAction.Introduce)
             {
-                throw new InvalidDataException("Invalid rendezvous action or target.");
+                targetId = RendezvousMessage.ReadIntroduceRequest(request);
+            }
+            else
+            {
+                RendezvousMessage.ReadRegisterRequest(request);
+            }
+            if (targetId == packet.Sender.NodeId)
+            {
+                throw new InvalidDataException("Invalid rendezvous target.");
             }
             lock (_gate)
             {
@@ -424,7 +423,7 @@ namespace MajDHTNetwork
                 }
                 if (!_natRegistrations.TryGetValue(packet.Sender.NodeId, out var sender))
                 {
-                    if (action != 0 || _natRegistrations.Count >= _options.MaxNatRegistrations)
+                    if (action != RendezvousAction.Register || _natRegistrations.Count >= _options.MaxNatRegistrations)
                     {
                         throw new IOException("Rendezvous registration is absent or the registry is full.");
                     }
@@ -433,23 +432,18 @@ namespace MajDHTNetwork
                 }
                 sender.Peer = packet.Sender;
                 sender.Bindings[transport] = new NatRoute(CopyEndpoint(source), expiry);
-                if (action == 0)
+                if (action == RendezvousAction.Register)
                 {
-                    PutNatEndpoint(response, source);
                     var inbox = sender.Inbox(transport);
                     while (inbox.Count != 0 && inbox.Peek().ExpiresAt <= now)
                     {
                         inbox.Dequeue();
                     }
-                    response.PutByte((byte)(inbox.Count == 0 ? 0 : 1));
-                    if (inbox.Count != 0)
-                    {
-                        PutNatInvitation(response, inbox.Dequeue());
-                    }
+                    RendezvousIntroduction? pending = inbox.Count == 0 ? null : ToIntroduction(inbox.Dequeue());
+                    RendezvousMessage.WritePollResponse(response, source, pending);
                 }
                 else
                 {
-                    Crypto.ParseHash(targetId);
                     if (!_natRegistrations.TryGetValue(targetId, out var target)
                         || !target.Bindings.TryGetValue(transport, out var binding) || binding.ExpiresAt <= now)
                     {
@@ -475,7 +469,7 @@ namespace MajDHTNetwork
                         ticketExpiry = binding.ExpiresAt;
                     }
                     inbox.Enqueue(new NatInvitation(packet.Sender, transport, CopyEndpoint(source), token, ticketExpiry));
-                    PutNatInvitation(response, new NatInvitation(target.Peer, transport, binding.Endpoint, token, ticketExpiry));
+                    RendezvousMessage.WriteIntroduction(response, new RendezvousIntroduction(target.Peer, binding.Endpoint, token, ticketExpiry));
                 }
             }
         }
@@ -487,13 +481,10 @@ namespace MajDHTNetwork
         /// <exception cref="InvalidDataException">The ticket, identity, transport or source endpoint does not match.</exception>
         private void DispatchPunch(Packet packet, DHTTransport transport, IPEndPoint source)
         {
-            if (packet.Body.Length != 16)
-            {
-                throw new InvalidDataException("A direct probe requires a 128-bit introduction ticket.");
-            }
+            var ticket = PunchMessage.ReadRequest(packet.Body);
             lock (_gate)
             {
-                if (!_natSessions.TryGetValue(Crypto.Hex(packet.Body.Span), out var session)
+                if (!_natSessions.TryGetValue(Crypto.Hex(ticket.Span), out var session)
                     || session.Invitation.ExpiresAt <= DateTimeOffset.UtcNow || session.Invitation.Peer.NodeId != packet.Sender.NodeId
                     || session.Invitation.Transport != transport || !session.Invitation.Endpoint.Equals(source))
                 {
@@ -560,7 +551,7 @@ namespace MajDHTNetwork
                         var encoded = await _transport.PunchAsync(invitation.Transport, invitation.Endpoint,
                             request.Seal(_identity, invitation.Peer), timeout.Token).ConfigureAwait(false);
                         using var response = AuthenticateResponse(encoded, invitation.Peer, request);
-                        ReadResponseBody(response.Packet);
+                        ResponseStatus.ReadResult(response.Packet.Body);
                         lock (_gate)
                         {
                             RememberNatRoute(invitation.Peer, invitation.Transport, invitation.Endpoint);
@@ -801,61 +792,30 @@ namespace MajDHTNetwork
             return NetworkScope.CopyEndpoint(endpoint);
         }
 
-        /// <summary>Encodes a relay-observed endpoint.</summary>
-        /// <param name="writer">The operation encoder.</param>
-        /// <param name="endpoint">The validated endpoint.</param>
-        private static void PutNatEndpoint(Wire writer, IPEndPoint endpoint)
+        /// <summary>Converts a queued introduction into its wire form.</summary>
+        /// <param name="invitation">The queued introduction.</param>
+        /// <returns>The introduction as the requester reads it.</returns>
+        private static RendezvousIntroduction ToIntroduction(NatInvitation invitation)
         {
-            writer.PutText(endpoint.Address.ToString());
-            writer.PutLong(endpoint.Port);
+            return new RendezvousIntroduction(invitation.Peer, invitation.Endpoint, invitation.Token, invitation.ExpiresAt);
         }
 
-        /// <summary>Decodes a bounded canonical unicast endpoint.</summary>
-        /// <param name="reader">The operation decoder.</param>
-        /// <returns>The observed endpoint.</returns>
-        /// <exception cref="InvalidDataException">The address or port is invalid.</exception>
-        private static IPEndPoint ReadNatEndpoint(Wire reader)
-        {
-            var text = reader.Text(96);
-            var port = reader.Long();
-            if (!IPAddress.TryParse(text, out var address) || address.ToString() != text || address.IsIPv6Multicast
-                || address.Equals(IPAddress.Any) || address.Equals(IPAddress.IPv6Any) || address.Equals(IPAddress.None)
-                || address.Equals(IPAddress.Broadcast) || port < 1 || port > 65535)
-            {
-                throw new InvalidDataException("Invalid rendezvous endpoint.");
-            }
-            return new IPEndPoint(address, (int)port);
-        }
-
-        /// <summary>Encodes a short-lived introduction shared by exactly two peer identities.</summary>
-        /// <param name="writer">The operation encoder.</param>
-        /// <param name="invitation">The bounded ticket.</param>
-        private static void PutNatInvitation(Wire writer, NatInvitation invitation)
-        {
-            writer.Put(invitation.Peer.Encoded);
-            PutNatEndpoint(writer, invitation.Endpoint);
-            writer.Put(invitation.Token.Span);
-            writer.PutLong(invitation.ExpiresAt.ToUnixTimeMilliseconds());
-        }
-
-        /// <summary>Decodes and validates an introduction from an authenticated relay.</summary>
-        /// <param name="reader">The operation decoder.</param>
+        /// <summary>Validates an introduction from an authenticated relay against this node's identity, listeners and policies.</summary>
+        /// <param name="introduction">The decoded introduction.</param>
         /// <param name="transport">The transport observed by this registration.</param>
         /// <returns>An owned ticket and verified peer contact.</returns>
-        /// <exception cref="InvalidDataException">The ticket is expired, malformed, local, or uses another address family.</exception>
-        private NatInvitation ReadNatInvitation(Wire reader, DHTTransport transport)
+        /// <exception cref="InvalidDataException">The ticket is expired, local, below the required work, or uses another address family.</exception>
+        private NatInvitation ToNatInvitation(RendezvousIntroduction introduction, DHTTransport transport)
         {
-            var peer = DHTPeer.Parse(reader.Bytes(DHTPeer.MaxEncodedLength));
-            var endpoint = ReadNatEndpoint(reader);
-            var token = reader.Bytes(16);
-            var expiresAt = DateTimeOffset.FromUnixTimeMilliseconds(reader.Long());
-            if (token.Length != 16 || peer.NodeId == NodeId || !HasRequiredWork(peer) || _transport.PortFor(transport, endpoint.AddressFamily) == 0
+            var peer = introduction.Peer;
+            var expiresAt = introduction.ExpiresAt;
+            if (peer.NodeId == NodeId || !HasRequiredWork(peer) || _transport.PortFor(transport, introduction.Endpoint.AddressFamily) == 0
                 || expiresAt <= DateTimeOffset.UtcNow || expiresAt > DateTimeOffset.UtcNow.AddMinutes(2)
                 || expiresAt > peer.ExpiresAt || !MaySupportTransport(peer, transport))
             {
                 throw new InvalidDataException("Invalid or expired rendezvous introduction.");
             }
-            return new NatInvitation(peer, transport, endpoint, token.ToArray(), expiresAt);
+            return new NatInvitation(peer, transport, introduction.Endpoint, introduction.Ticket.ToArray(), expiresAt);
         }
 
         /// <summary>Owns a relay's mutable registration lease and bounded transport inboxes.</summary>

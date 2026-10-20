@@ -5,14 +5,14 @@ using System.Collections.Generic;
 namespace MajDHTNetwork.Protocol
 {
     /// <summary>Orders contacts by XOR distance to one target using their cached digests.</summary>
-    internal sealed class XorDistanceComparer : IComparer<DHTPeer>
+    public sealed class XorDistanceComparer : IComparer<DHTPeer>
     {
         /// <summary>The target digest reused for every comparison.</summary>
         private readonly byte[] _target;
 
         /// <summary>Parses a target once for an entire sort.</summary>
         /// <param name="target">The canonical target.</param>
-        internal XorDistanceComparer(string target)
+        public XorDistanceComparer(string target)
         {
             _target = Crypto.ParseHash(target);
         }
@@ -20,7 +20,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Sorts a caller-owned candidate list without parsing each peer ID again.</summary>
         /// <param name="peers">The candidate list.</param>
         /// <param name="target">The routing target.</param>
-        internal static void Sort(List<DHTPeer> peers, string target)
+        public static void Sort(List<DHTPeer> peers, string target)
         {
             peers.Sort(new XorDistanceComparer(target));
         }

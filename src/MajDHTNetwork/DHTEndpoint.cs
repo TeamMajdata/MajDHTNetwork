@@ -44,12 +44,12 @@ namespace MajDHTNetwork
         }
 
         /// <summary>Gets whether the endpoint was configured or verified as directly reachable.</summary>
-        internal bool IsReachable => (Flags & (DHTEndpointFlags.Verified | DHTEndpointFlags.Configured)) != 0;
+        public bool IsReachable => (Flags & (DHTEndpointFlags.Verified | DHTEndpointFlags.Configured)) != 0;
 
         /// <summary>Gets the port for one transport.</summary>
         /// <param name="transport">The transport.</param>
         /// <returns>The port, or zero when the transport is not accepted.</returns>
-        internal int Port(DHTTransport transport)
+        public int Port(DHTTransport transport)
         {
             return transport == DHTTransport.Tcp ? TcpPort : UdpPort;
         }

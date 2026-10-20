@@ -31,9 +31,9 @@ namespace MajDHTNetwork
         /// <summary>Gets the private agreement scalar for envelope decryption; it is read in place and must never be modified or exposed.</summary>
         internal byte[] AgreementScalar => _agreementScalar;
         /// <summary>Gets a borrowed view of the agreement public key.</summary>
-        internal ReadOnlySpan<byte> AgreementPublicKey => _agreementPublicKey;
+        public ReadOnlySpan<byte> AgreementPublicKey => _agreementPublicKey;
         /// <summary>Gets a borrowed view of the node digest that <see cref="NodeId"/> formats.</summary>
-        internal ReadOnlySpan<byte> NodeHash => _nodeHash;
+        public ReadOnlySpan<byte> NodeHash => _nodeHash;
         /// <summary>Gets the SHA-256 signing-key fingerprint used as the node identifier.</summary>
         public string NodeId { get; }
         /// <summary>Gets a non-allocating read-only view of the signing public key.</summary>
@@ -81,7 +81,7 @@ namespace MajDHTNetwork
         /// <summary>Signs canonical protocol bytes.</summary>
         /// <param name="bytes">The canonical message.</param>
         /// <returns>The Ed25519 signature.</returns>
-        internal byte[] Sign(ReadOnlyMemory<byte> bytes)
+        public byte[] Sign(ReadOnlyMemory<byte> bytes)
         {
             return Crypto.Sign(_signingKey, bytes);
         }
@@ -90,7 +90,7 @@ namespace MajDHTNetwork
         /// <param name="bytes">The canonical message.</param>
         /// <param name="destination">Exactly 64 writable bytes.</param>
         /// <exception cref="ArgumentException">The destination is not 64 bytes long.</exception>
-        internal void SignTo(ReadOnlyMemory<byte> bytes, Memory<byte> destination)
+        public void SignTo(ReadOnlyMemory<byte> bytes, Memory<byte> destination)
         {
             Crypto.SignTo(_signingKey, bytes, destination);
         }
@@ -146,7 +146,7 @@ namespace MajDHTNetwork
 
         /// <summary>Issues a strictly increasing contact sequence based on the current Unix time in milliseconds.</summary>
         /// <returns>A sequence larger than every sequence previously issued for this instance.</returns>
-        internal long NextSequence()
+        public long NextSequence()
         {
             while (true)
             {

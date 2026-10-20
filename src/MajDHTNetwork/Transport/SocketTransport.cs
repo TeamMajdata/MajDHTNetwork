@@ -14,7 +14,7 @@ using MajDHTNetwork.Protocol;
 namespace MajDHTNetwork.Transport
 {
     /// <summary>Exchanges bounded envelopes through shared UDP sockets and reusable TCP sessions.</summary>
-    internal sealed partial class SocketTransport : IAsyncDisposable
+    public sealed partial class SocketTransport : IAsyncDisposable
     {
         /// <summary>The big-endian length prefix size of a TCP frame.</summary>
         private const int FramePrefixLength = 4;
@@ -25,7 +25,7 @@ namespace MajDHTNetwork.Transport
         /// <summary>The immutable node options.</summary>
         private readonly DHTNodeOptions _options;
         /// <summary>The dispatcher receiving the transport and observed source.</summary>
-        private readonly Func<ReadOnlyMemory<byte>, DHTTransport, IPEndPoint, CancellationToken, Task<ReadOnlyMemory<byte>>> _handler;
+        private readonly DHTEnvelopeHandler _handler;
         /// <summary>An optional response-bit classifier for alternate envelope encodings.</summary>
         private readonly Func<ReadOnlyMemory<byte>, bool>? _responseClassifier;
         /// <summary>The isolated diagnostic sink.</summary>
@@ -75,21 +75,27 @@ namespace MajDHTNetwork.Transport
         /// <summary>The idempotent stop marker.</summary>
         private int _stopped;
         /// <summary>Gets the assigned TCP listener port of the first configured address family, or zero.</summary>
-        internal int TcpPort => TcpPortFor(_primaryFamily);
+        public int TcpPort => TcpPortFor(_primaryFamily);
         /// <summary>Gets the assigned UDP listener port of the first configured address family, excluding outbound-only sockets.</summary>
-        internal int UdpPort => UdpPortFor(_primaryFamily);
+        public int UdpPort => UdpPortFor(_primaryFamily);
 
-        /// <summary>Creates an unbound transport that exposes observed endpoints to its handler.</summary>
-        /// <param name="options">The validated options.</param>
+        /// <summary>
+        /// Creates an unbound transport that delivers every received envelope, together with the transport and observed source,
+        /// to a handler. The transport implements the TCP framing, the UDP cookie exchange, retries, replay-safe response
+        /// correlation and listener lifetimes, so a node implementation only has to open, dispatch and seal envelopes.
+        /// </summary>
+        /// <param name="options">The listener addresses, ports, limits and timeouts; they are validated and copied.</param>
         /// <param name="handler">The envelope handler, including transport and observed source.</param>
         /// <param name="logger">An optional standard logger override.</param>
         /// <param name="responseClassifier">An optional response-bit classifier; authentication remains the handler's responsibility.</param>
-        internal SocketTransport(DHTNodeOptions options,
-            Func<ReadOnlyMemory<byte>, DHTTransport, IPEndPoint, CancellationToken, Task<ReadOnlyMemory<byte>>> handler,
-            ILogger? logger = null, Func<ReadOnlyMemory<byte>, bool>? responseClassifier = null)
+        /// <exception cref="ArgumentNullException">The handler is null.</exception>
+        /// <exception cref="ArgumentException">The options are invalid.</exception>
+        public SocketTransport(DHTNodeOptions options, DHTEnvelopeHandler handler, ILogger? logger = null,
+            Func<ReadOnlyMemory<byte>, bool>? responseClassifier = null)
         {
             _shutdownToken = _shutdown.Token;
-            _options = options;
+            _options = (options ?? throw new ArgumentNullException(nameof(options))).Snapshot();
+            handler = handler ?? throw new ArgumentNullException(nameof(handler));
             _handler = handler;
             _logger = logger ?? options.Logger;
             _responseClassifier = responseClassifier;
@@ -111,7 +117,7 @@ namespace MajDHTNetwork.Transport
         /// <summary>Gets the assigned TCP listener port for an address family.</summary>
         /// <param name="family">The address family.</param>
         /// <returns>The bound port, or zero when no TCP listener exists for the family.</returns>
-        internal int TcpPortFor(AddressFamily family)
+        public int TcpPortFor(AddressFamily family)
         {
             return _tcpEndpoints.TryGetValue(family, out var endpoint) ? endpoint.Port : 0;
         }
@@ -119,7 +125,7 @@ namespace MajDHTNetwork.Transport
         /// <summary>Gets the assigned UDP listener port for an address family, excluding outbound-only sockets.</summary>
         /// <param name="family">The address family.</param>
         /// <returns>The bound port, or zero when no UDP listener exists for the family.</returns>
-        internal int UdpPortFor(AddressFamily family)
+        public int UdpPortFor(AddressFamily family)
         {
             return _bound && _udpChannels.TryGetValue(family, out var channel) && channel.Listening ? channel.Endpoint.Port : 0;
         }
@@ -128,7 +134,7 @@ namespace MajDHTNetwork.Transport
         /// <param name="transport">The transport.</param>
         /// <param name="family">The address family.</param>
         /// <returns>The bound port, or zero when no listener exists.</returns>
-        internal int PortFor(DHTTransport transport, AddressFamily family)
+        public int PortFor(DHTTransport transport, AddressFamily family)
         {
             return transport == DHTTransport.Tcp ? TcpPortFor(family) : UdpPortFor(family);
         }
@@ -137,7 +143,7 @@ namespace MajDHTNetwork.Transport
         /// <exception cref="InvalidOperationException">The listeners have already been bound.</exception>
         /// <exception cref="SocketException">A requested listener cannot bind.</exception>
         /// <exception cref="OperationCanceledException">The transport has stopped.</exception>
-        internal void Bind()
+        public void Bind()
         {
             lock (_lifecycleSync)
             {
@@ -172,7 +178,7 @@ namespace MajDHTNetwork.Transport
 
         /// <summary>Starts listeners after the local signed contact is available.</summary>
         /// <exception cref="OperationCanceledException">The transport has stopped.</exception>
-        internal void Run()
+        public void Run()
         {
             lock (_lifecycleSync)
             {
@@ -612,7 +618,7 @@ namespace MajDHTNetwork.Transport
         /// </returns>
         /// <exception cref="IOException">The packet, endpoint or transport is invalid, or no response arrives.</exception>
         /// <exception cref="OperationCanceledException">The exchange or transport was cancelled.</exception>
-        internal Task<OwnedMemory> ExchangeAtAsync(DHTTransport transport, IPEndPoint endpoint,
+        public Task<OwnedMemory> ExchangeAtAsync(DHTTransport transport, IPEndPoint endpoint,
             ReadOnlyMemory<byte> packet, CancellationToken cancellationToken, TransmissionCounter? counter = null)
         {
             return StartExchange(transport, endpoint, packet, cancellationToken, false, counter);
@@ -626,7 +632,7 @@ namespace MajDHTNetwork.Transport
         /// <returns>The encrypted response in its pooled frame, requiring caller authentication, token correlation and release.</returns>
         /// <exception cref="IOException">A matching listener is unavailable or punching fails.</exception>
         /// <exception cref="OperationCanceledException">The exchange or transport was cancelled.</exception>
-        internal Task<OwnedMemory> PunchAsync(DHTTransport transport, IPEndPoint endpoint,
+        public Task<OwnedMemory> PunchAsync(DHTTransport transport, IPEndPoint endpoint,
             ReadOnlyMemory<byte> packet, CancellationToken cancellationToken)
         {
             return StartExchange(transport, endpoint, packet, cancellationToken, true, null);
@@ -926,7 +932,7 @@ namespace MajDHTNetwork.Transport
         }
 
         /// <summary>Cancels all pending operations and closes every listener and TCP session.</summary>
-        internal void Stop()
+        public void Stop()
         {
             lock (_lifecycleSync)
             {

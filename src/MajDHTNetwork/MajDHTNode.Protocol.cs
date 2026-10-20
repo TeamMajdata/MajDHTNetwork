@@ -41,14 +41,12 @@ namespace MajDHTNetwork
                     try
                     {
                         await DispatchAsync(packet, transport, source, response, cancellationToken).ConfigureAwait(false);
-                        body.PutByte(0);
-                        body.Put(response.WrittenSpan);
+                        ResponseStatus.WriteSuccess(body, response.WrittenSpan);
                     }
                     catch (Exception exception)
                     {
                         Log(LogLevel.Debug, "Request rejected: ", exception);
-                        body.PutByte(1);
-                        body.Put(ReadOnlySpan<byte>.Empty);
+                        ResponseStatus.WriteRejection(body);
                     }
                     var reply = new Packet(LocalPeer, packet.RequestId, (byte)(packet.Kind | 128), body.WrittenMemory);
                     cached.Completion.TrySetResult(reply.Seal(_identity, packet.Sender));
@@ -152,41 +150,26 @@ namespace MajDHTNetwork
                     return;
                 case Operation.Find:
                 {
-                    var mode = request.Byte();
-                    var target = request.Text(1024);
-                    request.End();
-                    if (mode > 2)
-                    {
-                        throw new InvalidDataException("Invalid lookup mode.");
-                    }
-                    var routingId = mode == 1 ? DHTKey.Parse(target).RoutingId : target;
+                    var find = FindMessage.ReadRequest(request);
+                    var target = find.Target;
+                    var routingId = find.Mode == FindMode.Record ? DHTKey.Parse(target).RoutingId : target;
                     Crypto.ParseHash(routingId);
                     DHTRecord? record = null;
                     lock (_gate)
                     {
-                        if (mode == 1 && _records.TryGetValue(target, out var found) && !found.IsExpired)
+                        if (find.Mode == FindMode.Record && _records.TryGetValue(target, out var found) && !found.IsExpired)
                         {
                             record = found;
                         }
                     }
-                    if (record == null)
-                    {
-                        response.Put(ReadOnlySpan<byte>.Empty);
-                    }
-                    else
-                    {
-                        response.Put(record.Encoded);
-                    }
-                    PutPeers(response, RoutedPeers(routingId, _options.BucketSize), ContactListBudget);
-                    IReadOnlyList<DHTPeer> providers = mode == 2 ? LocalProviders(target)
+                    IReadOnlyList<DHTPeer> providers = find.Mode == FindMode.Providers ? LocalProviders(target)
                         : record == null || record.IsWithdrawn ? Array.Empty<DHTPeer>() : LocalProviders(record.FileHash);
-                    PutPeers(response, providers, ContactListBudget);
+                    FindMessage.WriteResponse(response, record, RoutedPeers(routingId, _options.BucketSize), providers);
                     return;
                 }
                 case Operation.Store:
                 {
-                    var record = DHTRecord.ParseCached(request.Bytes(DHTRecord.MaxEncodedLength));
-                    request.End();
+                    var record = StoreMessage.ReadRequest(request);
                     // A withdrawal is signed by its publisher and claims no content, so any node may replicate it.
                     if (!record.IsWithdrawn && (packet.Sender.Capabilities & DHTCapabilities.Provide) == 0)
                     {
@@ -201,16 +184,13 @@ namespace MajDHTNetwork
                     {
                         throw new IOException("Content serving is disabled.");
                     }
-                    var record = DHTRecord.ParseCached(request.Bytes(DHTRecord.MaxEncodedLength));
-                    var index = request.Long();
-                    request.End();
-                    if (index < 0 || index >= record.BlockCount || record.Length > _options.MaxFileSize)
+                    var block = BlockMessage.ReadRequest(request);
+                    if (block.Record.Length > _options.MaxFileSize)
                     {
-                        throw new InvalidDataException("Invalid requested block geometry.");
+                        throw new InvalidDataException("The requested file exceeds the node's file limit.");
                     }
-                    var result = await ReadServedBlockAsync(record, (int)index, cancellationToken).ConfigureAwait(false);
-                    response.Put(result.Bytes.Span);
-                    result.Tree.WriteProof(response, (int)index);
+                    var result = await ReadServedBlockAsync(block.Record, block.Index, cancellationToken).ConfigureAwait(false);
+                    BlockMessage.WriteResponse(response, result.Bytes.Span, result.Tree, block.Index);
                     return;
                 }
                 case Operation.Rendezvous:
@@ -220,8 +200,8 @@ namespace MajDHTNetwork
                     DispatchPunch(packet, transport, source);
                     return;
                 case Operation.Hello:
-                    request.End();
-                    PutNatEndpoint(response, source);
+                    HelloMessage.ReadRequest(request);
+                    HelloMessage.WriteResponse(response, source);
                     return;
                 case Operation.Probe:
                     DispatchProbe(packet, transport);
@@ -232,17 +212,14 @@ namespace MajDHTNetwork
                     {
                         throw new IOException("Relaying is disabled.");
                     }
-                    var target = request.Text(64);
-                    var inner = request.Bytes(Wire.MaxPacket);
-                    request.End();
-                    Packet.CheckForward(inner, target);
-                    var destination = KnownRelayDestination(target);
+                    var relay = RelayMessage.ReadRequest(request);
+                    var destination = KnownRelayDestination(relay.DestinationId);
                     if (destination == null || destination.NodeId == packet.Sender.NodeId)
                     {
                         throw new IOException("Relay destination must be an already known peer.");
                     }
-                    using var relayed = (await ExchangeDirectAsync(destination, inner, cancellationToken).ConfigureAwait(false)).Response;
-                    response.Put(relayed.Bytes.Span);
+                    using var relayed = (await ExchangeDirectAsync(destination, relay.Envelope, cancellationToken).ConfigureAwait(false)).Response;
+                    RelayMessage.WriteResponse(response, relayed.Bytes.Span);
                     return;
                 }
                 default:
@@ -315,24 +292,6 @@ namespace MajDHTNetwork
             }
         }
 
-        /// <summary>Validates the operation status and extracts its bounded response body.</summary>
-        /// <param name="response">The already authenticated response.</param>
-        /// <returns>The operation payload, borrowing the decrypted envelope buffer.</returns>
-        /// <exception cref="IOException">The authenticated peer rejected the request.</exception>
-        /// <exception cref="InvalidDataException">The response framing is malformed.</exception>
-        private static ReadOnlyMemory<byte> ReadResponseBody(Packet response)
-        {
-            using var reader = new Wire(response.Body);
-            var status = reader.Byte();
-            var payload = reader.Bytes(Wire.MaxPacket);
-            reader.End();
-            if (status != 0)
-            {
-                throw new IOException("The authenticated peer rejected the request.");
-            }
-            return payload;
-        }
-
         /// <summary>Validates the operation status and takes over the response frame as a view of the bounded response body.</summary>
         /// <param name="response">The already authenticated response, which must not be disposed afterwards.</param>
         /// <returns>The operation payload, releasing the response frame when disposed.</returns>
@@ -342,7 +301,7 @@ namespace MajDHTNetwork
         {
             try
             {
-                return response.Narrow(ReadResponseBody(response.Packet));
+                return response.Narrow(ResponseStatus.ReadResult(response.Packet.Body));
             }
             catch
             {
@@ -393,15 +352,12 @@ namespace MajDHTNetwork
                 throw new IOException("The selected peer cannot relay this request.");
             }
             using var body = new Wire();
-            body.PutText(destination.NodeId);
-            body.Put(envelope.Span);
+            RelayMessage.WriteRequest(body, destination.NodeId, envelope.Span);
             var response = await RequestAsync(relay, Operation.Relay, body.WrittenMemory, cancellationToken, allowRelay: false).ConfigureAwait(false);
             try
             {
                 using var reader = new Wire(response.Bytes);
-                var result = reader.Bytes(Wire.MaxPacket);
-                reader.End();
-                return response.Narrow(result);
+                return response.Narrow(RelayMessage.ReadResponse(reader));
             }
             catch
             {
@@ -476,44 +432,6 @@ namespace MajDHTNetwork
         {
             return exception is IOException || exception is InvalidDataException || exception is CryptographicException || exception is ArgumentException
                 || exception is System.Net.Sockets.SocketException;
-        }
-
-        /// <summary>Encodes a contact list bounded by count and encoded size.</summary>
-        /// <param name="writer">The destination encoder.</param>
-        /// <param name="peers">The ordered candidate contacts; at most sixteen are written.</param>
-        /// <param name="budget">The maximum encoded bytes of the written contacts, including their length prefixes.</param>
-        private static void PutPeers(Wire writer, IReadOnlyList<DHTPeer> peers, int budget)
-        {
-            var count = 0;
-            var used = 0;
-            while (count < Math.Min(16, peers.Count) && used + 8 + peers[count].Encoded.Length <= budget)
-            {
-                used += 8 + peers[count].Encoded.Length;
-                count++;
-            }
-            writer.PutLong(count);
-            for (var i = 0; i < count; i++)
-            {
-                writer.Put(peers[i].Encoded);
-            }
-        }
-
-        /// <summary>Decodes and verifies a bounded contact list, reusing cached verifications of repeated contacts.</summary>
-        /// <param name="reader">The source decoder.</param>
-        /// <returns>Verified, unexpired contacts.</returns>
-        private static List<DHTPeer> ReadPeers(Wire reader)
-        {
-            var count = reader.Long();
-            if (count < 0 || count > 16)
-            {
-                throw new InvalidDataException("Invalid contact list size.");
-            }
-            var peers = new List<DHTPeer>((int)count);
-            for (var i = 0; i < count; i++)
-            {
-                peers.Add(DHTPeer.Parse(reader.Bytes(DHTPeer.MaxEncodedLength)));
-            }
-            return peers;
         }
     }
 }

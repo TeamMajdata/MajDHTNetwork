@@ -4,6 +4,7 @@ using System.Net;
 using System.Text;
 using System.Threading.Tasks;
 using MajDHTNetwork;
+using MajDHTNetwork.Protocol;
 using Microsoft.Extensions.Logging.Abstractions;
 
 #nullable enable
@@ -43,7 +44,33 @@ namespace MajDHTNetwork.Tests.PackageConsumer
                 throw new InvalidOperationException("External consumer content mismatch.");
             }
             VerifySpanApi(identity, record);
+            VerifyProtocolApi(identity, record);
             Console.WriteLine("PASS external consumer using " + typeof(MajDHTNode).Assembly.GetName().Name);
+        }
+
+        /// <summary>Checks that the protocol API a custom node builds on is public: envelopes, codecs and the response wrapper.</summary>
+        /// <param name="identity">The consumer identity.</param>
+        /// <param name="record">The verified publication.</param>
+        private static void VerifyProtocolApi(DHTIdentity identity, DHTRecord record)
+        {
+            var self = DHTPeer.Create(identity, IPAddress.Loopback, 1, 0, DHTCapabilities.Download);
+            using var body = new Wire();
+            FindMessage.WriteRequest(body, FindMode.Record, record.Key.ToString());
+            var request = new Packet(self, Crypto.Random(Packet.RequestIdLength), (byte)Operation.Find, body.WrittenMemory);
+            var opened = Packet.Open(identity, request.Seal(identity, self));
+            using var reader = new Wire(opened.Body);
+            var find = FindMessage.ReadRequest(reader);
+            using var result = new Wire();
+            FindMessage.WriteResponse(result, record, new[] { self }, Array.Empty<DHTPeer>());
+            using var response = new Wire();
+            ResponseStatus.WriteSuccess(response, result.WrittenSpan);
+            using var resultReader = new Wire(ResponseStatus.ReadResult(response.WrittenMemory));
+            var found = FindMessage.ReadResponse(resultReader);
+            if (find.Mode != FindMode.Record || opened.Sender.NodeId != identity.NodeId || found.Record == null
+                || !found.Record.Key.Equals(record.Key) || found.Peers.Count != 1)
+            {
+                throw new InvalidOperationException("Packaged protocol API mismatch.");
+            }
         }
 
         /// <summary>Checks public span exports and root namespace resolution from the artifact.</summary>

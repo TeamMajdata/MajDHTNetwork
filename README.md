@@ -20,6 +20,7 @@ The wire protocol is specified in [PROTOCOL.md](PROTOCOL.md)
 - [Build](#build)
 - [Quick start](#quick-start)
 - [Public API](#public-api)
+- [Implementing a node with the protocol API](#implementing-a-node-with-the-protocol-api)
 - [Identity, keys and integrity](#identity-keys-and-integrity)
 - [Encryption and relays](#encryption-and-relays)
 - [Bootstrap and discovery](#bootstrap-and-discovery)
@@ -53,6 +54,9 @@ The wire protocol is specified in [PROTOCOL.md](PROTOCOL.md)
 - **Pluggable storage.** Blocks live behind `IDHTContentStore`; the default
   `MemoryDHTContentStore` is a bounded LRU cache, and applications can supply a
   persistent store.
+- **Open protocol API.** The envelope, operation codecs, Merkle, identity-work and
+  socket transport types are public, so applications can implement their own node
+  and interoperate with `MajDHTNode`.
 - **Host-agnostic.** No Unity types, no `System.IO.File`/`FileStream`, structured
   logging through `Microsoft.Extensions.Logging`.
 
@@ -75,6 +79,7 @@ The wire protocol is specified in [PROTOCOL.md](PROTOCOL.md)
 | `src/MajDHTNetwork/` | Production sources: node, discovery, content, NAT, protocol and transport. |
 | `src/MajDHTNetwork.Tests/` | .NET 9 xUnit v3 test project with real loopback sockets; excluded from the library project. |
 | `PROTOCOL.md`, `PROTOCOL.zh-CN.md` | Wire protocol specification (English / Chinese). |
+| `IMPLEMENTING.md`, `IMPLEMENTING.zh-CN.md` | Guide to the protocol flows, the public API and building a custom node (English / Chinese). |
 | `Publish.ps1` | Release script: build, test, pack, loose-DLL archive and consumer validation. |
 | `LICENSE` | MIT license. |
 | `global.json`, `packages.lock.json` | SDK selection and pinned dependency graph. |
@@ -211,12 +216,12 @@ process.
 | Type | Key members |
 | --- | --- |
 | `DHTIdentity` | `DHTIdentity()`, `DHTIdentity(ReadOnlySpan<byte> seed)`, `NodeId`, `PublicKey`, `ExportSeed()`, `ExportSeed(Span<byte>)`, `IdentityWork`, `Create(int workBits, CancellationToken)` |
-| `DHTPeer` | `NodeId`, `Endpoints`, `RelayHints`, `Reachability`, `HasEndpointDependentMapping`, `ExternalAddress`, `Capabilities`, `IdentityWork`, `Sequence`, `ExpiresAt`, `IsExpired` |
+| `DHTPeer` | `NodeId`, `Endpoints`, `RelayHints`, `Reachability`, `HasEndpointDependentMapping`, `ExternalAddress`, `Capabilities`, `IdentityWork`, `Sequence`, `ExpiresAt`, `IsExpired`, `Encoded`, `Create(...)`, `Parse(ReadOnlyMemory<byte>)` |
 | `DHTEndpoint` | `DHTEndpoint(IPAddress, int tcpPort, int udpPort, DHTEndpointFlags)`, `Address`, `TcpPort`, `UdpPort`, `Flags` |
 | `DHTReachability` | `Unknown = 0`, `Public = 1`, `Private = 2` |
 | `DHTEndpointFlags` | `None = 0`, `Verified = 1`, `Local = 2`, `Configured = 4` |
 | `DHTKey` | `DHTKey(string publisherId, string name)`, `Parse(string)`, `IsValid`, `PublisherId`, `Name`, `RoutingId`, equality and hashing |
-| `DHTRecord` | `Key`, `IsWithdrawn`, `FileHash`, `MerkleRoot`, `Length`, `BlockSize`, `BlockCount`, `Revision`, `ExpiresAt`, `IsExpired`, `EncodedLength`, `CopyTo(Span<byte>)`, `ToBytes()`, `Parse(ReadOnlySpan<byte>)` |
+| `DHTRecord` | `Key`, `IsWithdrawn`, `FileHash`, `MerkleRoot`, `Length`, `BlockSize`, `BlockCount`, `Revision`, `ExpiresAt`, `IsExpired`, `EncodedLength`, `CopyTo(Span<byte>)`, `ToBytes()`, `Parse(ReadOnlySpan<byte>)`, `Create(...)`, `CreateWithdrawal(...)` |
 | `IDHTContentStore` | `PutAsync(string blockHash, ReadOnlyMemory<byte>, CancellationToken)`, `GetAsync(string blockHash, CancellationToken)` |
 | `IDHTContentFallback` | `TryAcquireAsync(DHTRecord, CancellationToken)`; makes requested but locally unavailable content available on demand |
 | `MemoryDHTContentStore` | `MemoryDHTContentStore(long capacity = 64 MiB, int maxEntries = 65536)` |
@@ -230,6 +235,100 @@ process.
 | `DHTDirectRoute`, `DHTRelayRoute` | `Endpoint`, `Transport`; `Relay`, `AttemptPunch` |
 | `DHTCapabilities` | `Download = 1`, `Provide = 2`, `Relay = 4` |
 | `DHTTransport` | `Tcp`, `Udp` |
+
+## Implementing a node with the protocol API
+
+`MajDHTNode` is one implementation of the MajDHT v1 protocol, not a mandatory
+one. Everything it uses to speak the protocol is public, so an application can
+write its own participant, whether a minimal client, a specialised index or a
+port of the node logic, and interoperate with reference nodes. The wire format
+is specified in [PROTOCOL.md](PROTOCOL.md); the types below implement it and
+are exactly the ones the reference node uses, so a custom node encodes and
+verifies messages the same way. [IMPLEMENTING.md](IMPLEMENTING.md) explains the
+protocol flows, what each public type means, how to extend `MajDHTNode` through
+its constructor, and how to build an independent node step by step.
+
+| Type (`MajDHTNetwork.Protocol` unless noted) | Purpose |
+| --- | --- |
+| `Wire` | Canonical encoder over a pooled buffer and zero-copy decoder: `PutByte`/`Byte`, `PutLong`/`Long`, `Put`/`Bytes(limit)`, `PutText`/`Text(limit)`, `PutRaw`, `PutHex`, `Tag`, `End`, `WrittenMemory`, `ToArray`, `MaxPacket`. |
+| `Operation` | The operation byte: `Ping`, `Find`, `Store`, `Block`, `Relay`, `Rendezvous`, `Punch`, `Hello`, `Probe`; responses set bit 7. |
+| `Packet` | One request or response: `Packet(sender, requestId, kind, body)`, `Seal(identity, recipient)`, `SealHello(identity)`, `Open(identity, envelope)`, `CheckForward(envelope, destinationId)`, `Sender`, `RequestId`, `Kind`, `Body`, `RequestIdLength`. |
+| `ResponseStatus` | The status wrapper of every response body: `WriteSuccess`, `WriteRejection`, `ReadResult`. |
+| `FindMessage`, `FindMode`, `FindRequest`, `FindResponse`, `ContactList` | Find request and result codecs with bounded, independently verified contact lists. |
+| `StoreMessage`, `BlockMessage`, `BlockRequest` | Store and Block codecs; `BlockMessage.ReadResponse` verifies block length, position and Merkle proof against the requester's own record. |
+| `RelayMessage`, `RelayRequest` | Opaque relay codec; `ReadRequest` enforces the forwarding rules on the inner envelope. |
+| `HelloMessage`, `ObservedEndpoint` | Hello result and the observed-endpoint encoding shared with Rendezvous. |
+| `RendezvousMessage`, `RendezvousAction`, `RendezvousIntroduction`, `RendezvousPollResponse`, `DialBackArrangement`, `DialBackDelegation`, `PunchMessage`, `ProbeMessage`, `ProbeRequest` | Registration, introduction, dial-back, punch and probe codecs for relay-assisted traversal and reachability. |
+| `MerkleTree` | Domain-separated leaf and parent hashing: `Leaf`, `AppendLeaf`, `Root`, `Count`, `LeafId`, `WriteProof`, `Proof`, `Verify`, `VerifyLocal`. |
+| `Crypto` | `Hash`, `HashPrefixed`, `Hex`, `HexTo`, `ParseHash`, `IsHash`, `AsciiEquals`, `Random`, `Fill`, `Shuffle`, `Verify`, `Hkdf` and the digest, agreement-key, nonce and tag lengths. |
+| `IdentityPuzzle` | The Argon2id identity work: `Evaluate`, `Work`, `Remember`, `Search` and its parameters. |
+| `ProtocolTags`, `NetworkScope`, `XorDistanceComparer` | Canonical labels, address scope and network-prefix rules, XOR distance ordering. |
+| `OwnedMemory`, `OwnedPacket`, `PooledBuffer` | Ownership of the pooled frames that received envelopes borrow. |
+| `MajDHTNetwork.Transport.SocketTransport`, `DHTEnvelopeHandler`, `TransmissionCounter` | TCP framing, UDP cookies and retries, listeners and sessions: `SocketTransport(options, handler)`, `Bind`, `Run`, `ExchangeAtAsync`, `PunchAsync`, `TcpPort`, `UdpPort`, `PortFor`, `Stop`, `DisposeAsync`. |
+| `DHTPeer`, `DHTRecord`, `DHTIdentity`, `DHTNodeOptions` (root namespace) | `DHTPeer.Create`, `Parse`, `Encoded`, `NodeHash`, `SigningKey`, `AgreementKey`, `SameAdvertisement`; `DHTRecord.Create`, `CreateWithdrawal`, `ParseCached`, `Encoded`, `SameContent`; `DHTIdentity.Sign`, `SignTo`, `AgreementPublicKey`, `NodeHash`, `NextSequence`; `DHTNodeOptions.Snapshot`. |
+
+A node implementation receives envelopes through a `DHTEnvelopeHandler`, opens
+them with `Packet.Open`, reads the body with the operation's codec, writes the
+result and the `ResponseStatus` wrapper into a `Wire`, and seals the reply to
+the authenticated sender. The transport releases the received frame when the
+handler's task completes, so anything kept from a request must be copied.
+Requests are sent with `Packet.Seal` and `SocketTransport.ExchangeAtAsync`; the
+caller authenticates the response sender, operation and request identifier
+before reading the result. The identity work, replay cache, routing admission,
+quotas and Sybil policies described in this document are node policies, not
+codecs: a custom node applies its own.
+
+```csharp
+using System;
+using System.IO;
+using System.Net;
+using System.Threading.Tasks;
+using MajDHTNetwork;
+using MajDHTNetwork.Protocol;
+using MajDHTNetwork.Transport;
+
+#nullable enable
+
+// A participant that answers Ping and Hello and serves nothing else.
+var identity = new DHTIdentity();
+DHTPeer self = null!;
+var transport = new SocketTransport(new DHTNodeOptions { UdpPort = null }, (envelope, kind, source, token) =>
+{
+    var request = Packet.Open(identity, envelope);
+    using var result = new Wire();
+    using var body = new Wire();
+    try
+    {
+        using var reader = new Wire(request.Body);
+        switch ((Operation)request.Kind)
+        {
+            case Operation.Ping:
+                reader.End();
+                break;
+            case Operation.Hello:
+                HelloMessage.ReadRequest(reader);
+                HelloMessage.WriteResponse(result, source);
+                break;
+            default:
+                throw new IOException("Unsupported operation.");
+        }
+        ResponseStatus.WriteSuccess(body, result.WrittenSpan);
+    }
+    catch (Exception)
+    {
+        ResponseStatus.WriteRejection(body);
+    }
+    var reply = new Packet(self, request.RequestId, (byte)(request.Kind | 128), body.WrittenMemory);
+    return Task.FromResult<ReadOnlyMemory<byte>>(reply.Seal(identity, request.Sender));
+});
+transport.Bind();
+self = DHTPeer.Create(identity, IPAddress.Loopback, transport.TcpPort, 0, DHTCapabilities.Download);
+transport.Run();
+```
+
+The test project's `MinimalProtocolNode` is a complete example built only on
+this API: it serves a file, indexes announcements, downloads from reference
+nodes and is discovered and downloaded from by them.
 
 ## Identity, keys and integrity
 
@@ -789,7 +888,7 @@ dotnet pack MajDHTNetwork.csproj --configuration Release --output artifacts/nuge
 ```
 
 The package contains the netstandard2.1 DLL, the XML documentation file,
-`README.md`, `PROTOCOL.md` and `LICENSE`; test sources are excluded. Upload the
+`README.md`, `PROTOCOL.md`, `IMPLEMENTING.md` and `LICENSE`; test sources are excluded. Upload the
 `.nupkg` to the chosen feed using that feed's normal release process.
 
 `Publish.ps1` automates the full release flow: locked restore, Release build, the

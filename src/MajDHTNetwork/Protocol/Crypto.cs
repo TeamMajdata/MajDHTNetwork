@@ -17,16 +17,16 @@ namespace MajDHTNetwork.Protocol
     /// Provides portable cryptography with borrowed memory, thread-cached hash and cipher instances, stack or pooled secrets,
     /// and array segments at the legacy array-only provider boundaries.
     /// </summary>
-    internal static class Crypto
+    public static class Crypto
     {
         /// <summary>The SHA-256 digest size.</summary>
-        internal const int DigestLength = 32;
+        public const int DigestLength = 32;
         /// <summary>The X25519 scalar, public key and shared-secret size.</summary>
-        internal const int AgreementKeyLength = 32;
+        public const int AgreementKeyLength = 32;
         /// <summary>The ChaCha20-Poly1305 nonce size.</summary>
-        internal const int NonceLength = 12;
+        public const int NonceLength = 12;
         /// <summary>The ChaCha20-Poly1305 authentication tag size.</summary>
-        internal const int TagLength = 16;
+        public const int TagLength = 16;
         /// <summary>The HMAC-SHA256 block size.</summary>
         private const int HmacBlockLength = 64;
         /// <summary>The largest HMAC message handled on the stack; longer messages use pooled storage.</summary>
@@ -49,7 +49,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Shuffles a list in place with a cryptographic random source, so attackers cannot predict selections.</summary>
         /// <typeparam name="T">The element type.</typeparam>
         /// <param name="items">The list to shuffle.</param>
-        internal static void Shuffle<T>(IList<T> items)
+        public static void Shuffle<T>(IList<T> items)
         {
             for (var index = items.Count - 1; index > 0; index--)
             {
@@ -63,7 +63,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Generates independently owned random bytes.</summary>
         /// <param name="count">The byte count.</param>
         /// <returns>The random bytes.</returns>
-        internal static byte[] Random(int count)
+        public static byte[] Random(int count)
         {
             var bytes = new byte[count];
             Fill(bytes);
@@ -72,7 +72,7 @@ namespace MajDHTNetwork.Protocol
 
         /// <summary>Fills caller-owned storage with cryptographic random bytes without allocating.</summary>
         /// <param name="destination">The storage to fill.</param>
-        internal static void Fill(Span<byte> destination)
+        public static void Fill(Span<byte> destination)
         {
             RandomNumberGenerator.Fill(destination);
         }
@@ -80,7 +80,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Hashes borrowed bytes into an owned digest.</summary>
         /// <param name="bytes">The input.</param>
         /// <returns>The 32-byte SHA-256 digest.</returns>
-        internal static byte[] Hash(ReadOnlySpan<byte> bytes)
+        public static byte[] Hash(ReadOnlySpan<byte> bytes)
         {
             var digest = new byte[DigestLength];
             Hash(bytes, digest);
@@ -92,7 +92,7 @@ namespace MajDHTNetwork.Protocol
         /// <param name="destination">At least 32 writable bytes.</param>
         /// <exception cref="ArgumentException">The destination is too short.</exception>
         /// <exception cref="CryptographicException">The hash provider failed.</exception>
-        internal static void Hash(ReadOnlySpan<byte> bytes, Span<byte> destination)
+        public static void Hash(ReadOnlySpan<byte> bytes, Span<byte> destination)
         {
             if (destination.Length < DigestLength)
             {
@@ -110,7 +110,7 @@ namespace MajDHTNetwork.Protocol
         /// <param name="destination">At least 32 writable bytes.</param>
         /// <exception cref="ArgumentException">The destination is too short.</exception>
         /// <exception cref="CryptographicException">The hash provider failed.</exception>
-        internal static void HashPrefixed(byte prefix, ReadOnlySpan<byte> bytes, Span<byte> destination)
+        public static void HashPrefixed(byte prefix, ReadOnlySpan<byte> bytes, Span<byte> destination)
         {
             if (destination.Length < DigestLength)
             {
@@ -140,7 +140,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Formats lowercase hexadecimal without per-byte strings or a StringBuilder.</summary>
         /// <param name="bytes">The borrowed input.</param>
         /// <returns>The canonical hexadecimal string.</returns>
-        internal static string Hex(ReadOnlySpan<byte> bytes)
+        public static string Hex(ReadOnlySpan<byte> bytes)
         {
             char[]? rented = null;
             Span<char> characters = bytes.Length <= 256 ? stackalloc char[bytes.Length * 2] : (rented = ArrayPool<char>.Shared.Rent(checked(bytes.Length * 2)));
@@ -166,7 +166,7 @@ namespace MajDHTNetwork.Protocol
         /// <param name="bytes">The borrowed input.</param>
         /// <param name="destination">Exactly twice as many writable bytes as the input.</param>
         /// <exception cref="ArgumentException">The destination length does not match.</exception>
-        internal static void HexTo(ReadOnlySpan<byte> bytes, Span<byte> destination)
+        public static void HexTo(ReadOnlySpan<byte> bytes, Span<byte> destination)
         {
             if (destination.Length != bytes.Length * 2)
             {
@@ -182,7 +182,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Parses a canonical identifier into newly owned digest storage.</summary>
         /// <param name="value">The lowercase identifier.</param>
         /// <returns>The 32-byte digest.</returns>
-        internal static byte[] ParseHash(string value)
+        public static byte[] ParseHash(string value)
         {
             var digest = new byte[DigestLength];
             ParseHash(value, digest);
@@ -193,7 +193,7 @@ namespace MajDHTNetwork.Protocol
         /// <param name="value">The canonical lowercase identifier.</param>
         /// <param name="destination">At least 32 writable bytes.</param>
         /// <exception cref="ArgumentException">The input or destination is invalid.</exception>
-        internal static void ParseHash(string value, Span<byte> destination)
+        public static void ParseHash(string value, Span<byte> destination)
         {
             if (value == null || value.Length != DigestLength * 2 || destination.Length < DigestLength)
             {
@@ -216,7 +216,7 @@ namespace MajDHTNetwork.Protocol
         /// <param name="destination">At least 32 writable bytes.</param>
         /// <exception cref="InvalidDataException">The identifier is not 64 lowercase hexadecimal digits.</exception>
         /// <exception cref="ArgumentException">The destination is too short.</exception>
-        internal static void ParseHash(ReadOnlySpan<byte> ascii, Span<byte> destination)
+        public static void ParseHash(ReadOnlySpan<byte> ascii, Span<byte> destination)
         {
             if (destination.Length < DigestLength)
             {
@@ -241,7 +241,7 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Checks whether ASCII bytes form a canonical identifier without allocating.</summary>
         /// <param name="ascii">The bytes to check.</param>
         /// <returns>Whether the bytes are exactly 64 lowercase hexadecimal digits.</returns>
-        internal static bool IsHash(ReadOnlySpan<byte> ascii)
+        public static bool IsHash(ReadOnlySpan<byte> ascii)
         {
             if (ascii.Length != DigestLength * 2)
             {
@@ -257,11 +257,30 @@ namespace MajDHTNetwork.Protocol
             return true;
         }
 
+        /// <summary>Checks whether a string is a canonical identifier.</summary>
+        /// <param name="value">The string to check.</param>
+        /// <returns>Whether the string is exactly 64 lowercase hexadecimal digits.</returns>
+        public static bool IsHash(string? value)
+        {
+            if (value == null || value.Length != DigestLength * 2)
+            {
+                return false;
+            }
+            foreach (var character in value)
+            {
+                if (character > 0x7f || HexValue((byte)character) < 0)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
         /// <summary>Compares ASCII bytes with a string ordinally without decoding.</summary>
         /// <param name="ascii">The ASCII bytes.</param>
         /// <param name="text">The expected text.</param>
         /// <returns>Whether every character matches.</returns>
-        internal static bool AsciiEquals(ReadOnlySpan<byte> ascii, string text)
+        public static bool AsciiEquals(ReadOnlySpan<byte> ascii, string text)
         {
             if (text == null || ascii.Length != text.Length)
             {
@@ -338,7 +357,7 @@ namespace MajDHTNetwork.Protocol
         /// <param name="bytes">The canonical message.</param>
         /// <param name="signature">The detached signature.</param>
         /// <returns>Whether the signature is valid.</returns>
-        internal static bool Verify(ReadOnlyMemory<byte> publicKey, ReadOnlyMemory<byte> bytes, ReadOnlyMemory<byte> signature)
+        public static bool Verify(ReadOnlyMemory<byte> publicKey, ReadOnlyMemory<byte> bytes, ReadOnlyMemory<byte> signature)
         {
             if (publicKey.Length != 32 || signature.Length != 64)
             {
@@ -472,7 +491,7 @@ namespace MajDHTNetwork.Protocol
         /// <param name="info">The context label of at most 256 bytes.</param>
         /// <param name="output">The destination of at most 8160 bytes.</param>
         /// <exception cref="ArgumentException">The label or output length is outside the supported range.</exception>
-        internal static void Hkdf(ReadOnlySpan<byte> inputKeyMaterial, ReadOnlySpan<byte> salt, ReadOnlySpan<byte> info, Span<byte> output)
+        public static void Hkdf(ReadOnlySpan<byte> inputKeyMaterial, ReadOnlySpan<byte> salt, ReadOnlySpan<byte> info, Span<byte> output)
         {
             if (info.Length > 256 || output.Length > 255 * DigestLength)
             {

@@ -141,7 +141,7 @@ namespace MajDHTNetwork
             }
             var accepted = 0;
             using var body = new Wire();
-            body.Put(withdrawal.Encoded);
+            StoreMessage.WriteRequest(body, withdrawal);
             foreach (var peer in peers.Values)
             {
                 try

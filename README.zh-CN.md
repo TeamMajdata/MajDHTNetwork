@@ -17,6 +17,7 @@ MajDHTNetwork 是一个独立的 **.NET Standard 2.1** 类库，命名空间为
 - [构建](#构建)
 - [快速开始](#快速开始)
 - [公共 API](#公共-api)
+- [用协议 API 实现自己的节点](#用协议-api-实现自己的节点)
 - [身份、密钥与完整性](#身份密钥与完整性)
 - [加密与中继](#加密与中继)
 - [引导与发现](#引导与发现)
@@ -46,6 +47,8 @@ MajDHTNetwork 是一个独立的 **.NET Standard 2.1** 类库，命名空间为
   加入网络。
 - **可插拔存储。** 数据块由 `IDHTContentStore` 承载；默认的 `MemoryDHTContentStore`
   是有界的 LRU 缓存，应用也可以提供持久化存储。
+- **开放的协议 API。** 信封、各操作的编解码器、Merkle、身份工作量与套接字传输层类型
+  均为公开类型，应用可以实现自己的节点并与 `MajDHTNode` 互通。
 - **与宿主无关。** 不使用 Unity 类型，不调用 `System.IO.File`/`FileStream`，日志走
   `Microsoft.Extensions.Logging` 的结构化接口。
 
@@ -68,6 +71,7 @@ MajDHTNetwork 是一个独立的 **.NET Standard 2.1** 类库，命名空间为
 | `src/MajDHTNetwork/` | 生产代码：节点、发现、内容、NAT、协议与传输。 |
 | `src/MajDHTNetwork.Tests/` | .NET 9 xUnit v3 测试工程，使用真实回环套接字；不包含在类库工程中。 |
 | `PROTOCOL.md`、`PROTOCOL.zh-CN.md` | 线协议规范（英文 / 中文）。 |
+| `IMPLEMENTING.md`、`IMPLEMENTING.zh-CN.md` | 协议流程、公开 API 与自定义节点实现指南（英文 / 中文）。 |
 | `Publish.ps1` | 发布脚本：构建、测试、打包、生成松散 DLL 归档并校验消费者。 |
 | `LICENSE` | MIT 许可证。 |
 | `global.json`、`packages.lock.json` | SDK 选择与锁定的依赖图。 |
@@ -200,12 +204,12 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | 类型 | 主要成员 |
 | --- | --- |
 | `DHTIdentity` | `DHTIdentity()`、`DHTIdentity(ReadOnlySpan<byte> seed)`、`NodeId`、`PublicKey`、`ExportSeed()`、`ExportSeed(Span<byte>)`、`IdentityWork`、`Create(int workBits, CancellationToken)` |
-| `DHTPeer` | `NodeId`、`Endpoints`、`RelayHints`、`Reachability`、`HasEndpointDependentMapping`、`ExternalAddress`、`Capabilities`、`IdentityWork`、`Sequence`、`ExpiresAt`、`IsExpired` |
+| `DHTPeer` | `NodeId`、`Endpoints`、`RelayHints`、`Reachability`、`HasEndpointDependentMapping`、`ExternalAddress`、`Capabilities`、`IdentityWork`、`Sequence`、`ExpiresAt`、`IsExpired`、`Encoded`、`Create(...)`、`Parse(ReadOnlyMemory<byte>)` |
 | `DHTEndpoint` | `DHTEndpoint(IPAddress, int tcpPort, int udpPort, DHTEndpointFlags)`、`Address`、`TcpPort`、`UdpPort`、`Flags` |
 | `DHTReachability` | `Unknown = 0`、`Public = 1`、`Private = 2` |
 | `DHTEndpointFlags` | `None = 0`、`Verified = 1`、`Local = 2`、`Configured = 4` |
 | `DHTKey` | `DHTKey(string publisherId, string name)`、`Parse(string)`、`IsValid`、`PublisherId`、`Name`、`RoutingId`、相等比较与哈希 |
-| `DHTRecord` | `Key`、`IsWithdrawn`、`FileHash`、`MerkleRoot`、`Length`、`BlockSize`、`BlockCount`、`Revision`、`ExpiresAt`、`IsExpired`、`EncodedLength`、`CopyTo(Span<byte>)`、`ToBytes()`、`Parse(ReadOnlySpan<byte>)` |
+| `DHTRecord` | `Key`、`IsWithdrawn`、`FileHash`、`MerkleRoot`、`Length`、`BlockSize`、`BlockCount`、`Revision`、`ExpiresAt`、`IsExpired`、`EncodedLength`、`CopyTo(Span<byte>)`、`ToBytes()`、`Parse(ReadOnlySpan<byte>)`、`Create(...)`、`CreateWithdrawal(...)` |
 | `IDHTContentStore` | `PutAsync(string blockHash, ReadOnlyMemory<byte>, CancellationToken)`、`GetAsync(string blockHash, CancellationToken)` |
 | `IDHTContentFallback` | `TryAcquireAsync(DHTRecord, CancellationToken)`；在本地尚无被请求内容时按需取得该内容 |
 | `MemoryDHTContentStore` | `MemoryDHTContentStore(long capacity = 64 MiB, int maxEntries = 65536)` |
@@ -219,6 +223,93 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | `DHTDirectRoute`、`DHTRelayRoute` | `Endpoint`、`Transport`；`Relay`、`AttemptPunch` |
 | `DHTCapabilities` | `Download = 1`、`Provide = 2`、`Relay = 4` |
 | `DHTTransport` | `Tcp`、`Udp` |
+
+## 用协议 API 实现自己的节点
+
+`MajDHTNode` 只是 MajDHT v1 协议的一种实现，并非必须使用。它用来参与协议的所有类型
+都是公开的，因此应用可以自行编写参与者——无论是最小化的客户端、专用的索引节点，还是
+节点逻辑的移植——并与参考节点互通。线格式由 [PROTOCOL.zh-CN.md](PROTOCOL.zh-CN.md)
+定义；下表中的类型实现了该格式，并且正是参考节点自身使用的同一份代码，因此自定义节点
+对消息的编码与校验方式与参考实现完全一致。[IMPLEMENTING.zh-CN.md](IMPLEMENTING.zh-CN.md)
+详细说明了协议的行为与流程、每个公开类型的含义、如何通过构造函数扩展 `MajDHTNode`，
+以及如何一步步实现一个独立的节点。
+
+| 类型（除注明外位于 `MajDHTNetwork.Protocol`） | 用途 |
+| --- | --- |
+| `Wire` | 基于池化缓冲区的规范编码器与零拷贝解码器：`PutByte`/`Byte`、`PutLong`/`Long`、`Put`/`Bytes(limit)`、`PutText`/`Text(limit)`、`PutRaw`、`PutHex`、`Tag`、`End`、`WrittenMemory`、`ToArray`、`MaxPacket`。 |
+| `Operation` | 操作字节：`Ping`、`Find`、`Store`、`Block`、`Relay`、`Rendezvous`、`Punch`、`Hello`、`Probe`；响应置位第 7 位。 |
+| `Packet` | 一条请求或响应：`Packet(sender, requestId, kind, body)`、`Seal(identity, recipient)`、`SealHello(identity)`、`Open(identity, envelope)`、`CheckForward(envelope, destinationId)`、`Sender`、`RequestId`、`Kind`、`Body`、`RequestIdLength`。 |
+| `ResponseStatus` | 每个响应体的状态包装：`WriteSuccess`、`WriteRejection`、`ReadResult`。 |
+| `FindMessage`、`FindMode`、`FindRequest`、`FindResponse`、`ContactList` | Find 请求与结果的编解码，联系人列表有界且逐个独立校验。 |
+| `StoreMessage`、`BlockMessage`、`BlockRequest` | Store 与 Block 的编解码；`BlockMessage.ReadResponse` 按请求方自己持有的记录校验块长度、位置与 Merkle 证明。 |
+| `RelayMessage`、`RelayRequest` | 不透明中继的编解码；`ReadRequest` 对内层信封强制执行转发规则。 |
+| `HelloMessage`、`ObservedEndpoint` | Hello 结果，以及与 Rendezvous 共用的被观测端点编码。 |
+| `RendezvousMessage`、`RendezvousAction`、`RendezvousIntroduction`、`RendezvousPollResponse`、`DialBackArrangement`、`DialBackDelegation`、`PunchMessage`、`ProbeMessage`、`ProbeRequest` | 登记、引荐、回拨、打洞与探测的编解码，用于中继辅助穿透与可达性。 |
+| `MerkleTree` | 带域分隔的叶子与父节点哈希：`Leaf`、`AppendLeaf`、`Root`、`Count`、`LeafId`、`WriteProof`、`Proof`、`Verify`、`VerifyLocal`。 |
+| `Crypto` | `Hash`、`HashPrefixed`、`Hex`、`HexTo`、`ParseHash`、`IsHash`、`AsciiEquals`、`Random`、`Fill`、`Shuffle`、`Verify`、`Hkdf`，以及摘要、协商密钥、nonce 与标签长度常量。 |
+| `IdentityPuzzle` | Argon2id 身份工作量：`Evaluate`、`Work`、`Remember`、`Search` 及其参数。 |
+| `ProtocolTags`、`NetworkScope`、`XorDistanceComparer` | 规范标签、地址作用域与网络前缀规则、XOR 距离排序。 |
+| `OwnedMemory`、`OwnedPacket`、`PooledBuffer` | 接收信封所借用的池化帧的所有权。 |
+| `MajDHTNetwork.Transport.SocketTransport`、`DHTEnvelopeHandler`、`TransmissionCounter` | TCP 分帧、UDP Cookie 与重试、监听器与会话：`SocketTransport(options, handler)`、`Bind`、`Run`、`ExchangeAtAsync`、`PunchAsync`、`TcpPort`、`UdpPort`、`PortFor`、`Stop`、`DisposeAsync`。 |
+| `DHTPeer`、`DHTRecord`、`DHTIdentity`、`DHTNodeOptions`（根命名空间） | `DHTPeer.Create`、`Parse`、`Encoded`、`NodeHash`、`SigningKey`、`AgreementKey`、`SameAdvertisement`；`DHTRecord.Create`、`CreateWithdrawal`、`ParseCached`、`Encoded`、`SameContent`；`DHTIdentity.Sign`、`SignTo`、`AgreementPublicKey`、`NodeHash`、`NextSequence`；`DHTNodeOptions.Snapshot`。 |
+
+节点实现通过 `DHTEnvelopeHandler` 接收信封，用 `Packet.Open` 打开，用对应操作的编解码器
+读取请求体，把结果连同 `ResponseStatus` 包装写入一个 `Wire`，再把回复封装给已认证的发送
+方。处理器的任务完成后传输层会释放接收帧，因此需要保留的请求内容必须复制。发送请求使用
+`Packet.Seal` 与 `SocketTransport.ExchangeAtAsync`；调用方在读取结果前须校验响应的发送方、
+操作与请求标识符。本文档描述的身份工作量、重放缓存、路由准入、配额与 Sybil 策略属于节点
+策略而非编解码：自定义节点需要自行实施。
+
+```csharp
+using System;
+using System.IO;
+using System.Net;
+using System.Threading.Tasks;
+using MajDHTNetwork;
+using MajDHTNetwork.Protocol;
+using MajDHTNetwork.Transport;
+
+#nullable enable
+
+// 一个只应答 Ping 与 Hello、不提供其他服务的参与者。
+var identity = new DHTIdentity();
+DHTPeer self = null!;
+var transport = new SocketTransport(new DHTNodeOptions { UdpPort = null }, (envelope, kind, source, token) =>
+{
+    var request = Packet.Open(identity, envelope);
+    using var result = new Wire();
+    using var body = new Wire();
+    try
+    {
+        using var reader = new Wire(request.Body);
+        switch ((Operation)request.Kind)
+        {
+            case Operation.Ping:
+                reader.End();
+                break;
+            case Operation.Hello:
+                HelloMessage.ReadRequest(reader);
+                HelloMessage.WriteResponse(result, source);
+                break;
+            default:
+                throw new IOException("Unsupported operation.");
+        }
+        ResponseStatus.WriteSuccess(body, result.WrittenSpan);
+    }
+    catch (Exception)
+    {
+        ResponseStatus.WriteRejection(body);
+    }
+    var reply = new Packet(self, request.RequestId, (byte)(request.Kind | 128), body.WrittenMemory);
+    return Task.FromResult<ReadOnlyMemory<byte>>(reply.Seal(identity, request.Sender));
+});
+transport.Bind();
+self = DHTPeer.Create(identity, IPAddress.Loopback, transport.TcpPort, 0, DHTCapabilities.Download);
+transport.Run();
+```
+
+测试工程中的 `MinimalProtocolNode` 是一个仅基于这组 API 的完整示例：它提供一个文件、
+索引他人的发布通告、从参考节点下载，也能被参考节点发现并下载。
 
 ## 身份、密钥与完整性
 
@@ -612,7 +703,7 @@ NAT、WAN 或硬件。上述宿主与网络条件在部署前需要各自进行�
 dotnet pack MajDHTNetwork.csproj --configuration Release --output artifacts/nuget
 ```
 
-包内包含 netstandard2.1 的 DLL、XML 文档文件、`README.md`、`PROTOCOL.md` 与 `LICENSE`；
+包内包含 netstandard2.1 的 DLL、XML 文档文件、`README.md`、`PROTOCOL.md`、`IMPLEMENTING.md` 与 `LICENSE`；
 测试源码不会被打包。请按所选馈送（feed）的常规发布流程上传 `.nupkg`。
 
 `Publish.ps1` 自动化完整的发布流程：锁定还原、Release 构建、回归与分配测试、NuGet 与符号包、
