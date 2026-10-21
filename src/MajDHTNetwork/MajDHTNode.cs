@@ -198,6 +198,7 @@ namespace MajDHTNetwork
                     _transport.Stop();
                 });
                 _maintenance = MaintainAsync();
+                StartRouteKeepAlive();
                 if (_options.BootstrapEndpoints.Count != 0)
                 {
                     _bootstrap = BootstrapInBackgroundAsync();

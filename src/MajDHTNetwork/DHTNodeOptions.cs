@@ -96,6 +96,13 @@ namespace MajDHTNetwork
         /// intervals and at most five minutes.
         /// </summary>
         public TimeSpan NatRegistrationLifetime { get; set; } = TimeSpan.FromSeconds(30);
+        /// <summary>
+        /// Gets or sets the longest idle gap a punched TCP or UDP route may have before this node sends an authenticated Ping
+        /// over it, so that the NAT mappings, firewall state and TCP session along the route stay open while the route lives;
+        /// from 50 milliseconds to 25 seconds, which stays below both common UDP mapping timeouts and the 30-second minimum
+        /// idle lifetime of a TCP session.
+        /// </summary>
+        public TimeSpan NatKeepAliveInterval { get; set; } = TimeSpan.FromSeconds(15);
         /// <summary>Gets or sets the interval between reachability dial-back checks, from one minute to one day.</summary>
         public TimeSpan ReachabilityCheckInterval { get; set; } = TimeSpan.FromMinutes(30);
         /// <summary>
@@ -148,6 +155,7 @@ namespace MajDHTNetwork
                 || NatPollInterval < TimeSpan.FromMilliseconds(50) || NatPollInterval > TimeSpan.FromMinutes(1)
                 || NatRegistrationLifetime < TimeSpan.FromSeconds(1) || NatRegistrationLifetime > TimeSpan.FromMinutes(5)
                 || NatRegistrationLifetime.Ticks / 3 < NatPollInterval.Ticks
+                || NatKeepAliveInterval < TimeSpan.FromMilliseconds(50) || NatKeepAliveInterval > TimeSpan.FromSeconds(25)
                 || ReachabilityCheckInterval < TimeSpan.FromMinutes(1) || ReachabilityCheckInterval > TimeSpan.FromDays(1)
                 || MaxNatRegistrations < 1 || MaxNatRegistrations > 65536 || MaxTraversalNodes < 1 || MaxTraversalNodes > 16
                 || MaxForwarders < 1 || MaxForwarders > 16

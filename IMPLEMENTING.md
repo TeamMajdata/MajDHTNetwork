@@ -259,7 +259,10 @@ from forwarding sessions, even on a node that has both capabilities.
    to each other's observed endpoint from their listening ports, retrying within
    the ticket lifetime. A receiver accepts a probe only for an active ticket
    whose peer identity, transport and exact source endpoint match, then caches
-   the direct route.
+   the direct route. While the route lives, each peer sends a `Ping` over it
+   whenever it has been idle for about `NatKeepAliveInterval`, so the NAT
+   mappings and the TCP session stay open, and drops it after two consecutive
+   keepalive failures that reached the network.
 4. **Fallback.** If punching fails, or a direct request after punching fails,
    the requester forwards through a Forwarder, which is the same node when it
    advertises both capabilities.

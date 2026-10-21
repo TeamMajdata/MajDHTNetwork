@@ -204,6 +204,7 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | `NatTraversalTimeout` | `5 秒` |
 | `NatPollInterval` | `1 秒` |
 | `NatRegistrationLifetime` | `30 秒`（至少覆盖三个轮询间隔） |
+| `NatKeepAliveInterval` | `15 秒`（允许 50 毫秒–25 秒；打洞路由空闲多久后发送保活 Ping） |
 | `ReachabilityCheckInterval` | `30 分钟`（允许 1 分钟–1 天） |
 | `MaxNatRegistrations` | `256`（托管的穿透登记、托管的转发会话与保留的直连路径各自的上限） |
 | `MaxTraversalNodes` | `4`（允许 1–16） |
@@ -534,7 +535,10 @@ await provider.RegisterForwarderAsync(forwarderPeer, cancellationToken);
 用 `DHTTransport.Tcp` 请求 TCP 同时打开。Traversal 节点分发双方观测到的端点以及一个随机、会过期的
 128 位票据。每个节点都从自己绑定的监听端口发起探测。有效的直连探测必须匹配票据、节点身份、
 传输与观测端点；此后普通请求便走已认证的直连路由。TCP 会保留已建立的连接以服务后续请求。
-即使 Traversal 节点离线，已成功的直连传输仍可继续。会话循环与未完成的探测会在 `StopAsync` 期间排空。
+即使 Traversal 节点离线，已成功的直连传输仍可继续。打洞路由有效期间，双方都会保持它畅通：路由空闲约
+`NatKeepAliveInterval`（默认 15 秒）后，双方各自经它发送一个已认证的 Ping，使 NAT 映射、防火墙状态与
+TCP 会话不会在两次传输之间过期。连续两次不响应保活的路由会被丢弃，下一个请求随即改走辅助路由。
+会话循环、保活与未完成的探测会在 `StopAsync` 期间排空。
 
 辅助穿透要求被穿透的传输存在本地监听器，因为出站探测必须复用该监听器的端口。将
 `EnableNatTraversal` 设为 `false` 可关闭客户端登记、转发会话与自动穿透；声明 `Traversal` 或

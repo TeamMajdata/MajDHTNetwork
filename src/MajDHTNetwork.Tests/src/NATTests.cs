@@ -235,11 +235,16 @@ namespace MajDHTNetwork.Tests
         [InlineData(nameof(DHTNodeOptions.MaxTraversalNodes), 17)]
         [InlineData(nameof(DHTNodeOptions.MaxForwarders), 0)]
         [InlineData(nameof(DHTNodeOptions.MaxForwarders), 17)]
+        [InlineData(nameof(DHTNodeOptions.NatKeepAliveInterval), 49)]
+        [InlineData(nameof(DHTNodeOptions.NatKeepAliveInterval), 25001)]
         public void InvalidNatLimitsAreRejected(string option, int value)
         {
             var options = NatOptions(DHTTransport.Tcp, DHTCapabilities.Download);
             switch (option)
             {
+                case nameof(DHTNodeOptions.NatKeepAliveInterval):
+                    options.NatKeepAliveInterval = TimeSpan.FromMilliseconds(value);
+                    break;
                 case nameof(DHTNodeOptions.NatTraversalTimeout):
                     options.NatTraversalTimeout = TimeSpan.FromMilliseconds(value);
                     break;

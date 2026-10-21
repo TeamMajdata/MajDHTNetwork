@@ -21,8 +21,8 @@ namespace MajDHTNetwork
         private readonly Dictionary<string, AssistantSession> _traversalNodes = new Dictionary<string, AssistantSession>();
         /// <summary>The authenticated, short-lived introduction tickets.</summary>
         private readonly Dictionary<string, PunchSession> _punchSessions = new Dictionary<string, PunchSession>();
-        /// <summary>The recently authenticated direct endpoints indexed by peer and transport.</summary>
-        private readonly Dictionary<(string, DHTTransport), ObservedRoute> _directRoutes = new Dictionary<(string, DHTTransport), ObservedRoute>();
+        /// <summary>The recently authenticated punched routes indexed by peer and transport, kept open by the route keepalive.</summary>
+        private readonly Dictionary<(string, DHTTransport), DirectRoute> _directRoutes = new Dictionary<(string, DHTTransport), DirectRoute>();
 
         /// <summary>Registers the node's bound TCP and UDP endpoints with a Traversal node and maintains the leases until shutdown.</summary>
         /// <param name="traversal">A Traversal node at the endpoints observed for it.</param>
@@ -668,7 +668,7 @@ namespace MajDHTNetwork
                 }
             }
             var expiresAt = DateTimeOffset.UtcNow.AddMinutes(5);
-            _directRoutes[key] = new ObservedRoute(CopyEndpoint(endpoint), expiresAt < peer.ExpiresAt ? expiresAt : peer.ExpiresAt);
+            _directRoutes[key] = new DirectRoute(peer, CopyEndpoint(endpoint), expiresAt < peer.ExpiresAt ? expiresAt : peer.ExpiresAt);
         }
 
         /// <summary>Uses an authenticated punched route or a hosted registration or session before trying the peer's observed endpoints.</summary>
@@ -690,10 +690,16 @@ namespace MajDHTNetwork
             {
                 var transport = attempt == 0 ? _options.PreferredTransport : OtherTransport(_options.PreferredTransport);
                 ObservedRoute route;
+                DirectRoute? punched = null;
                 var key = (peer.NodeId, transport);
                 lock (_gate)
                 {
-                    if (!_directRoutes.TryGetValue(key, out route) || route.ExpiresAt <= DateTimeOffset.UtcNow)
+                    if (_directRoutes.TryGetValue(key, out var cached) && cached.ExpiresAt > DateTimeOffset.UtcNow)
+                    {
+                        punched = cached;
+                        route = new ObservedRoute(cached.Endpoint, cached.ExpiresAt);
+                    }
+                    else
                     {
                         _directRoutes.Remove(key);
                         if (!TryGetHostedBindingLocked(peer.NodeId, transport, out route))
@@ -705,8 +711,10 @@ namespace MajDHTNetwork
                 try
                 {
                     // Punched routes and hosted bindings are mappings towards this node; they are not referred to others.
-                    return new DirectExchange(
-                        await ExchangeCountedAsync(peer, transport, route.Endpoint, envelope, cancellationToken).ConfigureAwait(false), null);
+                    var response = await ExchangeCountedAsync(peer, transport, route.Endpoint, envelope, cancellationToken).ConfigureAwait(false);
+                    // The exchange refreshed the NAT state along the route, so the keepalive need not ping it for a while.
+                    punched?.MarkActive();
+                    return new DirectExchange(response, null);
                 }
                 catch (Exception exception) when (IsPeerFailure(exception))
                 {
@@ -852,13 +860,17 @@ namespace MajDHTNetwork
             }
         }
 
-        /// <summary>Waits for every retained session loop, probe, reachability check and contact announcement after lifetime cancellation.</summary>
+        /// <summary>
+        /// Waits for every retained session loop, probe, route keepalive, reachability check and contact announcement after
+        /// lifetime cancellation.
+        /// </summary>
         /// <returns>Completion after all background assistance work has drained.</returns>
         private Task DrainAssistanceAsync()
         {
             lock (_gate)
             {
                 var work = ReachabilityWorkLocked();
+                work.Add(_routeKeepAlive);
                 foreach (var session in _traversalNodes.Values)
                 {
                     work.Add(session.Work);

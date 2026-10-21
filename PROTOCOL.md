@@ -312,6 +312,19 @@ registrations and completed expired tickets are reclaimed during negotiation.
 Direct routes expire after five minutes or the signed peer lease, whichever
 comes first. A failed direct route is removed and normal route selection resumes.
 
+Both peers keep each of their punched routes open while it lives, because NAT
+mappings, stateful firewalls and TCP sessions close after a period without
+traffic and the peer then has to be punched again. Every half
+`NatKeepAliveInterval` (default 15 seconds, at most 25 seconds) a node sends an
+ordinary authenticated Ping over each route that has carried no successful
+exchange for at least half an interval, so an idle route never stays silent
+much longer than one interval, and a route in use is not pinged. Over UDP the
+Ping uses the listener socket of the route; over TCP it uses the punched
+session, which also renews the session's idle lifetime of at least 30 seconds
+at both ends. A route whose keepalive fails twice in a row after reaching the
+network is removed; a keepalive the node could not send because its outgoing
+exchange limit was reached does not count.
+
 ## Reachability and dial-back
 
 A node records every endpoint observed for it by an authenticated Traversal,

@@ -218,6 +218,7 @@ process.
 | `NatTraversalTimeout` | `5 s` |
 | `NatPollInterval` | `1 s` |
 | `NatRegistrationLifetime` | `30 s` (must cover at least three poll intervals) |
+| `NatKeepAliveInterval` | `15 s` (50 ms–25 s; longest idle gap of a punched route before a keepalive Ping) |
 | `ReachabilityCheckInterval` | `30 min` (1 min–1 day accepted) |
 | `MaxNatRegistrations` | `256` (hosted traversal registrations, hosted forwarding sessions and retained direct routes, each) |
 | `MaxTraversalNodes` | `4` (1–16 accepted) |
@@ -662,7 +663,12 @@ peer probes from its bound listening port. A valid direct probe must match the
 ticket, peer identity, transport and observed endpoint; ordinary requests then
 use the authenticated direct route. TCP retains the established connection for
 further requests. Successful direct transfers can continue while the Traversal
-node is offline. The session loops and outstanding probes drain during
+node is offline. Both peers keep a punched route open while it lives: when it
+has been idle for about `NatKeepAliveInterval` (15 seconds by default), each
+sends an authenticated Ping over it, so NAT mappings, firewall state and the TCP
+session do not expire between transfers. A route that stops answering two
+keepalives in a row is dropped, and the next request falls back to an assisted
+route at once. The session loops, keepalives and outstanding probes drain during
 `StopAsync`.
 
 Assisted traversal requires a local listener for the transport being punched,
