@@ -821,6 +821,7 @@ namespace MajDHTNetwork
             foreach (var key in expired)
             {
                 _records.Remove(key);
+                _announced.Remove(key);
             }
             expired.Clear();
             foreach (var entry in _providers)
@@ -856,7 +857,7 @@ namespace MajDHTNetwork
             }
             foreach (var key in expired)
             {
-                _contents.Remove(key);
+                RemoveLocalContentLocked(key);
             }
         }
 
@@ -888,7 +889,7 @@ namespace MajDHTNetwork
                         TriggerReachabilityCheck();
                     }
                     await LookupAsync(0, NodeId, _lifetime.Token).ConfigureAwait(false);
-                    await ReannounceLocalRecordsAsync(_lifetime.Token).ConfigureAwait(false);
+                    await ReannounceLocalRecordsAsync(true, _lifetime.Token).ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
@@ -907,23 +908,16 @@ namespace MajDHTNetwork
         /// Reannounces every unexpired locally available publication and this publisher's own withdrawals, as many at once as
         /// <see cref="MaxConcurrentReplications"/> allows.
         /// </summary>
+        /// <param name="skipRecentlyAnnounced">
+        /// Whether records announced less than one maintenance interval ago are left for the next pass, as maintenance does;
+        /// false after a contact change, because every provider claim must then carry the new contact.
+        /// </param>
         /// <param name="cancellationToken">The node lifetime.</param>
         /// <returns>Completion after every announcement attempt.</returns>
         /// <exception cref="OperationCanceledException">The node stopped.</exception>
-        private async Task ReannounceLocalRecordsAsync(CancellationToken cancellationToken)
+        private async Task ReannounceLocalRecordsAsync(bool skipRecentlyAnnounced, CancellationToken cancellationToken)
         {
-            var publications = new List<DHTRecord>();
-            lock (_gate)
-            {
-                foreach (var record in _records.Values)
-                {
-                    if (record.IsWithdrawn ? record.Key.PublisherId == NodeId
-                        : (_options.Capabilities & DHTCapabilities.Provide) != 0 && _contents.ContainsKey(ContentId(record)))
-                    {
-                        publications.Add(record);
-                    }
-                }
-            }
+            var publications = LocalRecordsToReannounce(skipRecentlyAnnounced);
             await ForEachAsync(publications, MaxConcurrentReplications, async record =>
             {
                 try
@@ -947,6 +941,39 @@ namespace MajDHTNetwork
                     Log(LogLevel.Warning, "Maintenance announcement failed: ", exception);
                 }
             }).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Lists the records a reannouncement covers: every locally available publication and this publisher's own
+        /// withdrawals. Leaving out records that reached a replica under the same revision less than one maintenance interval
+        /// ago keeps maintenance from repeating, while many publications are still being announced, the announcements they
+        /// just made; a record left out is included again by the following pass.
+        /// </summary>
+        /// <param name="skipRecentlyAnnounced">Whether records announced less than one maintenance interval ago are left out.</param>
+        /// <returns>The records to reannounce.</returns>
+        internal List<DHTRecord> LocalRecordsToReannounce(bool skipRecentlyAnnounced)
+        {
+            var recent = Stopwatch.GetTimestamp() - (long)(_options.MaintenanceInterval.TotalSeconds * Stopwatch.Frequency);
+            var publications = new List<DHTRecord>();
+            lock (_gate)
+            {
+                foreach (var entry in _records)
+                {
+                    var record = entry.Value;
+                    if (!(record.IsWithdrawn ? record.Key.PublisherId == NodeId
+                        : (_options.Capabilities & DHTCapabilities.Provide) != 0 && _contents.ContainsKey(ContentId(record))))
+                    {
+                        continue;
+                    }
+                    if (skipRecentlyAnnounced && _announced.TryGetValue(entry.Key, out var announced)
+                        && announced.Revision == record.Revision && announced.Timestamp > recent)
+                    {
+                        continue;
+                    }
+                    publications.Add(record);
+                }
+            }
+            return publications;
         }
 
         /// <summary>Associates an authenticated provider claim with the source address of its announcement.</summary>

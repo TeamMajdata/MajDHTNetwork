@@ -52,6 +52,18 @@ namespace MajDHTNetwork
         /// <summary>The locally available Merkle trees indexed by file hash and block size.</summary>
         private readonly Dictionary<string, LocalContent> _contents = new Dictionary<string, LocalContent>();
         /// <summary>
+        /// The Merkle leaves of every tree in <see cref="_contents"/>, kept in step with it by
+        /// <see cref="SetLocalContentLocked"/> and <see cref="RemoveLocalContentLocked"/>, so registering content checks the
+        /// leaf quota without walking every tree; that walk made registering N contents quadratic under the index lock.
+        /// </summary>
+        private long _localLeaves;
+        /// <summary>
+        /// The revision and <see cref="Stopwatch"/> timestamp with which each record last reached a remote replica, keyed by
+        /// canonical lookup key, so maintenance does not reannounce a record that a publication, import, renewal or the
+        /// previous maintenance pass announced less than one maintenance interval ago. Entries leave with their records.
+        /// </summary>
+        private readonly Dictionary<string, (long Revision, long Timestamp)> _announced = new Dictionary<string, (long, long)>();
+        /// <summary>
         /// The shortest interval between two opportunistic prunes of the index, in <see cref="Stopwatch"/> ticks. A prune
         /// walks every record, revision, provider claim and local tree, so pruning on every cached record made a node with
         /// many records quadratic; postponing the walk is safe because every reader checks expiry itself and the quota

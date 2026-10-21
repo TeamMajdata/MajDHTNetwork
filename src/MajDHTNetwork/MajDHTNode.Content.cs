@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Security.Cryptography;
 using System.Threading;
@@ -552,24 +553,46 @@ namespace MajDHTNetwork
                     }
                 }
                 CacheRecord(record, (_options.Capabilities & DHTCapabilities.Provide) == 0 ? null : new DHTPeer(_self!, Array.Empty<DHTEndpoint>()));
-                _contents[id] = new LocalContent(record, tree);
+                SetLocalContentLocked(id, new LocalContent(record, tree));
             }
         }
 
         /// <summary>Counts the Merkle leaves of every registered tree except the geometry about to be registered or replaced.</summary>
         /// <param name="id">The geometry identifier being registered.</param>
         /// <returns>The leaves held by the other local trees.</returns>
+        /// <remarks>The caller must hold the index lock.</remarks>
         private long CountOtherLeavesLocked(string id)
         {
-            long leaves = 0;
-            foreach (var entry in _contents)
+            return _contents.TryGetValue(id, out var existing) ? _localLeaves - existing.Tree.Count : _localLeaves;
+        }
+
+        /// <summary>Registers or replaces the local tree of a geometry and keeps the leaf total in step.</summary>
+        /// <param name="id">The geometry identifier.</param>
+        /// <param name="content">The verified local content.</param>
+        /// <remarks>The caller must hold the index lock.</remarks>
+        private void SetLocalContentLocked(string id, LocalContent content)
+        {
+            if (_contents.TryGetValue(id, out var replaced))
             {
-                if (entry.Key != id)
-                {
-                    leaves += entry.Value.Tree.Count;
-                }
+                _localLeaves -= replaced.Tree.Count;
             }
-            return leaves;
+            _contents[id] = content;
+            _localLeaves += content.Tree.Count;
+        }
+
+        /// <summary>Forgets the local tree of a geometry and keeps the leaf total in step.</summary>
+        /// <param name="id">The geometry identifier.</param>
+        /// <returns>Whether a tree was registered for the geometry.</returns>
+        /// <remarks>The caller must hold the index lock.</remarks>
+        private bool RemoveLocalContentLocked(string id)
+        {
+            if (!_contents.TryGetValue(id, out var removed))
+            {
+                return false;
+            }
+            _contents.Remove(id);
+            _localLeaves -= removed.Tree.Count;
+            return true;
         }
 
         /// <summary>Replicates a signed publication near both its key and complete-file hash.</summary>
@@ -653,6 +676,13 @@ namespace MajDHTNetwork
                         Interlocked.Increment(ref accepted);
                     }
                 }).ConfigureAwait(false);
+                if (accepted > 0)
+                {
+                    lock (_gate)
+                    {
+                        _announced[record.Key.ToString()] = (record.Revision, Stopwatch.GetTimestamp());
+                    }
+                }
                 return accepted;
             }
             finally

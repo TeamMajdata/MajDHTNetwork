@@ -105,7 +105,7 @@ namespace MajDHTNetwork
                 }
                 foreach (var geometry in geometries)
                 {
-                    removed |= _contents.Remove(geometry);
+                    removed |= RemoveLocalContentLocked(geometry);
                 }
                 if (_providers.TryGetValue(fileHash, out var providers))
                 {

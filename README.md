@@ -558,10 +558,17 @@ run at once only when both fit, and the number of replications in flight is
 `MaxConcurrentRequests` divided by that footprint, at least one (one with the
 defaults, raise `MaxConcurrentRequests` for more). Maintenance reannounces
 records with the same bound, so the maintenance of many publications also runs
-in parallel where the budget allows. The index of records, revisions, provider
-claims and local trees is pruned at most once per second on the paths that
-cache or register a record, and at once when a quota appears full, so
-publishing or receiving many records costs time linear in their number.
+in parallel where the budget allows. A maintenance pass leaves out records that
+reached a replica under the same revision less than one `MaintenanceInterval`
+ago, such as publications made moments before, and the following pass includes
+them again, so maintenance during a long bulk publication does not repeat its
+announcements; a contact change still reannounces every record. The index of
+records, revisions, provider claims and local trees is pruned at most once per
+second on the paths that cache or register a record, and at once when a quota
+appears full, and the total of local Merkle leaves is kept in step as trees are
+registered, replaced and removed, so the leaf quota check never walks every
+tree. Publishing or receiving many records therefore costs time linear in their
+number.
 
 A publisher with many files need not read them again after a restart. Besides
 the blocks themselves, all the node needs to serve a file is its leaves: the
