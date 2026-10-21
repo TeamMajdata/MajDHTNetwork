@@ -862,10 +862,10 @@ namespace MajDHTNetwork
         }
 
         /// <summary>
-        /// Refreshes contact leases, retries bootstrap while isolated, schedules reachability checks and reannounces locally
-        /// available content on a cancellable interval.
+        /// Refreshes contact leases, retries bootstrap while isolated, schedules reachability checks and starts reannouncing
+        /// locally available content on a cancellable interval.
         /// </summary>
-        /// <returns>Completion when the node stops.</returns>
+        /// <returns>Completion when the node stops and the last reannouncement pass has ended.</returns>
         private async Task MaintainAsync()
         {
             try
@@ -889,7 +889,12 @@ namespace MajDHTNetwork
                         TriggerReachabilityCheck();
                     }
                     await LookupAsync(0, NodeId, _lifetime.Token).ConfigureAwait(false);
-                    await ReannounceLocalRecordsAsync(true, _lifetime.Token).ConfigureAwait(false);
+                    // A pass can yield to publications for a long time, so it runs apart from this loop, which keeps renewing
+                    // the contact and pruning on time; the next pass starts at the first interval after it ended.
+                    if (_reannouncement.IsCompleted)
+                    {
+                        _reannouncement = ReannounceInBackgroundAsync();
+                    }
                 }
             }
             catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
@@ -902,37 +907,66 @@ namespace MajDHTNetwork
                     Log(LogLevel.Error, "Maintenance stopped: ", exception);
                 }
             }
+            finally
+            {
+                await _reannouncement.ConfigureAwait(false);
+            }
+        }
+
+        /// <summary>Runs one scheduled reannouncement pass apart from the maintenance loop and logs its unexpected failure.</summary>
+        /// <returns>Completion after the pass, also when it failed or the node stopped.</returns>
+        private async Task ReannounceInBackgroundAsync()
+        {
+            try
+            {
+                await ReannounceLocalRecordsAsync(true, _lifetime.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+            {
+            }
+            catch (Exception exception)
+            {
+                Log(LogLevel.Warning, "Maintenance reannouncement failed: ", exception);
+            }
         }
 
         /// <summary>
-        /// Reannounces every unexpired locally available publication and this publisher's own withdrawals, as many at once as
-        /// <see cref="MaxConcurrentReplications"/> allows.
+        /// Reannounces the records <see cref="LocalRecordsToReannounce"/> lists, as many at once as
+        /// <see cref="MaxConcurrentReplications"/> allows and earliest deadline first. Each reannouncement first yields to
+        /// publications until its deadline, then drops out if the wait made it unnecessary.
         /// </summary>
-        /// <param name="skipRecentlyAnnounced">
-        /// Whether records announced less than one maintenance interval ago are left for the next pass, as maintenance does;
-        /// false after a contact change, because every provider claim must then carry the new contact.
+        /// <param name="scheduled">
+        /// Whether this is a scheduled maintenance pass; false after a contact change, because every provider claim must then
+        /// carry the new contact without waiting for publications.
         /// </param>
         /// <param name="cancellationToken">The node lifetime.</param>
         /// <returns>Completion after every announcement attempt.</returns>
         /// <exception cref="OperationCanceledException">The node stopped.</exception>
-        private async Task ReannounceLocalRecordsAsync(bool skipRecentlyAnnounced, CancellationToken cancellationToken)
+        internal async Task ReannounceLocalRecordsAsync(bool scheduled, CancellationToken cancellationToken)
         {
-            var publications = LocalRecordsToReannounce(skipRecentlyAnnounced);
-            await ForEachAsync(publications, MaxConcurrentReplications, async record =>
+            var reannouncements = LocalRecordsToReannounce(scheduled);
+            if (reannouncements.Count == 0)
+            {
+                return;
+            }
+            Log(LogLevel.Debug, scheduled ? "Maintenance is reannouncing local records." : "Reannouncing local records with the changed contact.");
+            await ForEachAsync(reannouncements, MaxConcurrentReplications, async reannouncement =>
             {
                 try
                 {
-                    if (record.IsExpired)
+                    await _replications.YieldToPublicationsAsync(reannouncement.Deadline, cancellationToken).ConfigureAwait(false);
+                    var record = PendingReannouncement(reannouncement.Record, scheduled);
+                    if (record == null)
                     {
                         return;
                     }
                     if (record.IsWithdrawn)
                     {
-                        await AnnounceWithdrawalAsync(record, null, cancellationToken).ConfigureAwait(false);
+                        await AnnounceWithdrawalAsync(record, null, publication: false, cancellationToken).ConfigureAwait(false);
                     }
                     else
                     {
-                        await AnnounceRecordAsync(record, cancellationToken).ConfigureAwait(false);
+                        await AnnounceRecordAsync(record, publication: false, cancellationToken).ConfigureAwait(false);
                     }
                 }
                 catch (Exception exception) when (IsPeerFailure(exception))
@@ -944,36 +978,101 @@ namespace MajDHTNetwork
         }
 
         /// <summary>
-        /// Lists the records a reannouncement covers: every locally available publication and this publisher's own
-        /// withdrawals. Leaving out records that reached a replica under the same revision less than one maintenance interval
-        /// ago keeps maintenance from repeating, while many publications are still being announced, the announcements they
-        /// just made; a record left out is included again by the following pass.
+        /// Lists the records a reannouncement covers, every locally available publication and this publisher's own
+        /// withdrawals, each with the <see cref="Stopwatch"/> timestamp until which it yields to publications. A scheduled pass
+        /// leaves out records that reached a replica under the same revision less than one
+        /// <see cref="DHTNodeOptions.RepublishInterval"/> ago, so it neither repeats the announcements of a bulk publication
+        /// nor renews claims long before they lapse, and a later pass includes them again. A listed record yields until its
+        /// last accepted announcement, or the start of the pass if no replica accepted its revision, is
+        /// <see cref="DHTNodeOptions.MaxRepublishInterval"/> old, which renews its provider claims before the shortest contact
+        /// lease ends even during an endless publication. After a contact change nothing is left out and nothing yields.
         /// </summary>
-        /// <param name="skipRecentlyAnnounced">Whether records announced less than one maintenance interval ago are left out.</param>
-        /// <returns>The records to reannounce.</returns>
-        internal List<DHTRecord> LocalRecordsToReannounce(bool skipRecentlyAnnounced)
+        /// <param name="scheduled">Whether the list is for a scheduled maintenance pass rather than a contact change.</param>
+        /// <returns>The records to reannounce with their deadlines, earliest deadline first.</returns>
+        internal List<(DHTRecord Record, long Deadline)> LocalRecordsToReannounce(bool scheduled)
         {
-            var recent = Stopwatch.GetTimestamp() - (long)(_options.MaintenanceInterval.TotalSeconds * Stopwatch.Frequency);
-            var publications = new List<DHTRecord>();
+            var now = Stopwatch.GetTimestamp();
+            var maximumDeferral = StopwatchTicks(DHTNodeOptions.MaxRepublishInterval);
+            var reannouncements = new List<(DHTRecord Record, long Deadline)>();
             lock (_gate)
             {
                 foreach (var entry in _records)
                 {
-                    var record = entry.Value;
-                    if (!(record.IsWithdrawn ? record.Key.PublisherId == NodeId
-                        : (_options.Capabilities & DHTCapabilities.Provide) != 0 && _contents.ContainsKey(ContentId(record))))
+                    if (!IsReannouncementDueLocked(entry.Key, entry.Value, scheduled, now))
                     {
                         continue;
                     }
-                    if (skipRecentlyAnnounced && _announced.TryGetValue(entry.Key, out var announced)
-                        && announced.Revision == record.Revision && announced.Timestamp > recent)
-                    {
-                        continue;
-                    }
-                    publications.Add(record);
+                    var deadline = scheduled ? (LastAnnouncementLocked(entry.Key, entry.Value) ?? now) + maximumDeferral : now;
+                    reannouncements.Add((entry.Value, deadline));
                 }
             }
-            return publications;
+            reannouncements.Sort((first, second) => first.Deadline.CompareTo(second.Deadline));
+            return reannouncements;
+        }
+
+        /// <summary>
+        /// Gets the record to announce for a listed reannouncement once it stopped yielding to publications, or null when the
+        /// wait made it unnecessary: the record expired, was superseded or is no longer served, or, in a scheduled pass, a
+        /// publication or renewal announced it meanwhile.
+        /// </summary>
+        /// <param name="listed">The record as <see cref="LocalRecordsToReannounce"/> listed it.</param>
+        /// <param name="scheduled">Whether the reannouncement belongs to a scheduled maintenance pass.</param>
+        /// <returns>The current record of the key at the listed revision, or null.</returns>
+        private DHTRecord? PendingReannouncement(DHTRecord listed, bool scheduled)
+        {
+            var key = listed.Key.ToString();
+            lock (_gate)
+            {
+                if (!_records.TryGetValue(key, out var current) || current.Revision != listed.Revision || current.IsExpired
+                    || !IsReannouncementDueLocked(key, current, scheduled, Stopwatch.GetTimestamp()))
+                {
+                    return null;
+                }
+                return current;
+            }
+        }
+
+        /// <summary>
+        /// Checks whether a record is one this node reannounces, a locally available publication or this publisher's own
+        /// withdrawal, and, for a scheduled pass, whether its <see cref="DHTNodeOptions.RepublishInterval"/> has passed.
+        /// </summary>
+        /// <param name="key">The canonical lookup key.</param>
+        /// <param name="record">The record held for the key.</param>
+        /// <param name="scheduled">Whether a scheduled maintenance pass asks rather than a contact change.</param>
+        /// <param name="now">The current <see cref="Stopwatch"/> timestamp.</param>
+        /// <returns>Whether the record is due for reannouncement.</returns>
+        /// <remarks>The caller must hold the index lock.</remarks>
+        private bool IsReannouncementDueLocked(string key, DHTRecord record, bool scheduled, long now)
+        {
+            if (!(record.IsWithdrawn ? record.Key.PublisherId == NodeId
+                : (_options.Capabilities & DHTCapabilities.Provide) != 0 && _contents.ContainsKey(ContentId(record))))
+            {
+                return false;
+            }
+            var announced = LastAnnouncementLocked(key, record);
+            return !scheduled || announced == null || now - announced.Value >= StopwatchTicks(_options.RepublishInterval);
+        }
+
+        /// <summary>Gets when a record last reached a remote replica under its current revision.</summary>
+        /// <param name="key">The canonical lookup key.</param>
+        /// <param name="record">The record held for the key.</param>
+        /// <returns>The <see cref="Stopwatch"/> timestamp of the last accepted announcement, or null if no replica accepted this revision.</returns>
+        /// <remarks>The caller must hold the index lock.</remarks>
+        private long? LastAnnouncementLocked(string key, DHTRecord record)
+        {
+            if (_announced.TryGetValue(key, out var announced) && announced.Revision == record.Revision)
+            {
+                return announced.Timestamp;
+            }
+            return null;
+        }
+
+        /// <summary>Converts a duration into <see cref="Stopwatch"/> ticks.</summary>
+        /// <param name="duration">The duration.</param>
+        /// <returns>The number of <see cref="Stopwatch"/> ticks that make up the duration.</returns>
+        private static long StopwatchTicks(TimeSpan duration)
+        {
+            return (long)(duration.TotalSeconds * Stopwatch.Frequency);
         }
 
         /// <summary>Associates an authenticated provider claim with the source address of its announcement.</summary>

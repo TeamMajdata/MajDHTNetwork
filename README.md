@@ -214,6 +214,7 @@ process.
 | `UdpAttempts` | `3` |
 | `RecordLifetime` | `24 h` (1 s–7 days accepted) |
 | `MaintenanceInterval` | `5 min` |
+| `RepublishInterval` | `30 min` (1 s–45 min accepted) |
 | `EnableNatTraversal` | `true` (register with Traversal nodes, open forwarding sessions, check reachability, punch) |
 | `NatTraversalTimeout` | `5 s` |
 | `NatPollInterval` | `1 s` |
@@ -558,11 +559,22 @@ run at once only when both fit, and the number of replications in flight is
 `MaxConcurrentRequests` divided by that footprint, at least one (one with the
 defaults, raise `MaxConcurrentRequests` for more). Maintenance reannounces
 records with the same bound, so the maintenance of many publications also runs
-in parallel where the budget allows. A maintenance pass leaves out records that
-reached a replica under the same revision less than one `MaintenanceInterval`
-ago, such as publications made moments before, and the following pass includes
-them again, so maintenance during a long bulk publication does not repeat its
-announcements; a contact change still reannounces every record. The index of
+in parallel where the budget allows, but it does not take slots from
+publications. Each `MaintenanceInterval` the node starts a reannouncement pass,
+unless the previous one is still running, over the records that last reached a
+replica under their revision at least `RepublishInterval` ago (30 minutes by
+default), so a pass during a long bulk publication does not repeat the
+announcements it just made. While a publication, import, renewal or withdrawal
+waits for or holds a replication slot, and for one second after the last one
+ends, the pass yields: it starts no reannouncement. A record stops yielding once
+its last accepted announcement is 45 minutes old, because its provider claims
+carry this node's contact, whose lease is one hour while reachability is
+unverified; the pass handles the records closest to that point first, and a
+record that a publication announced meanwhile is skipped. The pass runs apart
+from the maintenance loop, which keeps renewing the contact and pruning on time.
+A contact change still reannounces every record at once. With 35,000 records,
+the default `RepublishInterval` takes about 20 reannouncements per second where
+a five-minute one would need about 120. The index of
 records, revisions, provider claims and local trees is pruned at most once per
 second on the paths that cache or register a record, and at once when a quota
 appears full, and the total of local Merkle leaves is kept in step as trees are

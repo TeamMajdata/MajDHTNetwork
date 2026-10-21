@@ -137,18 +137,18 @@ namespace MajDHTNetwork.Tests
         }
 
         /// <summary>
-        /// Leaves a record that reached a replica less than one maintenance interval ago out of the maintenance pass, so the
+        /// Leaves a record that reached a replica less than one republish interval ago out of the maintenance pass, so the
         /// passes during a long bulk publication do not repeat its announcements, while a contact change still reannounces
         /// it; once the interval has passed without another accepted announcement, maintenance includes it again.
         /// </summary>
         /// <returns>Completion after the selections were checked.</returns>
         [Fact]
-        public async Task MaintenanceSkipsRecordsAnnouncedWithinOneInterval()
+        public async Task MaintenanceSkipsRecordsAnnouncedWithinOneRepublishInterval()
         {
             using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
             var token = deadline.Token;
             var options = Options(DHTTransport.Tcp, DHTCapabilities.Download | DHTCapabilities.Provide);
-            options.MaintenanceInterval = TimeSpan.FromSeconds(1);
+            options.RepublishInterval = TimeSpan.FromSeconds(1);
             await using var publisher = new MajDHTNode(options);
             var peer = new MajDHTNode(Options(DHTTransport.Tcp, DHTCapabilities.Download));
             DHTRecord record;
@@ -158,8 +158,8 @@ namespace MajDHTNetwork.Tests
                 await publisher.JoinAsync(peer.LocalPeer, token);
                 using var source = new MemoryStream(Crypto.Random(100));
                 record = await publisher.PublishAsync("songs/recent", source, cancellationToken: token);
-                Assert.DoesNotContain(publisher.LocalRecordsToReannounce(true), listed => listed.Key.Equals(record.Key));
-                Assert.Contains(publisher.LocalRecordsToReannounce(false), listed => listed.Key.Equals(record.Key));
+                Assert.DoesNotContain(publisher.LocalRecordsToReannounce(true), listed => listed.Record.Key.Equals(record.Key));
+                Assert.Contains(publisher.LocalRecordsToReannounce(false), listed => listed.Record.Key.Equals(record.Key));
             }
             finally
             {
@@ -167,7 +167,7 @@ namespace MajDHTNetwork.Tests
             }
             // Without the peer no later announcement is accepted, so the last accepted one ages past the interval.
             await Task.Delay(TimeSpan.FromSeconds(1.5), token);
-            Assert.Contains(publisher.LocalRecordsToReannounce(true), listed => listed.Key.Equals(record.Key));
+            Assert.Contains(publisher.LocalRecordsToReannounce(true), listed => listed.Record.Key.Equals(record.Key));
         }
 
         /// <summary>Awaits a publication and captures its record or failure.</summary>

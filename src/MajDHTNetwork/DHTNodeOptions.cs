@@ -17,6 +17,13 @@ namespace MajDHTNetwork
         private const int MaxBootstrapEndpoints = 16;
 
         /// <summary>
+        /// Gets the longest <see cref="RepublishInterval"/>: three quarters of the one-hour lease of a contact whose reachability
+        /// is unverified, which the provider claims of its publications carry. It is also the age of a record's last
+        /// announcement beyond which its reannouncement stops yielding to publications, so claims are renewed before they lapse.
+        /// </summary>
+        internal static TimeSpan MaxRepublishInterval { get; } = TimeSpan.FromMinutes(45);
+
+        /// <summary>
         /// Gets or sets the initial <see cref="IdentityWorkBits"/> of new option instances. Only test hosts change it, to avoid
         /// searching qualifying identities for every short-lived test node.
         /// </summary>
@@ -80,8 +87,19 @@ namespace MajDHTNetwork
         public int UdpAttempts { get; set; } = 3;
         /// <summary>Gets or sets the lease for new publications, from one second to seven days.</summary>
         public TimeSpan RecordLifetime { get; set; } = TimeSpan.FromHours(24);
-        /// <summary>Gets or sets the interval for peer refresh, expiry cleanup and local record reannouncement.</summary>
+        /// <summary>
+        /// Gets or sets the interval for contact renewal, peer refresh, expiry cleanup and starting a reannouncement of the
+        /// local records whose <see cref="RepublishInterval"/> has passed.
+        /// </summary>
         public TimeSpan MaintenanceInterval { get; set; } = TimeSpan.FromMinutes(5);
+        /// <summary>
+        /// Gets or sets how long after a record last reached a remote replica maintenance announces it again, from one second
+        /// to 45 minutes. Reannouncements renew the provider claims, which expire with the publisher's contact after one hour
+        /// while its reachability is unverified, and reach nodes that joined near the key since. A record is reannounced on
+        /// the first maintenance pass after its interval, while no publication is replicating, or once its last announcement
+        /// is 45 minutes old.
+        /// </summary>
+        public TimeSpan RepublishInterval { get; set; } = TimeSpan.FromMinutes(30);
         /// <summary>
         /// Gets or sets whether this node registers with Traversal nodes, opens forwarding sessions with Forwarders, checks its
         /// reachability and attempts assisted direct connections.
@@ -144,6 +162,7 @@ namespace MajDHTNetwork
                 || RequestTimeout < TimeSpan.FromMilliseconds(50) || RequestTimeout > TimeSpan.FromMinutes(2)
                 || RecordLifetime < TimeSpan.FromSeconds(1) || RecordLifetime > TimeSpan.FromDays(7)
                 || MaintenanceInterval < TimeSpan.FromSeconds(1) || MaintenanceInterval > TimeSpan.FromHours(1)
+                || RepublishInterval < TimeSpan.FromSeconds(1) || RepublishInterval > MaxRepublishInterval
                 || NatTraversalTimeout < TimeSpan.FromMilliseconds(50) || NatTraversalTimeout > TimeSpan.FromMinutes(2)
                 || NatPollInterval < TimeSpan.FromMilliseconds(50) || NatPollInterval > TimeSpan.FromMinutes(1)
                 || NatRegistrationLifetime < TimeSpan.FromSeconds(1) || NatRegistrationLifetime > TimeSpan.FromMinutes(5)

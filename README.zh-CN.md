@@ -200,6 +200,7 @@ await downloader.DownloadAsync(alias.Key, destination, record.FileHash, cancella
 | `UdpAttempts` | `3` |
 | `RecordLifetime` | `24 小时`（允许 1 秒–7 天） |
 | `MaintenanceInterval` | `5 分钟` |
+| `RepublishInterval` | `30 分钟`（允许 1 秒–45 分钟） |
 | `EnableNatTraversal` | `true`（向 Traversal 节点登记、建立转发会话、检查可达性、打洞） |
 | `NatTraversalTimeout` | `5 秒` |
 | `NatPollInterval` | `1 秒` |
@@ -467,9 +468,15 @@ var block = await downloader.ReadBlockAsync(record, providerPeer, 0,
 `MaxConcurrentRequests` 个出站交换：只有两次查找合计不超出预算时才会同时进行，同时进行的复制
 数量为 `MaxConcurrentRequests` 除以该占用量，至少为一（默认值下为一；需要更多时请调高
 `MaxConcurrentRequests`）。维护流程以同样的上限重新宣告记录，因此大量发布的维护也会在预算允许
-的范围内并行进行。一轮维护会跳过在不到一个 `MaintenanceInterval` 之前以相同修订号成功送达副本的
-记录（例如刚刚完成的发布），由下一轮再纳入，因此长时间的批量发布期间维护不会重复它刚做过的宣告；
-联系人变更仍会重新宣告全部记录。记录、修订号、提供者声明与本地 Merkle 树的索引在缓存或登记记录的路径上每秒最多
+的范围内并行进行，但不会从发布手中抢占槽位。节点每个 `MaintenanceInterval` 启动一轮重新宣告（上一轮
+仍在进行时不启动），只纳入以当前修订号最后一次送达副本已满 `RepublishInterval`（默认 30 分钟）的
+记录，因此长时间的批量发布期间维护不会重复刚做过的宣告。只要有发布、导入、续签或撤销正在等待或
+占用复制槽位，以及最后一个结束后的一秒内，这一轮都会让路，不启动任何重新宣告。某条记录上次被接受
+的宣告满 45 分钟后不再让路，因为它的提供者声明携带本节点的联系人，而可达性未经验证的联系人租约
+只有一小时；一轮中最接近这一时限的记录先处理，等待期间已被发布宣告过的记录会被跳过。这一轮与维护
+循环分开运行，维护循环照常续签联系人并清理索引。联系人变更仍会立即重新宣告全部记录。对 35,000 条
+记录而言，默认的 `RepublishInterval` 每秒约需 20 次重新宣告，而五分钟的间隔约需 120 次。
+记录、修订号、提供者声明与本地 Merkle 树的索引在缓存或登记记录的路径上每秒最多
 清理一次，配额看似用尽时则立即清理；本地 Merkle 叶子总数随树的登记、替换与移除同步维护，登记内容时
 检查叶子配额无需遍历所有树。因此发布或接收大量记录的耗时与记录数成线性关系。
 

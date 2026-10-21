@@ -38,9 +38,10 @@ namespace MajDHTNetwork
         /// <summary>
         /// Bounds the record replications in flight to <see cref="MaxConcurrentReplications"/>, so many publications, imports
         /// and maintenance announcements at once stay within the outgoing exchange budget of
-        /// <see cref="DHTNodeOptions.MaxConcurrentRequests"/> instead of failing requests and evicting routing contacts.
+        /// <see cref="DHTNodeOptions.MaxConcurrentRequests"/> instead of failing requests and evicting routing contacts, and
+        /// lets maintenance reannouncements yield their share of it to publications.
         /// </summary>
-        private readonly SemaphoreSlim _replications;
+        private readonly ReplicationGate _replications;
         /// <summary>The node shutdown token, also linked to all public operations.</summary>
         private readonly CancellationTokenSource _lifetime = new CancellationTokenSource();
         /// <summary>The signed records keyed by canonical lookup key.</summary>
@@ -59,8 +60,9 @@ namespace MajDHTNetwork
         private long _localLeaves;
         /// <summary>
         /// The revision and <see cref="Stopwatch"/> timestamp with which each record last reached a remote replica, keyed by
-        /// canonical lookup key, so maintenance does not reannounce a record that a publication, import, renewal or the
-        /// previous maintenance pass announced less than one maintenance interval ago. Entries leave with their records.
+        /// canonical lookup key, so maintenance does not reannounce a record that a publication, import, renewal or an
+        /// earlier maintenance pass announced less than one <see cref="DHTNodeOptions.RepublishInterval"/> ago, and knows how
+        /// long a reannouncement may yield to publications. Entries leave with their records.
         /// </summary>
         private readonly Dictionary<string, (long Revision, long Timestamp)> _announced = new Dictionary<string, (long, long)>();
         /// <summary>
@@ -80,6 +82,11 @@ namespace MajDHTNetwork
         private DHTContact? _self;
         /// <summary>The maintenance loop task.</summary>
         private Task _maintenance = Task.CompletedTask;
+        /// <summary>
+        /// The reannouncement pass that the maintenance loop started last; only that loop reads or replaces it, and it starts
+        /// no other pass while this one runs.
+        /// </summary>
+        private Task _reannouncement = Task.CompletedTask;
         /// <summary>The initial background bootstrap through the configured endpoints.</summary>
         private Task _bootstrap = Task.CompletedTask;
         /// <summary>Tracks whether this single-use node has started.</summary>
@@ -175,7 +182,7 @@ namespace MajDHTNetwork
             _routing.Initialize(NodeId, _options.BucketSize);
             _routeSelector = routeSelector ?? new DefaultDHTRouteSelector();
             _contentFallback = contentFallback;
-            _replications = new SemaphoreSlim(MaxConcurrentReplications, MaxConcurrentReplications);
+            _replications = new ReplicationGate(MaxConcurrentReplications, PublicationQuietPeriod);
             _transport = new SocketTransport(_options, HandleAsync, _options.Logger);
         }
 

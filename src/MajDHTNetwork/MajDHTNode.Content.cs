@@ -49,7 +49,7 @@ namespace MajDHTNetwork
             var record = DHTRecord.Create(_identity, name, content.Value.FileHash, tree.Root,
                 content.Value.Length, _options.BlockSize, revision, DateTimeOffset.UtcNow.Add(_options.RecordLifetime));
             await RegisterPublicationAsync(record, tree, cancellation.Token).ConfigureAwait(false);
-            await AnnounceRecordAsync(record, cancellation.Token).ConfigureAwait(false);
+            await AnnounceRecordAsync(record, publication: true, cancellation.Token).ConfigureAwait(false);
             Log(LogLevel.Information, "Content publication completed.");
             return record;
         }
@@ -96,7 +96,7 @@ namespace MajDHTNetwork
             var record = DHTRecord.Create(_identity, name, fileHash, tree.Root, length, _options.BlockSize, revision,
                 DateTimeOffset.UtcNow.Add(_options.RecordLifetime));
             await RegisterPublicationAsync(record, tree, cancellation.Token).ConfigureAwait(false);
-            await AnnounceRecordAsync(record, cancellation.Token).ConfigureAwait(false);
+            await AnnounceRecordAsync(record, publication: true, cancellation.Token).ConfigureAwait(false);
             Log(LogLevel.Information, "Content publication from precomputed leaves completed.");
             return record;
         }
@@ -131,7 +131,7 @@ namespace MajDHTNetwork
             var record = DHTRecord.Create(_identity, name, content.FileHash, content.MerkleRoot, content.Length,
                 content.BlockSize, revision, DateTimeOffset.UtcNow.Add(_options.RecordLifetime));
             await RegisterPublicationAsync(record, tree, cancellation.Token).ConfigureAwait(false);
-            await AnnounceRecordAsync(record, cancellation.Token).ConfigureAwait(false);
+            await AnnounceRecordAsync(record, publication: true, cancellation.Token).ConfigureAwait(false);
             return record;
         }
 
@@ -179,7 +179,7 @@ namespace MajDHTNetwork
             {
                 using var withdrawal = OperationCancellation(cancellationToken);
                 CacheRecord(record, null);
-                return await AnnounceWithdrawalAsync(record, null, withdrawal.Token).ConfigureAwait(false);
+                return await AnnounceWithdrawalAsync(record, null, publication: true, withdrawal.Token).ConfigureAwait(false);
             }
             RequireProvider();
             using var cancellation = OperationCancellation(cancellationToken);
@@ -193,7 +193,7 @@ namespace MajDHTNetwork
                 tree = content.Tree;
             }
             RegisterContent(record, tree);
-            return await AnnounceRecordAsync(record, cancellation.Token).ConfigureAwait(false);
+            return await AnnounceRecordAsync(record, publication: true, cancellation.Token).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -238,7 +238,7 @@ namespace MajDHTNetwork
                 throw new InvalidDataException("The local content differs from the signed manifest.");
             }
             RegisterContent(record, new MerkleTree(leaves.WrittenSpan));
-            var replicas = await AnnounceRecordAsync(record, cancellation.Token).ConfigureAwait(false);
+            var replicas = await AnnounceRecordAsync(record, publication: true, cancellation.Token).ConfigureAwait(false);
             Log(LogLevel.Information, "Local content import completed.");
             return replicas;
         }
@@ -289,7 +289,7 @@ namespace MajDHTNetwork
             }
             using var cancellation = OperationCancellation(cancellationToken);
             RegisterContent(record, new MerkleTree(leaves.Span));
-            var replicas = await AnnounceRecordAsync(record, cancellation.Token).ConfigureAwait(false);
+            var replicas = await AnnounceRecordAsync(record, publication: true, cancellation.Token).ConfigureAwait(false);
             Log(LogLevel.Information, "Local content import from precomputed leaves completed.");
             return replicas;
         }
@@ -378,7 +378,7 @@ namespace MajDHTNetwork
             RegisterContent(record, new MerkleTree(leaves.WrittenSpan));
             if ((_options.Capabilities & DHTCapabilities.Provide) != 0)
             {
-                await AnnounceRecordAsync(record, cancellation.Token).ConfigureAwait(false);
+                await AnnounceRecordAsync(record, publication: true, cancellation.Token).ConfigureAwait(false);
             }
             Log(LogLevel.Information, "Content download and full verification completed.");
             return record;
@@ -597,13 +597,16 @@ namespace MajDHTNetwork
 
         /// <summary>Replicates a signed publication near both its key and complete-file hash.</summary>
         /// <param name="record">The unexpired publication.</param>
+        /// <param name="publication">
+        /// Whether a caller waits for the announcement, so maintenance reannouncements yield to it; false for a reannouncement.
+        /// </param>
         /// <param name="cancellationToken">Cancels lookup and replication.</param>
         /// <returns>The number of remote replicas accepting the record.</returns>
-        private async Task<int> AnnounceRecordAsync(DHTRecord record, CancellationToken cancellationToken)
+        private async Task<int> AnnounceRecordAsync(DHTRecord record, bool publication, CancellationToken cancellationToken)
         {
             RequireProvider();
             CacheRecord(record, new DHTPeer(LocalContact, Array.Empty<DHTEndpoint>()));
-            var accepted = await ReplicateAsync(record, record.Key.RoutingId, record.FileHash, cancellationToken).ConfigureAwait(false);
+            var accepted = await ReplicateAsync(record, record.Key.RoutingId, record.FileHash, publication, cancellationToken).ConfigureAwait(false);
             if (accepted == 0)
             {
                 Log(LogLevel.Warning, "Publication is available locally; no remote replica accepted the announcement.");
@@ -633,6 +636,16 @@ namespace MajDHTNetwork
         private int MaxConcurrentReplications => Math.Max(1, _options.MaxConcurrentRequests / ReplicationFootprint);
 
         /// <summary>
+        /// Gets how long no publication may have waited for or held a replication slot before a maintenance reannouncement
+        /// takes one. It bridges the moments in which a bulk publisher reads and registers its next file, so a reannouncement
+        /// does not slip into such a gap and make the next publication wait for a whole replication.
+        /// </summary>
+        internal static TimeSpan PublicationQuietPeriod { get; } = TimeSpan.FromSeconds(1);
+
+        /// <summary>Gets the replication slots, so tests can hold a slot the way a publication in progress does.</summary>
+        internal ReplicationGate Replications => _replications;
+
+        /// <summary>
         /// Stores a signed record on the nodes nearest one or two routing identifiers. The lookups run at once and the store
         /// requests run in parallel, while the whole replication occupies one of the <see cref="MaxConcurrentReplications"/>
         /// slots, so the outgoing exchange budget is never exceeded by many replications at once.
@@ -640,12 +653,17 @@ namespace MajDHTNetwork
         /// <param name="record">The signed publication or withdrawal.</param>
         /// <param name="routingId">The routing identifier of the record's key.</param>
         /// <param name="secondaryId">A file hash whose nearby nodes also index the record, or null.</param>
+        /// <param name="publication">
+        /// Whether a caller waits for the replication, which makes maintenance reannouncements yield to it until it ends;
+        /// false for a reannouncement.
+        /// </param>
         /// <param name="cancellationToken">Cancels waiting for a slot, lookup and replication.</param>
         /// <returns>The number of remote nodes accepting the record.</returns>
         /// <exception cref="OperationCanceledException">Replication was cancelled.</exception>
-        private async Task<int> ReplicateAsync(DHTRecord record, string routingId, string? secondaryId, CancellationToken cancellationToken)
+        private async Task<int> ReplicateAsync(DHTRecord record, string routingId, string? secondaryId, bool publication,
+            CancellationToken cancellationToken)
         {
-            await _replications.WaitAsync(cancellationToken).ConfigureAwait(false);
+            await _replications.EnterAsync(publication, cancellationToken).ConfigureAwait(false);
             try
             {
                 var lookups = new List<Task<LookupResult>> { LookupAsync(0, routingId, cancellationToken) };
@@ -687,7 +705,7 @@ namespace MajDHTNetwork
             }
             finally
             {
-                _replications.Release();
+                _replications.Exit(publication);
             }
         }
 

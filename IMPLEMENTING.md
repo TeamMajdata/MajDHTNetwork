@@ -297,7 +297,12 @@ Every `MaintenanceInterval` the reference node re-signs its contact before the
 lease ends (one day for public contacts, one hour otherwise, and immediately
 when the advertisement changes), prunes expired records, claims and
 registrations, retries bootstrap endpoints while the table is empty, schedules
-reachability checks, looks up its own node ID and reannounces local records.
+reachability checks, looks up its own node ID and starts reannouncing the local
+records that last reached a replica at least `RepublishInterval` ago. The
+reannouncements run apart from the loop and yield their replication slots to
+publications in progress until a record's last announcement is 45 minutes old,
+well inside the one-hour lease that its provider claims inherit from an
+unverified contact.
 
 ## The protocol API in detail
 
