@@ -43,7 +43,7 @@ namespace MajDHTNetwork
                 try
                 {
                     var peer = await HelloAsync(endpoint, _options.PreferredTransport, cancellation.Token).ConfigureAwait(false);
-                    await RegisterBootstrapRelayAsync(peer, cancellation.Token).ConfigureAwait(false);
+                    await RegisterBootstrapAssistantsAsync(peer, cancellation.Token).ConfigureAwait(false);
                     joined++;
                 }
                 catch (Exception exception) when (IsPeerFailure(exception))
@@ -66,7 +66,7 @@ namespace MajDHTNetwork
         /// Adds the node listening at an address and port, for example one a user typed or the application learned through
         /// its own channel: sends a signed Hello request through the transport to try first and, when that fails, through
         /// the other transport at the same port, admits the authenticated responder to the routing table, registers with it
-        /// when it is a relay and NAT traversal is enabled, and then discovers this node's neighbors through it.
+        /// when it is a Traversal node or Forwarder and NAT traversal is enabled, and then discovers this node's neighbors through it.
         /// </summary>
         /// <param name="endpoint">The unicast address and port the node listens on.</param>
         /// <param name="preferredTransport">
@@ -74,7 +74,7 @@ namespace MajDHTNetwork
         /// tried at the same port when the first one does not answer.
         /// </param>
         /// <param name="cancellationToken">Cancels the exchange and the neighbor discovery.</param>
-        /// <returns>The authenticated contact of the node that answered.</returns>
+        /// <returns>The authenticated contact of the node that answered, at the endpoint that answered.</returns>
         /// <remarks>
         /// An endpoint does not identify a node: whoever answers at it becomes a contact, exactly as with a bootstrap
         /// endpoint, so add endpoints from trusted sources only. The node that answered is also returned, so the application
@@ -97,14 +97,14 @@ namespace MajDHTNetwork
             }
             using var cancellation = OperationCancellation(cancellationToken);
             var peer = await HelloAsync(NetworkScope.CopyEndpoint(endpoint), first, cancellation.Token).ConfigureAwait(false);
-            await RegisterBootstrapRelayAsync(peer, cancellation.Token).ConfigureAwait(false);
+            await RegisterBootstrapAssistantsAsync(peer, cancellation.Token).ConfigureAwait(false);
             await LookupAsync(0, NodeId, cancellation.Token).ConfigureAwait(false);
             Log(LogLevel.Information, "Peer added and neighbor discovery completed.");
             return peer;
         }
 
-        /// <summary>Joins the network through an already known signed contact.</summary>
-        /// <param name="bootstrap">An unexpired remote contact.</param>
+        /// <summary>Joins the network through an already known contact at the endpoints known for it.</summary>
+        /// <param name="bootstrap">An unexpired remote peer.</param>
         /// <param name="cancellationToken">Cancels joining and initial discovery.</param>
         /// <returns>Completion after authentication and iterative neighbor discovery.</returns>
         /// <exception cref="ArgumentException">The contact is absent or local.</exception>
@@ -118,30 +118,44 @@ namespace MajDHTNetwork
             }
             using var cancellation = OperationCancellation(cancellationToken);
             using var pong = await RequestAsync(bootstrap, Operation.Ping, Array.Empty<byte>(), cancellation.Token).ConfigureAwait(false);
-            await RegisterBootstrapRelayAsync(bootstrap, cancellation.Token).ConfigureAwait(false);
+            await RegisterBootstrapAssistantsAsync(bootstrap, cancellation.Token).ConfigureAwait(false);
             await LookupAsync(0, NodeId, cancellation.Token).ConfigureAwait(false);
             Log(LogLevel.Information, "Bootstrap authentication and neighbor discovery completed.");
         }
 
-        /// <summary>Registers with a bootstrap node that offers rendezvous assistance, logging rather than failing on errors.</summary>
-        /// <param name="bootstrap">The authenticated bootstrap contact.</param>
+        /// <summary>
+        /// Registers with a bootstrap node that coordinates traversal and opens a forwarding session when it forwards traffic,
+        /// while the respective limits leave room, logging rather than failing on errors.
+        /// </summary>
+        /// <param name="bootstrap">The authenticated bootstrap peer.</param>
         /// <param name="cancellationToken">Cancels registration.</param>
-        /// <returns>Completion after the registration attempt.</returns>
+        /// <returns>Completion after the registration attempts.</returns>
         /// <exception cref="OperationCanceledException">Registration was cancelled.</exception>
-        private async Task RegisterBootstrapRelayAsync(DHTPeer bootstrap, CancellationToken cancellationToken)
+        private async Task RegisterBootstrapAssistantsAsync(DHTPeer bootstrap, CancellationToken cancellationToken)
         {
-            if (!_options.EnableNatTraversal || (bootstrap.Capabilities & DHTCapabilities.Relay) == 0)
+            if ((bootstrap.Capabilities & DHTCapabilities.Traversal) != 0 && HasTraversalRoom())
             {
-                return;
+                try
+                {
+                    await RegisterTraversalAsync(bootstrap, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception exception) when (IsPeerFailure(exception))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    Log(LogLevel.Warning, "Bootstrap traversal registration failed: ", exception);
+                }
             }
-            try
+            if ((bootstrap.Capabilities & DHTCapabilities.Forwarder) != 0 && HasForwarderRoom())
             {
-                await RegisterRelayAsync(bootstrap, cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception exception) when (IsPeerFailure(exception))
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                Log(LogLevel.Warning, "Bootstrap relay registration failed: ", exception);
+                try
+                {
+                    await RegisterForwarderAsync(bootstrap, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception exception) when (IsPeerFailure(exception))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    Log(LogLevel.Warning, "Bootstrap forwarding session failed: ", exception);
+                }
             }
         }
 
@@ -149,7 +163,7 @@ namespace MajDHTNetwork
         /// <param name="endpoint">The remote endpoint, tried with one transport and then with the other one at the same port.</param>
         /// <param name="first">The transport to try first.</param>
         /// <param name="cancellationToken">Cancels the exchange.</param>
-        /// <returns>The authenticated remote contact.</returns>
+        /// <returns>The authenticated remote contact at the endpoint that answered.</returns>
         /// <exception cref="IOException">Neither transport answered.</exception>
         /// <exception cref="OperationCanceledException">The exchange was cancelled.</exception>
         private async Task<DHTPeer> HelloAsync(IPEndPoint endpoint, DHTTransport first, CancellationToken cancellationToken)
@@ -179,14 +193,14 @@ namespace MajDHTNetwork
         /// <param name="endpoint">The remote endpoint.</param>
         /// <param name="expectedNodeId">The identity that must answer, or null to accept any identity other than this node's.</param>
         /// <param name="cancellationToken">Cancels the exchange.</param>
-        /// <returns>The authenticated remote contact.</returns>
+        /// <returns>The authenticated remote contact at the endpoint that answered.</returns>
         /// <exception cref="IOException">The endpoint did not answer.</exception>
         /// <exception cref="CryptographicException">The response was forged, miscorrelated or signed by another identity.</exception>
         /// <exception cref="OperationCanceledException">The exchange was cancelled.</exception>
         private async Task<DHTPeer> HelloAtAsync(DHTTransport transport, IPEndPoint endpoint, string? expectedNodeId,
             CancellationToken cancellationToken)
         {
-            var request = new Packet(LocalPeer, Crypto.Random(16), (byte)Operation.Hello, ReadOnlyMemory<byte>.Empty);
+            var request = new Packet(LocalContact, Crypto.Random(16), (byte)Operation.Hello, ReadOnlyMemory<byte>.Empty);
             var counter = new TransmissionCounter();
             using var encoded = await _transport.ExchangeAtAsync(transport, endpoint, request.SealHello(_identity), cancellationToken, counter)
                 .ConfigureAwait(false);
@@ -201,11 +215,12 @@ namespace MajDHTNetwork
             using var reader = new Wire(ResponseStatus.ReadResult(response.Body));
             var observed = HelloMessage.ReadResponse(reader);
             // The endpoint answered authentically, which proves the responder is reachable there.
-            ObservePeer(response.Sender, endpoint.Address);
+            var peer = DHTPeer.Observed(response.Sender, transport, endpoint);
+            ObservePeer(response.Sender, peer.Endpoints[0]);
             RecordObservation(response.Sender, endpoint.Address, transport, observed);
             // The responder is unknown until it answers, so only answered Hello exchanges enter its statistics.
             RecordTransmissions(response.Sender.NodeId, transport, endpoint, counter);
-            return response.Sender;
+            return peer;
         }
 
         /// <summary>Runs the initial bootstrap without failing node startup.</summary>
@@ -229,7 +244,7 @@ namespace MajDHTNetwork
         /// <summary>Finds reachable nodes nearest a SHA-256 routing identifier.</summary>
         /// <param name="routingId">The lowercase SHA-256 target identifier.</param>
         /// <param name="cancellationToken">Cancels the iterative lookup.</param>
-        /// <returns>The nearest discovered peer contacts.</returns>
+        /// <returns>The nearest discovered peers, each at the endpoints observed for it.</returns>
         /// <exception cref="ArgumentException">The routing identifier is invalid.</exception>
         /// <exception cref="OperationCanceledException">The lookup was cancelled.</exception>
         public async Task<IReadOnlyList<DHTPeer>> FindNodesAsync(string routingId, CancellationToken cancellationToken = default)
@@ -264,7 +279,7 @@ namespace MajDHTNetwork
         /// <summary>Discovers content providers independently of the alias used to publish the file.</summary>
         /// <param name="fileHash">The SHA-256 digest of the complete file.</param>
         /// <param name="cancellationToken">Cancels provider lookup.</param>
-        /// <returns>Signed contacts advertising content-providing capability.</returns>
+        /// <returns>Peers advertising content-providing capability, each at the endpoints observed for it.</returns>
         /// <exception cref="ArgumentException">The hash is invalid.</exception>
         /// <exception cref="OperationCanceledException">Lookup was cancelled.</exception>
         public async Task<IReadOnlyList<DHTPeer>> FindProvidersAsync(string fileHash, CancellationToken cancellationToken = default)
@@ -537,9 +552,11 @@ namespace MajDHTNetwork
                 var found = FindMessage.ReadResponse(reader);
                 var record = found.Record;
                 var peers = found.Peers;
-                peers.RemoveAll(peer => !HasRequiredWork(peer));
+                peers.RemoveAll(referred => !HasRequiredWork(referred.Contact));
+                AttachResponderEndpoints(peers, peer);
                 var providers = found.Providers;
-                providers.RemoveAll(peer => !HasRequiredWork(peer));
+                providers.RemoveAll(referred => !HasRequiredWork(referred.Contact));
+                AttachResponderEndpoints(providers, peer);
                 if (record != null && (mode != 1 || record.Key.ToString() != target || record.Length > _options.MaxFileSize))
                 {
                     throw new InvalidDataException("Lookup returned a record for an unrelated key or excessive size.");
@@ -552,6 +569,24 @@ namespace MajDHTNetwork
                 _routing.Remove(peer.NodeId);
                 Log(LogLevel.Debug, "Lookup peer was unusable: ", exception);
                 return null;
+            }
+        }
+
+        /// <summary>
+        /// Replaces the responder's own entries in a returned list with the endpoints this node reached the responder at: a node
+        /// lists itself without endpoints because it does not know how others observe it.
+        /// </summary>
+        /// <param name="peers">The returned peers.</param>
+        /// <param name="responder">The queried node at the endpoints known for it.</param>
+        private static void AttachResponderEndpoints(List<DHTPeer> peers, DHTPeer responder)
+        {
+            for (var index = 0; index < peers.Count; index++)
+            {
+                if (peers[index].NodeId == responder.NodeId)
+                {
+                    var contact = peers[index].Sequence >= responder.Sequence ? peers[index].Contact : responder.Contact;
+                    peers[index] = new DHTPeer(contact, responder.Endpoints);
+                }
             }
         }
 
@@ -605,7 +640,7 @@ namespace MajDHTNetwork
         /// <see cref="MaxProvidersPerNetwork"/> claims per globally routed network for each file.
         /// </summary>
         /// <param name="record">The signed record.</param>
-        /// <param name="provider">The authenticated announcing peer, or null for a lookup cache.</param>
+        /// <param name="provider">The authenticated announcing peer at the endpoints observed for it, or null for a lookup cache.</param>
         /// <param name="providerAddress">The observed source address of the announcement, or null for local claims.</param>
         /// <exception cref="IOException">The record quota is full.</exception>
         /// <exception cref="InvalidDataException">The record is expired, too large or conflicts with its revision.</exception>
@@ -648,13 +683,28 @@ namespace MajDHTNetwork
                 }
                 if (providers.TryGetValue(provider.NodeId, out var known))
                 {
-                    providers[provider.NodeId] = new ProviderClaim(provider, providerAddress ?? known.Address);
+                    providers[provider.NodeId] = new ProviderClaim(MergeProvider(known.Peer, provider), providerAddress ?? known.Address);
                 }
                 else if (providers.Count < 16 && HasProviderRoom(providers, providerAddress))
                 {
                     providers[provider.NodeId] = new ProviderClaim(provider, providerAddress);
                 }
             }
+        }
+
+        /// <summary>Combines a repeated announcement with the known claim: the newest contact and the union of observed endpoints.</summary>
+        /// <param name="known">The provider as claimed so far.</param>
+        /// <param name="announced">The provider as it announced now.</param>
+        /// <returns>The combined provider.</returns>
+        private static DHTPeer MergeProvider(DHTPeer known, DHTPeer announced)
+        {
+            var contact = announced.Sequence >= known.Sequence ? announced.Contact : known.Contact;
+            IReadOnlyList<DHTEndpoint> endpoints = known.Endpoints;
+            foreach (var endpoint in announced.Endpoints)
+            {
+                endpoints = DHTPeer.Merge(endpoints, endpoint);
+            }
+            return new DHTPeer(contact, endpoints);
         }
 
         /// <summary>Checks whether a new provider claim from an address stays within the per-network limit.</summary>
@@ -680,7 +730,7 @@ namespace MajDHTNetwork
 
         /// <summary>Returns a bounded snapshot of live locally indexed providers.</summary>
         /// <param name="fileHash">The whole-file identifier.</param>
-        /// <returns>Live provider contacts.</returns>
+        /// <returns>Live providers; this node lists itself with its current contact and no endpoints, which requesters fill in.</returns>
         private List<DHTPeer> LocalProviders(string fileHash)
         {
             var result = new List<DHTPeer>();
@@ -693,7 +743,7 @@ namespace MajDHTNetwork
                         var peer = claim.Peer;
                         if (!peer.IsExpired && (peer.Capabilities & DHTCapabilities.Provide) != 0)
                         {
-                            result.Add(peer.NodeId == NodeId ? _self! : peer);
+                            result.Add(peer.NodeId == NodeId ? new DHTPeer(_self!, Array.Empty<DHTEndpoint>()) : peer);
                         }
                     }
                 }
@@ -825,7 +875,7 @@ namespace MajDHTNetwork
                     bool checkReachability;
                     lock (_gate)
                     {
-                        RefreshLocalPeerLocked();
+                        RefreshLocalContactLocked();
                         PruneLocked();
                         checkReachability = _lastReachabilityCheck + _options.ReachabilityCheckInterval <= DateTimeOffset.UtcNow;
                     }
@@ -902,7 +952,7 @@ namespace MajDHTNetwork
         /// <summary>Associates an authenticated provider claim with the source address of its announcement.</summary>
         internal sealed class ProviderClaim
         {
-            /// <summary>Gets the provider contact.</summary>
+            /// <summary>Gets the provider at the endpoints observed for it.</summary>
             internal DHTPeer Peer { get; }
             /// <summary>Gets the announcement's observed source address, or null for local claims.</summary>
             internal IPAddress? Address { get; }

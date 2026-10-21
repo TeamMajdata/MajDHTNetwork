@@ -31,22 +31,30 @@ namespace MajDHTNetwork.Tests
         }
     }
 
-    /// <summary>A real UDP proxy that drops the first response and checks replay-cached retransmission.</summary>
+    /// <summary>
+    /// A real UDP proxy that drops the first reply from the node and checks replay-cached retransmission. Both directions are
+    /// pumped independently, because the node also sends its own requests, such as admission verifications, towards the
+    /// client's observed source, which is the proxy.
+    /// </summary>
     internal sealed class LossyUdpProxy : IAsyncDisposable
     {
         /// <summary>The public proxy socket.</summary>
         private readonly UdpClient _listener = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        /// <summary>The socket towards the actual node.</summary>
+        private readonly UdpClient _outgoing = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
         /// <summary>The actual node endpoint.</summary>
         private readonly IPEndPoint _destination;
-        /// <summary>The active receive task.</summary>
+        /// <summary>The active receive tasks.</summary>
         private readonly Task _loop;
-        /// <summary>The first encrypted response.</summary>
+        /// <summary>The first encrypted reply.</summary>
         private byte[]? _first;
+        /// <summary>The client endpoint seen most recently, which receives everything the node sends.</summary>
+        private IPEndPoint? _client;
         /// <summary>The shutdown marker.</summary>
-        private bool _stopped;
-        /// <summary>Gets the number of forwarded valid responses.</summary>
+        private volatile bool _stopped;
+        /// <summary>Gets the number of replies received from the node.</summary>
         internal int Responses { get; private set; }
-        /// <summary>Gets whether duplicate ciphertext was served from the replay cache.</summary>
+        /// <summary>Gets whether a later reply repeated the dropped ciphertext, served from the replay cache.</summary>
         internal bool DuplicateReplyMatched { get; private set; }
         /// <summary>Gets the public proxy port.</summary>
         internal int Port
@@ -65,32 +73,24 @@ namespace MajDHTNetwork.Tests
             _loop = RunAsync();
         }
 
-        /// <summary>Forwards requests, discarding the first reply.</summary>
+        /// <summary>Pumps both directions until shutdown.</summary>
         /// <returns>Completion after proxy shutdown.</returns>
-        private async Task RunAsync()
+        private Task RunAsync()
+        {
+            return Task.WhenAll(ForwardClientFramesAsync(), ForwardNodeFramesAsync());
+        }
+
+        /// <summary>Forwards everything the client sends to the node and remembers the client endpoint.</summary>
+        /// <returns>Completion after proxy shutdown.</returns>
+        private async Task ForwardClientFramesAsync()
         {
             try
             {
-                using var outgoing = new UdpClient();
-                outgoing.Connect(_destination);
                 while (!_stopped)
                 {
                     var incoming = await _listener.ReceiveAsync().ConfigureAwait(false);
-                    await outgoing.SendAsync(incoming.Buffer, incoming.Buffer.Length).ConfigureAwait(false);
-                    var response = await outgoing.ReceiveAsync().ConfigureAwait(false);
-                    if (!UdpCookies.IsFrame(response.Buffer, 3) && !UdpCookies.ReplyDigest(response.Buffer).HasValue)
-                    {
-                        await _listener.SendAsync(response.Buffer, response.Buffer.Length, incoming.RemoteEndPoint).ConfigureAwait(false);
-                        continue;
-                    }
-                    Responses++;
-                    if (_first == null)
-                    {
-                        _first = response.Buffer;
-                        continue;
-                    }
-                    DuplicateReplyMatched = BytesEqual(_first, response.Buffer);
-                    await _listener.SendAsync(response.Buffer, response.Buffer.Length, incoming.RemoteEndPoint).ConfigureAwait(false);
+                    Volatile.Write(ref _client, incoming.RemoteEndPoint);
+                    await _outgoing.SendAsync(incoming.Buffer, incoming.Buffer.Length, _destination).ConfigureAwait(false);
                 }
             }
             catch (Exception exception) when (_stopped && (exception is ObjectDisposedException || exception is SocketException))
@@ -98,12 +98,46 @@ namespace MajDHTNetwork.Tests
             }
         }
 
-        /// <summary>Closes the proxy socket and drains the receive task.</summary>
+        /// <summary>Forwards what the node sends to the client, discarding the node's first reply.</summary>
+        /// <returns>Completion after proxy shutdown.</returns>
+        private async Task ForwardNodeFramesAsync()
+        {
+            try
+            {
+                while (!_stopped)
+                {
+                    var response = await _outgoing.ReceiveAsync().ConfigureAwait(false);
+                    var client = Volatile.Read(ref _client);
+                    if (client == null)
+                    {
+                        continue;
+                    }
+                    // Challenges and the node's own requests pass through; only replies take part in the loss experiment.
+                    if (UdpCookies.IsFrame(response.Buffer, 3) || UdpCookies.ReplyDigest(response.Buffer).HasValue)
+                    {
+                        Responses++;
+                        if (_first == null)
+                        {
+                            _first = response.Buffer;
+                            continue;
+                        }
+                        DuplicateReplyMatched |= BytesEqual(_first, response.Buffer);
+                    }
+                    await _listener.SendAsync(response.Buffer, response.Buffer.Length, client).ConfigureAwait(false);
+                }
+            }
+            catch (Exception exception) when (_stopped && (exception is ObjectDisposedException || exception is SocketException))
+            {
+            }
+        }
+
+        /// <summary>Closes the proxy sockets and drains the receive tasks.</summary>
         /// <returns>Completion after proxy cleanup.</returns>
         public async ValueTask DisposeAsync()
         {
             _stopped = true;
             _listener.Dispose();
+            _outgoing.Dispose();
             await _loop.ConfigureAwait(false);
         }
     }

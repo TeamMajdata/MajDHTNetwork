@@ -67,14 +67,16 @@ namespace MajDHTNetwork.Tests
             closed.Start();
             var closedPort = ((IPEndPoint)closed.LocalEndpoint).Port;
             closed.Stop();
+            var staleId = NodeHash();
             var snapshot = Snapshot(
                 (reachable.NodeId, reachable.LocalPeer.Endpoints[0]),
-                (NodeHash(), reidentified.LocalPeer.Endpoints[0]),
-                (NodeHash(), new DHTEndpoint(IPAddress.Loopback, closedPort, 0, DHTEndpointFlags.None)));
+                (staleId, reidentified.LocalPeer.Endpoints[0]),
+                (NodeHash(), new DHTEndpoint(IPAddress.Loopback, closedPort, 0)));
             Assert.Equal(1, await restorer.RestoreRoutingTableAsync(snapshot, token));
             var known = restorer.KnownPeers;
             Assert.Contains(known, peer => peer.NodeId == reachable.NodeId);
-            Assert.DoesNotContain(known, peer => peer.NodeId == reidentified.NodeId);
+            // The saved identity no longer answers at its endpoint; whoever answers there is not restored under that identity.
+            Assert.DoesNotContain(known, peer => peer.NodeId == staleId);
         }
 
         /// <summary>Rejects snapshots with a wrong label, truncation, trailing bytes, repeated or invalid identifiers.</summary>
@@ -86,7 +88,7 @@ namespace MajDHTNetwork.Tests
             var token = deadline.Token;
             await using var node = new MajDHTNode(Options(DHTTransport.Tcp, DHTCapabilities.Download));
             await node.StartAsync(token);
-            var endpoint = new DHTEndpoint(IPAddress.Loopback, 1, 0, DHTEndpointFlags.None);
+            var endpoint = new DHTEndpoint(IPAddress.Loopback, 1, 0);
             var nodeId = NodeHash();
             var valid = Snapshot((nodeId, endpoint));
             var trailing = new byte[valid.Length + 1];
@@ -111,7 +113,7 @@ namespace MajDHTNetwork.Tests
             {
                 writer.PutText(nodeId);
                 writer.PutLong(1);
-                DHTPeer.WriteEndpoint(writer, endpoint);
+                endpoint.Write(writer);
             }
             return writer.ToArray();
         }

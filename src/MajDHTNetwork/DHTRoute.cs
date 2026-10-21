@@ -37,24 +37,28 @@ namespace MajDHTNetwork
         }
     }
 
-    /// <summary>One relay attempt: the relay and whether to try hole punching through it before opaque forwarding.</summary>
-    public sealed class DHTRelayRoute
+    /// <summary>
+    /// One assisted attempt through a Traversal or Forwarder node: hole punching coordinated by a Traversal node, forwarding
+    /// through a Forwarder, or both in that order when the assistant has both capabilities.
+    /// </summary>
+    public sealed class DHTAssistedRoute
     {
-        /// <summary>Gets the relay contact.</summary>
-        public DHTPeer Relay { get; }
+        /// <summary>Gets the assisting node at the endpoints it was observed.</summary>
+        public DHTPeer Assistant { get; }
         /// <summary>
-        /// Gets whether to ask the relay for a direct introduction first; punching registers with the relay when this node
-        /// is not registered yet and is skipped when NAT traversal is disabled.
+        /// Gets whether to ask the assistant, when it is a Traversal node, for a direct introduction before forwarding;
+        /// punching registers with the assistant when this node is not registered yet and is skipped when NAT traversal is
+        /// disabled.
         /// </summary>
         public bool AttemptPunch { get; }
 
-        /// <summary>Creates a relay attempt.</summary>
-        /// <param name="relay">The relay contact.</param>
+        /// <summary>Creates an assisted attempt.</summary>
+        /// <param name="assistant">The assisting node.</param>
         /// <param name="attemptPunch">Whether to try hole punching first.</param>
-        /// <exception cref="ArgumentNullException">The relay is null.</exception>
-        public DHTRelayRoute(DHTPeer relay, bool attemptPunch)
+        /// <exception cref="ArgumentNullException">The assistant is null.</exception>
+        public DHTAssistedRoute(DHTPeer assistant, bool attemptPunch)
         {
-            Relay = relay ?? throw new ArgumentNullException(nameof(relay));
+            Assistant = assistant ?? throw new ArgumentNullException(nameof(assistant));
             AttemptPunch = attemptPunch;
         }
     }

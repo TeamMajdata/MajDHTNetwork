@@ -34,39 +34,40 @@ namespace MajDHTNetwork.Tests
             Assert.NotNull(statistics);
             Assert.Equal(1, statistics!.LostPackets);
             Assert.True(statistics.SentPackets >= 2, "The retransmission must be counted.");
+            // The server was observed through the proxy, so every later request to it also travels through the proxy.
             var route = statistics.GetRoute(new IPEndPoint(IPAddress.Loopback, proxy.Port), DHTTransport.Udp);
             Assert.NotNull(route);
-            Assert.Equal(2, route!.SentPackets);
-            Assert.Equal(0.5, route.PacketLossRate);
+            Assert.Equal(1, route!.LostPackets);
+            Assert.True(route.SentPackets >= 2, "The retransmission must be counted on the route.");
+            Assert.Equal((double)route.LostPackets / route.SentPackets, route.PacketLossRate);
             Assert.Contains(client.PeerStatistics, entry => entry.NodeId == server.NodeId);
         }
 
-        /// <summary>Puts lower-loss routes and relays first within the same tier of the default selector.</summary>
+        /// <summary>Puts lower-loss routes and Forwarders first within the same tier of the default selector.</summary>
         [Fact]
-        public void DefaultSelectorRanksRoutesAndRelaysByPacketLoss()
+        public void DefaultSelectorRanksRoutesAndForwardersByPacketLoss()
         {
-            var destination = DHTPeer.Create(new DHTIdentity(),
-                new[] { new DHTEndpoint(IPAddress.Parse("203.0.113.2"), 1000, 2000, DHTEndpointFlags.Verified) }, DHTCapabilities.Provide,
-                DHTReachability.Public, false, null, Array.Empty<DHTPeer>(), TimeSpan.FromHours(1));
-            var lossyRelay = PublicRelay("203.0.113.10");
-            var cleanRelay = PublicRelay("203.0.113.11");
+            var destination = new DHTPeer(DHTContact.Create(new DHTIdentity(), DHTCapabilities.Provide, DHTReachability.Public, false,
+                Array.Empty<DHTPeer>(), TimeSpan.FromHours(1)), new[] { new DHTEndpoint(IPAddress.Parse("203.0.113.2"), 1000, 2000) });
+            var lossyForwarder = PublicForwarder("203.0.113.10");
+            var cleanForwarder = PublicForwarder("203.0.113.11");
             var tcp = new IPEndPoint(IPAddress.Parse("203.0.113.2"), 1000);
             var statistics = new Dictionary<string, DHTPeerStatistics>
             {
                 [destination.NodeId] = new DHTPeerStatistics(destination.NodeId, 10, 5, DateTimeOffset.UtcNow,
                     new[] { new DHTRouteStatistics(tcp, DHTTransport.Tcp, 10, 5, DateTimeOffset.UtcNow) }),
-                [lossyRelay.NodeId] = new DHTPeerStatistics(lossyRelay.NodeId, 10, 9, DateTimeOffset.UtcNow, Array.Empty<DHTRouteStatistics>())
+                [lossyForwarder.NodeId] = new DHTPeerStatistics(lossyForwarder.NodeId, 10, 9, DateTimeOffset.UtcNow, Array.Empty<DHTRouteStatistics>())
             };
-            var context = new DHTRouteContext(DHTTransport.Tcp, true, Array.Empty<IPAddress>(), Array.Empty<string>(), 8,
+            var context = new DHTRouteContext(DHTTransport.Tcp, true, Array.Empty<string>(), 8,
                 nodeId => statistics.TryGetValue(nodeId, out var entry) ? entry : null);
             var selector = new DefaultDHTRouteSelector();
             var routes = selector.SelectDirectRoutes(destination, context);
             Assert.Equal(DHTTransport.Udp, routes[0].Transport);
             Assert.Equal(DHTTransport.Tcp, routes[1].Transport);
             Assert.Equal(0.5, context.PacketLossRate(destination.NodeId, routes[1]));
-            var relays = selector.SelectRelayRoutes(destination, new[] { lossyRelay, cleanRelay }, context);
-            Assert.Equal(cleanRelay.NodeId, relays[0].Relay.NodeId);
-            Assert.Equal(lossyRelay.NodeId, relays[1].Relay.NodeId);
+            var assisted = selector.SelectAssistedRoutes(destination, new[] { lossyForwarder, cleanForwarder }, context);
+            Assert.Equal(cleanForwarder.NodeId, assisted[0].Assistant.NodeId);
+            Assert.Equal(lossyForwarder.NodeId, assisted[1].Assistant.NodeId);
         }
 
         /// <summary>Downloads one file from two providers concurrently while respecting the per-provider request limit.</summary>
@@ -120,13 +121,13 @@ namespace MajDHTNetwork.Tests
             Assert.ThrowsAny<ArgumentException>(() => new DHTNodeOptions { MaxBlockRequestsPerPeer = 17 }.Snapshot());
         }
 
-        /// <summary>Creates a public relay contact with one configured endpoint.</summary>
-        /// <param name="address">The relay address.</param>
-        /// <returns>The relay contact.</returns>
-        private static DHTPeer PublicRelay(string address)
+        /// <summary>Creates a public Forwarder observed at one endpoint.</summary>
+        /// <param name="address">The observed address.</param>
+        /// <returns>The Forwarder.</returns>
+        private static DHTPeer PublicForwarder(string address)
         {
-            return DHTPeer.Create(new DHTIdentity(), new[] { new DHTEndpoint(IPAddress.Parse(address), 42000, 0, DHTEndpointFlags.Configured) },
-                DHTCapabilities.Relay, DHTReachability.Public, false, null, Array.Empty<DHTPeer>(), TimeSpan.FromHours(2));
+            return new DHTPeer(DHTContact.Create(new DHTIdentity(), DHTCapabilities.Forwarder, DHTReachability.Public, false, Array.Empty<DHTPeer>(),
+                TimeSpan.FromHours(2)), new[] { new DHTEndpoint(IPAddress.Parse(address), 42000, 0) });
         }
 
         /// <summary>Tracks the peak number of block reads in progress across several stores.</summary>

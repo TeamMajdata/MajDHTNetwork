@@ -25,7 +25,7 @@ namespace MajDHTNetwork
         private int RestoreParallelism => Math.Max(1, Math.Min(MaxRestoreParallelism, _options.MaxConcurrentRequests / 2));
 
         /// <summary>
-        /// Exports the routing table: the identity and advertised endpoints of every contact currently used as a lookup hop,
+        /// Exports the routing table: the identity and observed endpoints of every contact currently used as a lookup hop,
         /// nearest to this node first. Persist the result with the application's storage and pass it to
         /// <see cref="RestoreRoutingTableAsync"/> after a restart, so the node rejoins through the nodes it already knew
         /// instead of depending on bootstrap endpoints alone.
@@ -52,11 +52,7 @@ namespace MajDHTNetwork
             foreach (var peer in contacts)
             {
                 writer.PutText(peer.NodeId);
-                writer.PutLong(peer.Endpoints.Count);
-                foreach (var endpoint in peer.Endpoints)
-                {
-                    DHTPeer.WriteEndpoint(writer, endpoint);
-                }
+                peer.WriteEndpoints(writer);
             }
             return writer.ToArray();
         }
@@ -64,8 +60,8 @@ namespace MajDHTNetwork
         /// <summary>
         /// Restores a routing table exported by <see cref="ExportRoutingTable"/>: asks the saved endpoints for their current
         /// signed contacts, admits every node that still answers under its saved identity, registers with the answering
-        /// relays when NAT traversal is enabled, and then discovers this node's current neighbors. Endpoints that no longer
-        /// answer, or answer under another identity, are skipped.
+        /// Traversal nodes and Forwarders when NAT traversal is enabled, and then discovers this node's current neighbors.
+        /// Endpoints that no longer answer, or answer under another identity, are skipped.
         /// </summary>
         /// <param name="snapshot">The exported snapshot.</param>
         /// <param name="cancellationToken">Cancels the restoration.</param>
@@ -131,10 +127,7 @@ namespace MajDHTNetwork
                     {
                         var peer = await HelloAtAsync(transport, new IPEndPoint(endpoint.NetworkAddress, port), contact.NodeId, cancellationToken)
                             .ConfigureAwait(false);
-                        if ((peer.Capabilities & DHTCapabilities.Relay) != 0 && HasRelayRoom())
-                        {
-                            await RegisterBootstrapRelayAsync(peer, cancellationToken).ConfigureAwait(false);
-                        }
+                        await RegisterBootstrapAssistantsAsync(peer, cancellationToken).ConfigureAwait(false);
                         return true;
                     }
                     catch (Exception exception) when (IsPeerFailure(exception) || exception is OperationCanceledException)
@@ -145,20 +138,6 @@ namespace MajDHTNetwork
                 }
             }
             return false;
-        }
-
-        /// <summary>Checks whether this node may still register with another rendezvous relay.</summary>
-        /// <returns>Whether NAT traversal is enabled and the relay limit is not reached.</returns>
-        private bool HasRelayRoom()
-        {
-            if (!_options.EnableNatTraversal)
-            {
-                return false;
-            }
-            lock (_gate)
-            {
-                return _natRelays.Count < _options.MaxNatRelays;
-            }
         }
 
         /// <summary>Decodes a routing snapshot.</summary>
@@ -194,7 +173,7 @@ namespace MajDHTNetwork
                 var endpoints = new DHTEndpoint[endpointCount];
                 for (var position = 0; position < endpoints.Length; position++)
                 {
-                    endpoints[position] = DHTPeer.ReadEndpoint(reader);
+                    endpoints[position] = DHTEndpoint.Read(reader);
                 }
                 contacts.Add(new SavedContact(nodeId, endpoints));
             }
@@ -202,17 +181,17 @@ namespace MajDHTNetwork
             return contacts;
         }
 
-        /// <summary>A contact as kept in a routing snapshot: its identity and the endpoints it advertised when exported.</summary>
+        /// <summary>A contact as kept in a routing snapshot: its identity and the endpoints observed for it when exported.</summary>
         private sealed class SavedContact
         {
             /// <summary>Gets the node identifier that must answer at one of the endpoints.</summary>
             internal string NodeId { get; }
-            /// <summary>Gets the advertised endpoints in their saved order.</summary>
+            /// <summary>Gets the observed endpoints in their saved order.</summary>
             internal IReadOnlyList<DHTEndpoint> Endpoints { get; }
 
             /// <summary>Creates a saved contact.</summary>
             /// <param name="nodeId">The node identifier.</param>
-            /// <param name="endpoints">The advertised endpoints.</param>
+            /// <param name="endpoints">The observed endpoints.</param>
             internal SavedContact(string nodeId, IReadOnlyList<DHTEndpoint> endpoints)
             {
                 NodeId = nodeId;

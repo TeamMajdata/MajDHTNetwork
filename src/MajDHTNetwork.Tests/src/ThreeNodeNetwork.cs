@@ -17,7 +17,7 @@ namespace MajDHTNetwork.Tests
     {
         /// <summary>Gets the identity used to sign provider announcements.</summary>
         internal DHTIdentity ProviderIdentity { get; }
-        /// <summary>Gets the bootstrap node that can relay but does not retain file content.</summary>
+        /// <summary>Gets the bootstrap node that forwards traffic but does not retain file content.</summary>
         internal MajDHTNode Bootstrap { get; }
         /// <summary>Gets the node that owns the published file.</summary>
         internal MajDHTNode Provider { get; }
@@ -32,7 +32,7 @@ namespace MajDHTNetwork.Tests
 
         /// <summary>Retains the nodes and signed records of an initialized test network.</summary>
         /// <param name="providerIdentity">The provider signing identity.</param>
-        /// <param name="bootstrap">The bootstrap and opaque relay node.</param>
+        /// <param name="bootstrap">The bootstrap and Forwarder node.</param>
         /// <param name="provider">The file provider node.</param>
         /// <param name="downloader">The indirectly joined download node.</param>
         /// <param name="input">The original file bytes.</param>
@@ -58,7 +58,7 @@ namespace MajDHTNetwork.Tests
         internal static async Task<ThreeNodeNetwork> CreateAsync(DHTTransport transport, CancellationToken token)
         {
             var identity = new DHTIdentity();
-            var bootstrap = new MajDHTNode(Options(transport, DHTCapabilities.Download | DHTCapabilities.Relay));
+            var bootstrap = new MajDHTNode(Options(transport, DHTCapabilities.Download | DHTCapabilities.Forwarder));
             var provider = new MajDHTNode(Options(transport, DHTCapabilities.Download | DHTCapabilities.Provide), identity);
             MajDHTNode? downloader = null;
             try

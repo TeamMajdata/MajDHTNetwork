@@ -14,56 +14,63 @@ using Xunit;
 
 namespace MajDHTNetwork.Tests
 {
-    /// <summary>Exercises real relay-assisted direct routes, authenticated probes, quotas and cancellation.</summary>
+    /// <summary>Exercises real Traversal-assisted direct routes, authenticated probes, quotas and cancellation.</summary>
     [Trait("Category", "NAT")]
     public sealed class NATTests
     {
-        /// <summary>Transfers in both directions over observed endpoints after the assisting relay stops.</summary>
+        /// <summary>Transfers in both directions over punched routes after the Traversal node stops.</summary>
         /// <param name="transport">The only transport enabled on every node.</param>
         /// <returns>Completion after repeated concurrent direct requests and full verified downloads.</returns>
         [Theory]
         [InlineData(DHTTransport.Tcp)]
         [InlineData(DHTTransport.Udp)]
-        public async Task ObservedRoutesSupportRepeatedBidirectionalTransfersAfterRelayStops(DHTTransport transport)
+        public async Task PunchedRoutesSupportRepeatedBidirectionalTransfersAfterTraversalNodeStops(DHTTransport transport)
         {
             using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(90));
             var token = deadline.Token;
-            await using var relay = new MajDHTNode(NatOptions(transport, DHTCapabilities.Relay));
-            await using var left = new MajDHTNode(NatOptions(transport, DHTCapabilities.Download | DHTCapabilities.Provide, hidden: true));
-            await using var right = new MajDHTNode(NatOptions(transport, DHTCapabilities.Download | DHTCapabilities.Provide, hidden: true));
-            await Task.WhenAll(relay.StartAsync(token), left.StartAsync(token), right.StartAsync(token));
+            await using var traversal = new MajDHTNode(NatOptions(transport, DHTCapabilities.Traversal));
+            await using var left = new MajDHTNode(NatOptions(transport, DHTCapabilities.Download | DHTCapabilities.Provide));
+            await using var right = new MajDHTNode(NatOptions(transport, DHTCapabilities.Download | DHTCapabilities.Provide));
+            await Task.WhenAll(traversal.StartAsync(token), left.StartAsync(token), right.StartAsync(token));
             var leftBytes = Crypto.Random(40001);
             var rightBytes = Crypto.Random(35003);
             using var leftSource = new MemoryStream(leftBytes);
             using var rightSource = new MemoryStream(rightBytes);
             var leftRecord = await left.PublishAsync("nat/left", leftSource, cancellationToken: token);
             var rightRecord = await right.PublishAsync("nat/right", rightSource, cancellationToken: token);
-            await left.JoinAsync(relay.LocalPeer, token);
-            await right.JoinAsync(relay.LocalPeer, token);
-            Assert.Equal(IPAddress.Parse("127.0.0.2"), left.LocalPeer.Address());
-            Assert.Equal(IPAddress.Parse("127.0.0.2"), right.LocalPeer.Address());
-            Assert.True(await left.TryPunchAsync(right.LocalPeer, relay.LocalPeer, transport, token));
-            await relay.StopAsync();
+            await left.JoinAsync(traversal.LocalPeer, token);
+            await right.JoinAsync(traversal.LocalPeer, token);
+            // Each side knows the other only at an address where nothing listens, so only the punched route can carry traffic.
+            var hiddenLeft = Hidden(left);
+            var hiddenRight = Hidden(right);
+            Assert.True(await left.TryPunchAsync(hiddenRight, traversal.LocalPeer, transport, token));
+            await traversal.StopAsync();
             for (var round = 0; round < 3; round++)
             {
                 var index = round % leftRecord.BlockCount;
                 var reads = await Task.WhenAll(
-                    left.ReadBlockAsync(rightRecord, right.LocalPeer, index, cancellationToken: token),
-                    right.ReadBlockAsync(leftRecord, left.LocalPeer, index, cancellationToken: token),
-                    left.ReadBlockAsync(rightRecord, right.LocalPeer, index, cancellationToken: token),
-                    right.ReadBlockAsync(leftRecord, left.LocalPeer, index, cancellationToken: token));
+                    left.ReadBlockAsync(rightRecord, hiddenRight, index, cancellationToken: token),
+                    right.ReadBlockAsync(leftRecord, hiddenLeft, index, cancellationToken: token),
+                    left.ReadBlockAsync(rightRecord, hiddenRight, index, cancellationToken: token),
+                    right.ReadBlockAsync(leftRecord, hiddenLeft, index, cancellationToken: token));
                 AssertBlock(rightBytes, rightRecord.BlockSize, index, reads[0]);
                 AssertBlock(leftBytes, leftRecord.BlockSize, index, reads[1]);
                 AssertBlock(rightBytes, rightRecord.BlockSize, index, reads[2]);
                 AssertBlock(leftBytes, leftRecord.BlockSize, index, reads[3]);
             }
-            // Peers whose advertised endpoints never answer stay out of routing tables, so the whole files are read
-            // block by block over the punched routes rather than through DHT provider discovery.
-            var leftFile = await ReadWholeFileAsync(left, rightRecord, right.LocalPeer, token);
-            var rightFile = await ReadWholeFileAsync(right, leftRecord, left.LocalPeer, token);
+            var leftFile = await ReadWholeFileAsync(left, rightRecord, hiddenRight, token);
+            var rightFile = await ReadWholeFileAsync(right, leftRecord, hiddenLeft, token);
             Assert.Equal(rightBytes, leftFile);
             Assert.Equal(leftBytes, rightFile);
-            Assert.DoesNotContain(left.KnownPeers, peer => peer.NodeId == right.NodeId);
+        }
+
+        /// <summary>Pairs a node's contact with an address where nothing listens, so only punched or hosted routes can reach it.</summary>
+        /// <param name="node">The running node.</param>
+        /// <returns>The node's contact at an unreachable endpoint with the node's real ports.</returns>
+        private static DHTPeer Hidden(MajDHTNode node)
+        {
+            var listener = node.LocalPeer.Endpoints[0];
+            return new DHTPeer(node.LocalContact, new[] { new DHTEndpoint(IPAddress.Parse("127.0.0.2"), listener.TcpPort, listener.UdpPort) });
         }
 
         /// <summary>Reads every verified block of a record from one provider and concatenates them.</summary>
@@ -83,47 +90,41 @@ namespace MajDHTNetwork.Tests
             return file.ToArray();
         }
 
-        /// <summary>Retries an initially failed common transport while maintaining an existing relay registration.</summary>
-        /// <returns>Completion after an independently introduced UDP peer transfers content without the relay.</returns>
+        /// <summary>Keeps a registration alive on the transport that works when the other observed transport port is stale.</summary>
+        /// <returns>Completion after an introduced TCP peer transfers content without the Traversal node.</returns>
         [Fact]
-        public async Task PollingRecoversAnInitiallyFailedCommonTransport()
+        public async Task RegistrationSurvivesAStaleTransportPort()
         {
             using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(90));
             var token = deadline.Token;
-            var relayIdentity = new DHTIdentity();
-            var relayOptions = NatOptions(DHTTransport.Tcp, DHTCapabilities.Relay);
-            relayOptions.UdpPort = 0;
-            var dualOptions = NatOptions(DHTTransport.Udp, DHTCapabilities.Download | DHTCapabilities.Provide, hidden: true);
-            dualOptions.TcpPort = 0;
-            await using var relay = new MajDHTNode(relayOptions, relayIdentity);
+            var traversalIdentity = new DHTIdentity();
+            var traversalOptions = NatOptions(DHTTransport.Tcp, DHTCapabilities.Traversal);
+            traversalOptions.UdpPort = 0;
+            var dualOptions = NatOptions(DHTTransport.Tcp, DHTCapabilities.Download | DHTCapabilities.Provide);
+            dualOptions.UdpPort = 0;
+            await using var traversal = new MajDHTNode(traversalOptions, traversalIdentity);
             await using var dual = new MajDHTNode(dualOptions);
-            await using var udpOnly = new MajDHTNode(NatOptions(DHTTransport.Udp, DHTCapabilities.Download, hidden: true));
-            await Task.WhenAll(relay.StartAsync(token), dual.StartAsync(token), udpOnly.StartAsync(token));
+            await using var tcpOnly = new MajDHTNode(NatOptions(DHTTransport.Tcp, DHTCapabilities.Download));
+            await Task.WhenAll(traversal.StartAsync(token), dual.StartAsync(token), tcpOnly.StartAsync(token));
             var content = Crypto.Random(2049);
             using var source = new MemoryStream(content);
-            var record = await dual.PublishAsync("nat/recovered-udp", source, cancellationToken: token);
-            var stale = DHTPeer.Create(relayIdentity, IPAddress.Loopback, relay.LocalPeer.TcpPort(), 1, DHTCapabilities.Relay);
-            await dual.RegisterRelayAsync(stale, token);
-            await udpOnly.RegisterRelayAsync(relay.LocalPeer, token);
-            var punched = false;
-            for (var attempt = 0; attempt < 20 && !punched; attempt++)
-            {
-                punched = await udpOnly.TryPunchAsync(dual.LocalPeer, relay.LocalPeer, DHTTransport.Udp, token);
-                if (!punched)
-                {
-                    await Task.Delay(TimeSpan.FromMilliseconds(75), token);
-                }
-            }
-            Assert.True(punched, "Polling must register UDP even when only TCP succeeded during initial registration.");
-            await relay.StopAsync();
-            var block = await udpOnly.ReadBlockAsync(record, dual.LocalPeer, 0, cancellationToken: token);
+            var record = await dual.PublishAsync("nat/stale-udp", source, cancellationToken: token);
+            // The Traversal node was observed at a UDP port where nothing listens; the TCP registration must still carry the session.
+            var stale = DHTPeer.Create(traversalIdentity, IPAddress.Loopback, traversal.LocalPeer.TcpPort(), 1, DHTCapabilities.Traversal);
+            await dual.RegisterTraversalAsync(stale, token);
+            await tcpOnly.RegisterTraversalAsync(traversal.LocalPeer, token);
+            await Task.Delay(TimeSpan.FromMilliseconds(300), token);
+            Assert.True(await tcpOnly.TryPunchAsync(dual.LocalPeer, traversal.LocalPeer, DHTTransport.Tcp, token),
+                "The registration over the working transport must survive the failing refreshes of the stale one.");
+            await traversal.StopAsync();
+            var block = await tcpOnly.ReadBlockAsync(record, Hidden(dual), 0, cancellationToken: token);
             Assert.Equal(content, block.ToArray());
         }
 
-        /// <summary>Rejects assistance from a contact that does not advertise relay capability.</summary>
-        /// <returns>Completion after both public APIs reject the incapable relay.</returns>
+        /// <summary>Rejects assistance from a peer that does not advertise the Traversal capability.</summary>
+        /// <returns>Completion after both public APIs reject the incapable peer.</returns>
         [Fact]
-        public async Task NonRelayContactsCannotRegisterOrIntroducePeers()
+        public async Task NonTraversalPeersCannotRegisterOrIntroducePeers()
         {
             using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(90));
             var token = deadline.Token;
@@ -131,11 +132,11 @@ namespace MajDHTNetwork.Tests
             await using var ordinary = new MajDHTNode(NatOptions(DHTTransport.Tcp, DHTCapabilities.Download));
             await Task.WhenAll(client.StartAsync(token), ordinary.StartAsync(token));
             var target = DHTPeer.Create(new DHTIdentity(), IPAddress.Loopback, 22000, 0, DHTCapabilities.Download);
-            await Assert.ThrowsAnyAsync<ArgumentException>(() => client.RegisterRelayAsync(ordinary.LocalPeer, token));
+            await Assert.ThrowsAnyAsync<ArgumentException>(() => client.RegisterTraversalAsync(ordinary.LocalPeer, token));
             await Assert.ThrowsAnyAsync<ArgumentException>(() => client.TryPunchAsync(target, ordinary.LocalPeer, DHTTransport.Tcp, token));
         }
 
-        /// <summary>Returns false when the requested peer has no live registration at the relay.</summary>
+        /// <summary>Returns false when the requested peer has no live registration at the Traversal node.</summary>
         /// <param name="transport">The only enabled transport.</param>
         /// <returns>Completion after the unregistered-target lookup.</returns>
         [Theory]
@@ -145,11 +146,11 @@ namespace MajDHTNetwork.Tests
         {
             using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(90));
             var token = deadline.Token;
-            await using var relay = new MajDHTNode(NatOptions(transport, DHTCapabilities.Relay));
+            await using var relay = new MajDHTNode(NatOptions(transport, DHTCapabilities.Traversal));
             await using var client = new MajDHTNode(NatOptions(transport, DHTCapabilities.Download));
-            await using var target = new MajDHTNode(NatOptions(transport, DHTCapabilities.Download, hidden: true));
+            await using var target = new MajDHTNode(NatOptions(transport, DHTCapabilities.Download));
             await Task.WhenAll(relay.StartAsync(token), client.StartAsync(token), target.StartAsync(token));
-            await client.RegisterRelayAsync(relay.LocalPeer, token);
+            await client.RegisterTraversalAsync(relay.LocalPeer, token);
             Assert.False(await client.TryPunchAsync(target.LocalPeer, relay.LocalPeer, transport, token));
         }
 
@@ -160,17 +161,17 @@ namespace MajDHTNetwork.Tests
         {
             using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(90));
             var token = deadline.Token;
-            await using var relay = new MajDHTNode(NatOptions(DHTTransport.Tcp, DHTCapabilities.Relay));
+            await using var relay = new MajDHTNode(NatOptions(DHTTransport.Tcp, DHTCapabilities.Traversal));
             await using var client = new MajDHTNode(NatOptions(DHTTransport.Tcp, DHTCapabilities.Download));
             await Task.WhenAll(relay.StartAsync(token), client.StartAsync(token));
             var target = DHTPeer.Create(new DHTIdentity(), IPAddress.Loopback, 22000, 0, DHTCapabilities.Download);
             using var cancelled = new CancellationTokenSource();
             cancelled.Cancel();
-            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => client.RegisterRelayAsync(relay.LocalPeer, cancelled.Token));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => client.RegisterTraversalAsync(relay.LocalPeer, cancelled.Token));
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() => client.TryPunchAsync(target, relay.LocalPeer, DHTTransport.Tcp, cancelled.Token));
         }
 
-        /// <summary>Cancels an active real-socket traversal while the relay withholds a response.</summary>
+        /// <summary>Cancels an active real-socket traversal while the Traversal node withholds a response.</summary>
         /// <param name="transport">The only enabled transport.</param>
         /// <returns>Completion after cancellation reaches the outstanding network operation.</returns>
         [Theory]
@@ -183,7 +184,7 @@ namespace MajDHTNetwork.Tests
             await using var relay = new StallingRelay(transport);
             await using var client = new MajDHTNode(NatOptions(transport, DHTCapabilities.Download));
             await client.StartAsync(token);
-            await client.RegisterRelayAsync(relay.Peer, token);
+            await client.RegisterTraversalAsync(relay.Peer, token);
             relay.Stall();
             var target = DHTPeer.Create(new DHTIdentity(), IPAddress.Loopback,
                 transport == DHTTransport.Tcp ? 22000 : 0, transport == DHTTransport.Udp ? 22000 : 0, DHTCapabilities.Download);
@@ -207,7 +208,7 @@ namespace MajDHTNetwork.Tests
             await using var relay = new StallingRelay(transport);
             await using var client = new MajDHTNode(NatOptions(transport, DHTCapabilities.Download));
             await client.StartAsync(token);
-            await client.RegisterRelayAsync(relay.Peer, token);
+            await client.RegisterTraversalAsync(relay.Peer, token);
             relay.Stall();
             await relay.Entered.Task.WaitAsync(token);
             var target = DHTPeer.Create(new DHTIdentity(), IPAddress.Loopback,
@@ -230,8 +231,10 @@ namespace MajDHTNetwork.Tests
         [InlineData(nameof(DHTNodeOptions.NatRegistrationLifetime), 300001)]
         [InlineData(nameof(DHTNodeOptions.MaxNatRegistrations), 0)]
         [InlineData(nameof(DHTNodeOptions.MaxNatRegistrations), 65537)]
-        [InlineData(nameof(DHTNodeOptions.MaxNatRelays), 0)]
-        [InlineData(nameof(DHTNodeOptions.MaxNatRelays), 17)]
+        [InlineData(nameof(DHTNodeOptions.MaxTraversalNodes), 0)]
+        [InlineData(nameof(DHTNodeOptions.MaxTraversalNodes), 17)]
+        [InlineData(nameof(DHTNodeOptions.MaxForwarders), 0)]
+        [InlineData(nameof(DHTNodeOptions.MaxForwarders), 17)]
         public void InvalidNatLimitsAreRejected(string option, int value)
         {
             var options = NatOptions(DHTTransport.Tcp, DHTCapabilities.Download);
@@ -249,8 +252,11 @@ namespace MajDHTNetwork.Tests
                 case nameof(DHTNodeOptions.MaxNatRegistrations):
                     options.MaxNatRegistrations = value;
                     break;
-                case nameof(DHTNodeOptions.MaxNatRelays):
-                    options.MaxNatRelays = value;
+                case nameof(DHTNodeOptions.MaxTraversalNodes):
+                    options.MaxTraversalNodes = value;
+                    break;
+                case nameof(DHTNodeOptions.MaxForwarders):
+                    options.MaxForwarders = value;
                     break;
                 default:
                     throw new ArgumentOutOfRangeException(nameof(option));
@@ -278,10 +284,10 @@ namespace MajDHTNetwork.Tests
             var options = NatOptions(DHTTransport.Tcp, DHTCapabilities.Download);
             options.EnableNatTraversal = false;
             await using var client = new MajDHTNode(options);
-            await using var relay = new MajDHTNode(NatOptions(DHTTransport.Tcp, DHTCapabilities.Relay));
+            await using var relay = new MajDHTNode(NatOptions(DHTTransport.Tcp, DHTCapabilities.Traversal));
             await Task.WhenAll(client.StartAsync(token), relay.StartAsync(token));
             var target = DHTPeer.Create(new DHTIdentity(), IPAddress.Loopback, 22000, 0, DHTCapabilities.Download);
-            await Assert.ThrowsAnyAsync<InvalidOperationException>(() => client.RegisterRelayAsync(relay.LocalPeer, token));
+            await Assert.ThrowsAnyAsync<InvalidOperationException>(() => client.RegisterTraversalAsync(relay.LocalPeer, token));
             Assert.False(await client.TryPunchAsync(target, relay.LocalPeer, DHTTransport.Tcp, token));
             await Assert.ThrowsAnyAsync<ArgumentNullException>(() => client.TryPunchAsync(null!, relay.LocalPeer, DHTTransport.Tcp, token));
             await Assert.ThrowsAnyAsync<ArgumentException>(() => client.TryPunchAsync(client.LocalPeer, relay.LocalPeer, DHTTransport.Tcp, token));
@@ -298,23 +304,23 @@ namespace MajDHTNetwork.Tests
         {
             using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(90));
             var token = deadline.Token;
-            await using var relay = new MajDHTNode(NatOptions(transport, DHTCapabilities.Relay));
-            await using var target = new MajDHTNode(NatOptions(transport, DHTCapabilities.Download, hidden: true));
+            await using var relay = new MajDHTNode(NatOptions(transport, DHTCapabilities.Traversal));
+            await using var target = new MajDHTNode(NatOptions(transport, DHTCapabilities.Download));
             await using var introduced = new NATProtocolPeer(transport);
             await using var substituted = new NATProtocolPeer(transport, introduced.Identity, introduced.Content);
             await Task.WhenAll(relay.StartAsync(token), target.StartAsync(token));
-            await target.RegisterRelayAsync(relay.LocalPeer, token);
-            AssertStatus(await introduced.ExchangeAsync(relay.LocalPeer, Operation.Rendezvous, new byte[] { 0 }, token), 0);
+            await target.RegisterTraversalAsync(relay.LocalPeer, token);
+            AssertStatus(await introduced.ExchangeAsync(relay.LocalPeer, Operation.Traversal, new byte[] { 0 }, token), 0);
             using var introduction = new Wire();
             introduction.PutByte(1);
             introduction.PutText(target.NodeId);
-            var response = await introduced.ExchangeAsync(relay.LocalPeer, Operation.Rendezvous, introduction.WrittenMemory, token);
+            var response = await introduced.ExchangeAsync(relay.LocalPeer, Operation.Traversal, introduction.WrittenMemory, token);
             byte[] ticket;
             using (var envelope = new Wire(response))
             {
                 Assert.Equal((byte)0, envelope.Byte());
                 using var invitation = new Wire(envelope.Bytes(4096));
-                _ = new DHTPeer(invitation.Bytes(2048));
+                _ = DHTContact.Parse(invitation.Bytes(2048));
                 _ = invitation.Text(96);
                 _ = invitation.Long();
                 ticket = invitation.Bytes(16).ToArray();
@@ -358,22 +364,22 @@ namespace MajDHTNetwork.Tests
             AssertStatus(await sender.ExchangeAsync(target.LocalPeer, Operation.Punch, new byte[length], token), 1);
         }
 
-        /// <summary>Bounds maintained assisting relays without counting a duplicate registration twice.</summary>
+        /// <summary>Bounds maintained Traversal nodes without counting a duplicate registration twice.</summary>
         /// <returns>Completion after duplicate registration and the full-quota rejection are checked.</returns>
         [Fact]
-        public async Task MaintainedRelayQuotaRejectsAdditionalRelaysButAllowsRefresh()
+        public async Task MaintainedTraversalQuotaRejectsAdditionalNodesButAllowsRefresh()
         {
             using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(90));
             var token = deadline.Token;
             var options = NatOptions(DHTTransport.Tcp, DHTCapabilities.Download);
-            options.MaxNatRelays = 1;
+            options.MaxTraversalNodes = 1;
             await using var client = new MajDHTNode(options);
-            await using var first = new MajDHTNode(NatOptions(DHTTransport.Tcp, DHTCapabilities.Relay));
-            await using var second = new MajDHTNode(NatOptions(DHTTransport.Tcp, DHTCapabilities.Relay));
+            await using var first = new MajDHTNode(NatOptions(DHTTransport.Tcp, DHTCapabilities.Traversal));
+            await using var second = new MajDHTNode(NatOptions(DHTTransport.Tcp, DHTCapabilities.Traversal));
             await Task.WhenAll(client.StartAsync(token), first.StartAsync(token), second.StartAsync(token));
-            await client.RegisterRelayAsync(first.LocalPeer, token);
-            await client.RegisterRelayAsync(first.LocalPeer, token);
-            await Assert.ThrowsAnyAsync<IOException>(() => client.RegisterRelayAsync(second.LocalPeer, token));
+            await client.RegisterTraversalAsync(first.LocalPeer, token);
+            await client.RegisterTraversalAsync(first.LocalPeer, token);
+            await Assert.ThrowsAnyAsync<IOException>(() => client.RegisterTraversalAsync(second.LocalPeer, token));
         }
 
         /// <summary>Checks the authenticated outer status of a raw protocol response.</summary>
@@ -385,17 +391,15 @@ namespace MajDHTNetwork.Tests
             Assert.Equal(expected, reader.Byte());
         }
 
-        /// <summary>Creates fast real-loopback NAT options with optional unreachable advertised addresses.</summary>
+        /// <summary>Creates fast real-loopback NAT options.</summary>
         /// <param name="transport">The only transport to bind.</param>
         /// <param name="capabilities">The services advertised by the test node.</param>
-        /// <param name="hidden">Whether the signed contact should use an address with no matching listener.</param>
-        /// <returns>Independent options whose observed socket address remains 127.0.0.1.</returns>
-        private static DHTNodeOptions NatOptions(DHTTransport transport, DHTCapabilities capabilities, bool hidden = false)
+        /// <returns>Independent options whose observed socket address is 127.0.0.1.</returns>
+        private static DHTNodeOptions NatOptions(DHTTransport transport, DHTCapabilities capabilities)
         {
             return new DHTNodeOptions
             {
                 ListenAddresses = new List<IPAddress> { IPAddress.Loopback },
-                AdvertisedAddresses = new List<IPAddress> { hidden ? IPAddress.Parse("127.0.0.2") : IPAddress.Loopback },
                 TcpPort = transport == DHTTransport.Tcp ? 0 : (int?)null,
                 UdpPort = transport == DHTTransport.Udp ? 0 : (int?)null,
                 PreferredTransport = transport,
@@ -420,27 +424,27 @@ namespace MajDHTNetwork.Tests
             Assert.True(actual.Span.SequenceEqual(content.AsSpan(offset, length)), "The authenticated direct block differs from its original file slice.");
         }
 
-        /// <summary>Authenticates registration once and can then stall subsequent rendezvous RPCs.</summary>
+        /// <summary>Authenticates registration once and can then stall subsequent traversal RPCs.</summary>
         private sealed class StallingRelay : IAsyncDisposable
         {
-            /// <summary>The identity signing the relay's authenticated responses.</summary>
+            /// <summary>The identity signing the Traversal node's authenticated responses.</summary>
             private readonly DHTIdentity _identity = new DHTIdentity();
             /// <summary>The real transport that captures source endpoint metadata.</summary>
             private readonly SocketTransport _transport;
             /// <summary>Whether subsequent requests wait for their transport cancellation.</summary>
             private bool _stall;
-            /// <summary>Gets the relay-capable signed listener contact.</summary>
+            /// <summary>Gets the Traversal-capable contact at the listener endpoint.</summary>
             internal DHTPeer Peer { get; }
             /// <summary>Signals entry into a deliberately withheld network response.</summary>
             internal TaskCompletionSource<bool> Entered { get; } = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-            /// <summary>Binds a real relay listener for a single transport.</summary>
+            /// <summary>Binds a real Traversal listener for a single transport.</summary>
             /// <param name="transport">The only transport to enable.</param>
             internal StallingRelay(DHTTransport transport)
             {
-                _transport = new SocketTransport(NatOptions(transport, DHTCapabilities.Relay).Snapshot(), HandleAsync, NullLogger.Instance);
+                _transport = new SocketTransport(NatOptions(transport, DHTCapabilities.Traversal).Snapshot(), HandleAsync, NullLogger.Instance);
                 _transport.Bind();
-                Peer = DHTPeer.Create(_identity, IPAddress.Loopback, _transport.TcpPort, _transport.UdpPort, DHTCapabilities.Relay);
+                Peer = DHTPeer.Create(_identity, IPAddress.Loopback, _transport.TcpPort, _transport.UdpPort, DHTCapabilities.Traversal);
                 _transport.Run();
             }
 
@@ -451,7 +455,7 @@ namespace MajDHTNetwork.Tests
             }
 
             /// <summary>Returns an authenticated observed endpoint or holds the response until cancelled.</summary>
-            /// <param name="encoded">The encrypted rendezvous request.</param>
+            /// <param name="encoded">The encrypted traversal request.</param>
             /// <param name="transport">The transport carrying the authenticated request.</param>
             /// <param name="source">The real remote socket endpoint.</param>
             /// <param name="token">The server request lifetime.</param>
@@ -475,7 +479,7 @@ namespace MajDHTNetwork.Tests
                 return new Packet(Peer, request.RequestId, (byte)(request.Kind | 128), response.WrittenMemory).Seal(_identity, request.Sender);
             }
 
-            /// <summary>Cancels all held requests and drains the real relay transport.</summary>
+            /// <summary>Cancels all held requests and drains the real transport.</summary>
             /// <returns>Completion after all listener and request tasks stop.</returns>
             public async ValueTask DisposeAsync()
             {

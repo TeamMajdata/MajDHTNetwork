@@ -7,25 +7,25 @@ using System.Net;
 
 namespace MajDHTNetwork.Protocol
 {
-    /// <summary>The first byte of every Rendezvous request.</summary>
-    public enum RendezvousAction : byte
+    /// <summary>The first byte of every Traversal request.</summary>
+    public enum TraversalAction : byte
     {
         /// <summary>Registers or refreshes the sender's observed endpoint and polls for a pending introduction.</summary>
         Register = 0,
-        /// <summary>Asks the relay to introduce the sender to another registered node.</summary>
+        /// <summary>Asks the Traversal node to introduce the sender to another registered node for hole punching.</summary>
         Introduce = 1,
-        /// <summary>Asks the relay to arrange an independent dial-back of the sender's observed address.</summary>
+        /// <summary>Asks the Traversal node to arrange an independent dial-back of the sender's observed address.</summary>
         DialBack = 2,
-        /// <summary>Delegates a dial-back from a relay to an independent helper.</summary>
+        /// <summary>Delegates a dial-back from a Traversal node to an independent helper.</summary>
         DialBackAssist = 3
     }
 
-    /// <summary>A relay's introduction of one registered peer to another, shared only by that pair and transport.</summary>
-    public readonly struct RendezvousIntroduction
+    /// <summary>A Traversal node's introduction of one registered peer to another, shared only by that pair and transport.</summary>
+    public readonly struct TraversalIntroduction
     {
         /// <summary>Gets the introduced peer's signed contact.</summary>
-        public DHTPeer Peer { get; }
-        /// <summary>Gets the endpoint the relay observed for the introduced peer on the introduced transport.</summary>
+        public DHTContact Peer { get; }
+        /// <summary>Gets the endpoint the Traversal node observed for the introduced peer on the introduced transport.</summary>
         public IPEndPoint Endpoint { get; }
         /// <summary>Gets the random 16-byte ticket both peers send in their Punch probes.</summary>
         public ReadOnlyMemory<byte> Ticket { get; }
@@ -34,14 +34,14 @@ namespace MajDHTNetwork.Protocol
 
         /// <summary>Creates an introduction.</summary>
         /// <param name="peer">The introduced peer's contact.</param>
-        /// <param name="endpoint">The relay-observed endpoint of the introduced peer.</param>
+        /// <param name="endpoint">The observed endpoint of the introduced peer.</param>
         /// <param name="ticket">The 16-byte ticket.</param>
         /// <param name="expiresAt">The ticket expiry.</param>
         /// <exception cref="ArgumentNullException">The peer or endpoint is null.</exception>
         /// <exception cref="ArgumentException">The ticket is not 16 bytes long.</exception>
-        public RendezvousIntroduction(DHTPeer peer, IPEndPoint endpoint, ReadOnlyMemory<byte> ticket, DateTimeOffset expiresAt)
+        public TraversalIntroduction(DHTContact peer, IPEndPoint endpoint, ReadOnlyMemory<byte> ticket, DateTimeOffset expiresAt)
         {
-            if (ticket.Length != RendezvousMessage.TicketLength)
+            if (ticket.Length != TraversalMessage.TicketLength)
             {
                 throw new ArgumentException("An introduction ticket must contain 16 bytes.", nameof(ticket));
             }
@@ -52,29 +52,29 @@ namespace MajDHTNetwork.Protocol
         }
     }
 
-    /// <summary>The result of a <see cref="RendezvousAction.Register"/> request.</summary>
-    public readonly struct RendezvousPollResponse
+    /// <summary>The result of a <see cref="TraversalAction.Register"/> request.</summary>
+    public readonly struct TraversalPollResponse
     {
-        /// <summary>Gets the endpoint the relay observed for the requester on the request's transport.</summary>
+        /// <summary>Gets the endpoint the Traversal node observed for the requester on the request's transport.</summary>
         public IPEndPoint Observed { get; }
         /// <summary>Gets the introduction queued for the requester, or null when none is pending.</summary>
-        public RendezvousIntroduction? Introduction { get; }
+        public TraversalIntroduction? Introduction { get; }
 
         /// <summary>Creates a poll result.</summary>
         /// <param name="observed">The observed requester endpoint.</param>
         /// <param name="introduction">The pending introduction, or null.</param>
         /// <exception cref="ArgumentNullException">The observed endpoint is null.</exception>
-        public RendezvousPollResponse(IPEndPoint observed, RendezvousIntroduction? introduction)
+        public TraversalPollResponse(IPEndPoint observed, TraversalIntroduction? introduction)
         {
             Observed = observed ?? throw new ArgumentNullException(nameof(observed));
             Introduction = introduction;
         }
     }
 
-    /// <summary>The result of a <see cref="RendezvousAction.DialBack"/> request once a helper accepted the dial-back.</summary>
+    /// <summary>The result of a <see cref="TraversalAction.DialBack"/> request once a helper accepted the dial-back.</summary>
     public readonly struct DialBackArrangement
     {
-        /// <summary>Gets the endpoint the relay observed for the requester; its address is the only address the helper probes.</summary>
+        /// <summary>Gets the endpoint the Traversal node observed for the requester; its address is the only address the helper probes.</summary>
         public IPEndPoint Observed { get; }
         /// <summary>Gets the node identifier of the helper that will send the probes.</summary>
         public string HelperId { get; }
@@ -95,11 +95,11 @@ namespace MajDHTNetwork.Protocol
         /// <exception cref="ArgumentException">The nonce length or the port list is invalid.</exception>
         public DialBackArrangement(IPEndPoint observed, string helperId, ReadOnlyMemory<byte> nonce, DateTimeOffset expiresAt, IReadOnlyList<int> ports)
         {
-            if (nonce.Length != RendezvousMessage.NonceLength)
+            if (nonce.Length != TraversalMessage.NonceLength)
             {
                 throw new ArgumentException("A dial-back nonce must contain 16 bytes.", nameof(nonce));
             }
-            RendezvousMessage.CheckPorts(ports);
+            TraversalMessage.CheckPorts(ports);
             Observed = observed ?? throw new ArgumentNullException(nameof(observed));
             HelperId = helperId ?? throw new ArgumentNullException(nameof(helperId));
             Nonce = nonce;
@@ -108,14 +108,14 @@ namespace MajDHTNetwork.Protocol
         }
     }
 
-    /// <summary>The arguments of a <see cref="RendezvousAction.DialBackAssist"/> request from a relay to a helper.</summary>
+    /// <summary>The arguments of a <see cref="TraversalAction.DialBackAssist"/> request from a Traversal node to a helper.</summary>
     public readonly struct DialBackDelegation
     {
         /// <summary>Gets the signed contact of the node whose reachability is checked.</summary>
-        public DHTPeer Owner { get; }
+        public DHTContact Owner { get; }
         /// <summary>Gets the transport to probe.</summary>
         public DHTTransport Transport { get; }
-        /// <summary>Gets the address the relay observed for the owner, which is the only address to probe.</summary>
+        /// <summary>Gets the address the Traversal node observed for the owner, which is the only address to probe.</summary>
         public IPAddress TargetAddress { get; }
         /// <summary>Gets the one to three candidate ports, in index order.</summary>
         public IReadOnlyList<int> Ports { get; }
@@ -127,24 +127,24 @@ namespace MajDHTNetwork.Protocol
         /// <summary>Creates a dial-back delegation.</summary>
         /// <param name="owner">The contact of the node to probe.</param>
         /// <param name="transport">The transport to probe.</param>
-        /// <param name="targetAddress">The relay-observed address.</param>
+        /// <param name="targetAddress">The observed address.</param>
         /// <param name="ports">The candidate ports.</param>
         /// <param name="nonce">The 16-byte nonce.</param>
         /// <param name="expiresAt">The dial-back expiry.</param>
         /// <exception cref="ArgumentNullException">The owner, address or port list is null.</exception>
         /// <exception cref="ArgumentException">The transport, nonce length or port list is invalid.</exception>
-        public DialBackDelegation(DHTPeer owner, DHTTransport transport, IPAddress targetAddress, IReadOnlyList<int> ports, ReadOnlyMemory<byte> nonce,
+        public DialBackDelegation(DHTContact owner, DHTTransport transport, IPAddress targetAddress, IReadOnlyList<int> ports, ReadOnlyMemory<byte> nonce,
             DateTimeOffset expiresAt)
         {
             if (transport != DHTTransport.Tcp && transport != DHTTransport.Udp)
             {
                 throw new ArgumentException("A TCP or UDP transport is required.", nameof(transport));
             }
-            if (nonce.Length != RendezvousMessage.NonceLength)
+            if (nonce.Length != TraversalMessage.NonceLength)
             {
                 throw new ArgumentException("A dial-back nonce must contain 16 bytes.", nameof(nonce));
             }
-            RendezvousMessage.CheckPorts(ports);
+            TraversalMessage.CheckPorts(ports);
             Owner = owner ?? throw new ArgumentNullException(nameof(owner));
             Transport = transport;
             TargetAddress = targetAddress ?? throw new ArgumentNullException(nameof(targetAddress));
@@ -155,12 +155,12 @@ namespace MajDHTNetwork.Protocol
     }
 
     /// <summary>
-    /// Encodes the Rendezvous operation, which a relay serves for registration, introductions and dial-backs. Every request
-    /// starts with a <see cref="RendezvousAction"/> byte, read with <see cref="ReadAction"/> before the action's own reader.
-    /// Readers of complete bodies reject trailing data; <see cref="ReadIntroduction"/> and <see cref="ReadPorts"/> read one
-    /// value inside a larger body.
+    /// Encodes the Traversal operation, which a Traversal node serves for registration, introductions and dial-backs. Every
+    /// request starts with a <see cref="TraversalAction"/> byte, read with <see cref="ReadAction"/> before the action's own
+    /// reader. Readers of complete bodies reject trailing data; <see cref="ReadIntroduction"/> and <see cref="ReadPorts"/> read
+    /// one value inside a larger body.
     /// </summary>
-    public static class RendezvousMessage
+    public static class TraversalMessage
     {
         /// <summary>The introduction ticket length in bytes.</summary>
         public const int TicketLength = 16;
@@ -171,28 +171,28 @@ namespace MajDHTNetwork.Protocol
         /// <summary>The maximum number of candidate ports a helper probes.</summary>
         public const int MaxProbePorts = 3;
 
-        /// <summary>Reads the action byte that starts every Rendezvous request body.</summary>
+        /// <summary>Reads the action byte that starts every Traversal request body.</summary>
         /// <param name="reader">The request body decoder.</param>
         /// <returns>The action; the caller continues with that action's reader.</returns>
         /// <exception cref="InvalidDataException">The action is unknown.</exception>
-        public static RendezvousAction ReadAction(Wire reader)
+        public static TraversalAction ReadAction(Wire reader)
         {
             var action = reader.Byte();
-            if (action > (byte)RendezvousAction.DialBackAssist)
+            if (action > (byte)TraversalAction.DialBackAssist)
             {
-                throw new InvalidDataException("Invalid rendezvous action.");
+                throw new InvalidDataException("Invalid traversal action.");
             }
-            return (RendezvousAction)action;
+            return (TraversalAction)action;
         }
 
-        /// <summary>Writes a complete <see cref="RendezvousAction.Register"/> request body.</summary>
+        /// <summary>Writes a complete <see cref="TraversalAction.Register"/> request body.</summary>
         /// <param name="writer">The request body encoder.</param>
         public static void WriteRegisterRequest(Wire writer)
         {
-            writer.PutByte((byte)RendezvousAction.Register);
+            writer.PutByte((byte)TraversalAction.Register);
         }
 
-        /// <summary>Reads the remainder of a <see cref="RendezvousAction.Register"/> request body, which is empty.</summary>
+        /// <summary>Reads the remainder of a <see cref="TraversalAction.Register"/> request body, which is empty.</summary>
         /// <param name="reader">The request body decoder after the action byte.</param>
         /// <exception cref="InvalidDataException">The body has trailing data.</exception>
         public static void ReadRegisterRequest(Wire reader)
@@ -200,16 +200,16 @@ namespace MajDHTNetwork.Protocol
             reader.End();
         }
 
-        /// <summary>Writes a complete <see cref="RendezvousAction.Introduce"/> request body.</summary>
+        /// <summary>Writes a complete <see cref="TraversalAction.Introduce"/> request body.</summary>
         /// <param name="writer">The request body encoder.</param>
         /// <param name="targetId">The node identifier of the registered peer to be introduced to.</param>
         public static void WriteIntroduceRequest(Wire writer, string targetId)
         {
-            writer.PutByte((byte)RendezvousAction.Introduce);
+            writer.PutByte((byte)TraversalAction.Introduce);
             writer.PutText(targetId);
         }
 
-        /// <summary>Reads the remainder of a <see cref="RendezvousAction.Introduce"/> request body.</summary>
+        /// <summary>Reads the remainder of a <see cref="TraversalAction.Introduce"/> request body.</summary>
         /// <param name="reader">The request body decoder after the action byte.</param>
         /// <returns>The target node identifier.</returns>
         /// <exception cref="InvalidDataException">The identifier is not 64 lowercase hexadecimal digits or the body has trailing data.</exception>
@@ -219,15 +219,15 @@ namespace MajDHTNetwork.Protocol
             reader.End();
             if (!Crypto.IsHash(target))
             {
-                throw new InvalidDataException("Invalid rendezvous target.");
+                throw new InvalidDataException("Invalid traversal target.");
             }
             return target;
         }
 
-        /// <summary>Writes a complete <see cref="RendezvousAction.DialBack"/> request body.</summary>
+        /// <summary>Writes a complete <see cref="TraversalAction.DialBack"/> request body.</summary>
         /// <param name="writer">The request body encoder.</param>
         /// <param name="requestedPorts">
-        /// At most two extra candidate ports; the relay always probes the observed source port first and deduplicates the list.
+        /// At most two extra candidate ports; the Traversal node always probes the observed source port first and deduplicates the list.
         /// </param>
         /// <exception cref="ArgumentNullException">The port list is null.</exception>
         /// <exception cref="ArgumentException">The list is too long or contains an invalid port.</exception>
@@ -248,7 +248,7 @@ namespace MajDHTNetwork.Protocol
                     throw new ArgumentException("Invalid dial-back candidate port.", nameof(requestedPorts));
                 }
             }
-            writer.PutByte((byte)RendezvousAction.DialBack);
+            writer.PutByte((byte)TraversalAction.DialBack);
             writer.PutLong(requestedPorts.Count);
             foreach (var port in requestedPorts)
             {
@@ -256,7 +256,7 @@ namespace MajDHTNetwork.Protocol
             }
         }
 
-        /// <summary>Reads the remainder of a <see cref="RendezvousAction.DialBack"/> request body.</summary>
+        /// <summary>Reads the remainder of a <see cref="TraversalAction.DialBack"/> request body.</summary>
         /// <param name="reader">The request body decoder after the action byte.</param>
         /// <returns>The zero to two extra candidate ports, not yet deduplicated.</returns>
         /// <exception cref="InvalidDataException">The count or a port is out of range, or the body has trailing data.</exception>
@@ -281,12 +281,12 @@ namespace MajDHTNetwork.Protocol
             return ports;
         }
 
-        /// <summary>Writes a complete <see cref="RendezvousAction.DialBackAssist"/> request body.</summary>
+        /// <summary>Writes a complete <see cref="TraversalAction.DialBackAssist"/> request body.</summary>
         /// <param name="writer">The request body encoder.</param>
         /// <param name="delegation">The dial-back to delegate.</param>
         public static void WriteDialBackAssistRequest(Wire writer, DialBackDelegation delegation)
         {
-            writer.PutByte((byte)RendezvousAction.DialBackAssist);
+            writer.PutByte((byte)TraversalAction.DialBackAssist);
             writer.Put(delegation.Owner.Encoded);
             writer.PutByte((byte)delegation.Transport);
             writer.PutText(delegation.TargetAddress.ToString());
@@ -295,13 +295,13 @@ namespace MajDHTNetwork.Protocol
             writer.PutLong(delegation.ExpiresAt.ToUnixTimeMilliseconds());
         }
 
-        /// <summary>Reads the remainder of a <see cref="RendezvousAction.DialBackAssist"/> request body.</summary>
+        /// <summary>Reads the remainder of a <see cref="TraversalAction.DialBackAssist"/> request body.</summary>
         /// <param name="reader">The request body decoder after the action byte.</param>
         /// <returns>The structurally valid delegation; the helper still applies its scope, quota and expiry policies.</returns>
         /// <exception cref="InvalidDataException">A contact, transport, address, port, nonce or the framing is invalid.</exception>
         public static DialBackDelegation ReadDialBackAssistRequest(Wire reader)
         {
-            var owner = DHTPeer.Parse(reader.Bytes(DHTPeer.MaxEncodedLength));
+            var owner = DHTContact.Parse(reader.Bytes(DHTContact.MaxEncodedLength));
             var transport = reader.Byte();
             var targetText = reader.Text(ObservedEndpoint.MaxAddressLength);
             var ports = ReadPorts(reader);
@@ -316,11 +316,11 @@ namespace MajDHTNetwork.Protocol
             return new DialBackDelegation(owner, (DHTTransport)transport, target, ports, nonce, expiresAt);
         }
 
-        /// <summary>Writes a successful <see cref="RendezvousAction.Register"/> result.</summary>
+        /// <summary>Writes a successful <see cref="TraversalAction.Register"/> result.</summary>
         /// <param name="writer">The result encoder.</param>
         /// <param name="observed">The endpoint observed for the requester on this transport.</param>
         /// <param name="introduction">The pending introduction for the requester, or null.</param>
-        public static void WritePollResponse(Wire writer, IPEndPoint observed, RendezvousIntroduction? introduction)
+        public static void WritePollResponse(Wire writer, IPEndPoint observed, TraversalIntroduction? introduction)
         {
             ObservedEndpoint.Write(writer, observed);
             writer.PutByte((byte)(introduction.HasValue ? 1 : 0));
@@ -330,27 +330,27 @@ namespace MajDHTNetwork.Protocol
             }
         }
 
-        /// <summary>Reads a complete <see cref="RendezvousAction.Register"/> result.</summary>
+        /// <summary>Reads a complete <see cref="TraversalAction.Register"/> result.</summary>
         /// <param name="reader">The result decoder.</param>
         /// <returns>The observed endpoint and the optional introduction; the requester still validates the introduction's expiry and peer.</returns>
         /// <exception cref="InvalidDataException">The endpoint, flag or introduction is malformed, or the result has trailing data.</exception>
-        public static RendezvousPollResponse ReadPollResponse(Wire reader)
+        public static TraversalPollResponse ReadPollResponse(Wire reader)
         {
             var observed = ObservedEndpoint.Read(reader);
             var hasIntroduction = reader.Byte();
             if (hasIntroduction > 1)
             {
-                throw new InvalidDataException("Invalid rendezvous poll response.");
+                throw new InvalidDataException("Invalid traversal poll response.");
             }
-            RendezvousIntroduction? introduction = hasIntroduction == 0 ? null : ReadIntroduction(reader);
+            TraversalIntroduction? introduction = hasIntroduction == 0 ? null : ReadIntroduction(reader);
             reader.End();
-            return new RendezvousPollResponse(observed, introduction);
+            return new TraversalPollResponse(observed, introduction);
         }
 
-        /// <summary>Writes one introduction, which is also the complete successful <see cref="RendezvousAction.Introduce"/> result.</summary>
+        /// <summary>Writes one introduction, which is also the complete successful <see cref="TraversalAction.Introduce"/> result.</summary>
         /// <param name="writer">The result encoder.</param>
         /// <param name="introduction">The introduction.</param>
-        public static void WriteIntroduction(Wire writer, RendezvousIntroduction introduction)
+        public static void WriteIntroduction(Wire writer, TraversalIntroduction introduction)
         {
             writer.Put(introduction.Peer.Encoded);
             ObservedEndpoint.Write(writer, introduction.Endpoint);
@@ -362,31 +362,31 @@ namespace MajDHTNetwork.Protocol
         /// <param name="reader">The decoder positioned at the introduction.</param>
         /// <returns>The verified contact, observed endpoint, ticket and expiry; the caller validates them against its own state.</returns>
         /// <exception cref="InvalidDataException">The contact, endpoint or ticket is malformed.</exception>
-        public static RendezvousIntroduction ReadIntroduction(Wire reader)
+        public static TraversalIntroduction ReadIntroduction(Wire reader)
         {
-            var peer = DHTPeer.Parse(reader.Bytes(DHTPeer.MaxEncodedLength));
+            var peer = DHTContact.Parse(reader.Bytes(DHTContact.MaxEncodedLength));
             var endpoint = ObservedEndpoint.Read(reader);
             var ticket = reader.Bytes(TicketLength);
             var expiresAt = DateTimeOffset.FromUnixTimeMilliseconds(reader.Long());
             if (ticket.Length != TicketLength)
             {
-                throw new InvalidDataException("Invalid rendezvous introduction ticket.");
+                throw new InvalidDataException("Invalid traversal introduction ticket.");
             }
-            return new RendezvousIntroduction(peer, endpoint, ticket, expiresAt);
+            return new TraversalIntroduction(peer, endpoint, ticket, expiresAt);
         }
 
-        /// <summary>Reads a complete <see cref="RendezvousAction.Introduce"/> result.</summary>
+        /// <summary>Reads a complete <see cref="TraversalAction.Introduce"/> result.</summary>
         /// <param name="reader">The result decoder.</param>
         /// <returns>The introduction to the requested target.</returns>
         /// <exception cref="InvalidDataException">The introduction is malformed or the result has trailing data.</exception>
-        public static RendezvousIntroduction ReadIntroduceResponse(Wire reader)
+        public static TraversalIntroduction ReadIntroduceResponse(Wire reader)
         {
             var introduction = ReadIntroduction(reader);
             reader.End();
             return introduction;
         }
 
-        /// <summary>Writes a successful <see cref="RendezvousAction.DialBack"/> result.</summary>
+        /// <summary>Writes a successful <see cref="TraversalAction.DialBack"/> result.</summary>
         /// <param name="writer">The result encoder.</param>
         /// <param name="arrangement">The accepted dial-back.</param>
         public static void WriteDialBackResponse(Wire writer, DialBackArrangement arrangement)
@@ -398,7 +398,7 @@ namespace MajDHTNetwork.Protocol
             WritePorts(writer, arrangement.Ports);
         }
 
-        /// <summary>Reads a complete <see cref="RendezvousAction.DialBack"/> result.</summary>
+        /// <summary>Reads a complete <see cref="TraversalAction.DialBack"/> result.</summary>
         /// <param name="reader">The result decoder.</param>
         /// <returns>The arrangement; the requester still checks the helper identity and expiry against its own policy.</returns>
         /// <exception cref="InvalidDataException">The endpoint, helper identifier, nonce, ports or framing is invalid.</exception>

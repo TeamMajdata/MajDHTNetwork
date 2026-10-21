@@ -8,253 +8,170 @@ using MajDHTNetwork.Protocol;
 
 namespace MajDHTNetwork
 {
-    /// <summary>A self-signed node contact describing its endpoints, reachability and relay hints.</summary>
+    /// <summary>
+    /// A node as another node knows it: its signed <see cref="DHTContact"/> together with the endpoints at which that node, or
+    /// the node that referred it, observed it. The contact is the owner's signed statement; the endpoints are the observer's.
+    /// </summary>
     public sealed class DHTPeer
     {
-        /// <summary>The maximum accepted signed payload length.</summary>
-        public const int MaxPayloadLength = 2048;
-        /// <summary>The maximum accepted encoded contact length, including framing and signature.</summary>
-        public const int MaxEncodedLength = 2200;
-        /// <summary>The maximum number of advertised endpoints.</summary>
+        /// <summary>The maximum number of observed endpoints kept for one node.</summary>
         public const int MaxEndpoints = 4;
-        /// <summary>The maximum number of embedded relay hints.</summary>
-        public const int MaxRelayHints = 3;
-        /// <summary>The maximum accepted encoded length of one embedded relay hint.</summary>
-        public const int MaxHintLength = 1024;
-        /// <summary>The reachability bits that encode <see cref="DHTReachability"/>.</summary>
-        private const byte ReachabilityMask = 0x03;
-        /// <summary>The reachability bit marking an endpoint-dependent NAT mapping.</summary>
-        private const byte EndpointDependentBit = 0x04;
-        /// <summary>The maximum number of distinct contacts whose verification is cached process-wide.</summary>
-        private const int CacheCapacity = 512;
-        /// <summary>
-        /// The verified contacts keyed by their exact bytes, so the sender of every request and the contacts repeated across
-        /// lookups are parsed, signature-checked and allocated once instead of on every packet.
-        /// </summary>
-        private static readonly EncodedCache<DHTPeer> s_cache = new EncodedCache<DHTPeer>(CacheCapacity,
-            static encoded => new DHTPeer(encoded), static (peer, encoded) => !peer.IsExpired && peer.Encoded.SequenceEqual(encoded));
-        /// <summary>The immutable canonical contact bytes.</summary>
-        private readonly byte[] _encoded;
-        /// <summary>The signing public key.</summary>
-        private readonly ReadOnlyMemory<byte> _signingKey;
-        /// <summary>The agreement public key.</summary>
-        private readonly ReadOnlyMemory<byte> _agreementKey;
-        /// <summary>The cached node digest used for allocation-free routing comparisons.</summary>
-        private readonly byte[] _nodeHash;
-        /// <summary>The validated advertised endpoints.</summary>
+        /// <summary>The observed endpoints, at most one per address.</summary>
         private readonly DHTEndpoint[] _endpoints;
-        /// <summary>The validated relay hints.</summary>
-        private readonly DHTPeer[] _relayHints;
-        /// <summary>The confirmed external address, or null when unknown.</summary>
-        private readonly IPAddress? _externalAddress;
-        /// <summary>Gets the stable node fingerprint.</summary>
-        public string NodeId { get; }
-        /// <summary>Gets the advertised endpoints, ordered by the owner's preference.</summary>
+
+        /// <summary>Gets the signed contact.</summary>
+        public DHTContact Contact { get; }
+        /// <summary>Gets the observed endpoints, most recently observed last; at most one per address.</summary>
         public IReadOnlyList<DHTEndpoint> Endpoints => _endpoints;
-        /// <summary>Gets the public relays through which a private node can be reached.</summary>
-        public IReadOnlyList<DHTPeer> RelayHints => _relayHints;
-        /// <summary>Gets how other nodes can reach this contact.</summary>
-        public DHTReachability Reachability { get; }
-        /// <summary>Gets whether the owner observed an endpoint-dependent NAT mapping, which makes hole punching unlikely.</summary>
-        public bool HasEndpointDependentMapping { get; }
-        /// <summary>Gets a copy of the external address confirmed by independent relays, or null when unknown.</summary>
-        public IPAddress? ExternalAddress => _externalAddress == null ? null : NetworkScope.CopyAddress(_externalAddress);
-        /// <summary>Gets the internally cached external address.</summary>
-        internal IPAddress? ExternalNetworkAddress => _externalAddress;
-        /// <summary>Gets the advertised and signed node capabilities.</summary>
-        public DHTCapabilities Capabilities { get; }
-        /// <summary>
-        /// Gets the identity work of the contact owner: the leading zero bits of Argon2id over its node digest. It is evaluated
-        /// once per process and cached; while the process-wide evaluation budget is spent, an unevaluated identity reports zero.
-        /// Nodes reject contacts below their configured difficulty.
-        /// </summary>
-        public int IdentityWork => IdentityPuzzle.Work(NodeId, _nodeHash);
-        /// <summary>Gets the owner's strictly increasing issue sequence; a higher value supersedes a lower one.</summary>
-        public long Sequence { get; }
-        /// <summary>Gets the expiry of this contact.</summary>
-        public DateTimeOffset ExpiresAt { get; }
-        /// <summary>Gets whether the contact lease is still valid.</summary>
-        public bool IsExpired => ExpiresAt <= DateTimeOffset.UtcNow;
-        /// <summary>Gets a borrowed view of the owned immutable signed contact.</summary>
-        public ReadOnlySpan<byte> Encoded => _encoded;
+        /// <summary>Gets the stable node fingerprint.</summary>
+        public string NodeId => Contact.NodeId;
         /// <summary>Gets the cached node digest without allocation.</summary>
-        public ReadOnlySpan<byte> NodeHash => _nodeHash;
-        /// <summary>Gets the signing public key for protocol verification.</summary>
-        public ReadOnlyMemory<byte> SigningKey => _signingKey;
-        /// <summary>Gets the agreement public key for envelope encryption.</summary>
-        public ReadOnlyMemory<byte> AgreementKey => _agreementKey;
+        public ReadOnlySpan<byte> NodeHash => Contact.NodeHash;
+        /// <summary>Gets the advertised and signed node capabilities.</summary>
+        public DHTCapabilities Capabilities => Contact.Capabilities;
+        /// <summary>Gets how other nodes can reach this node.</summary>
+        public DHTReachability Reachability => Contact.Reachability;
+        /// <summary>Gets whether the owner observed an endpoint-dependent NAT mapping.</summary>
+        public bool HasEndpointDependentMapping => Contact.HasEndpointDependentMapping;
+        /// <summary>Gets the Traversal and Forwarder nodes hinted by the contact.</summary>
+        public IReadOnlyList<DHTPeer> Hints => Contact.Hints;
+        /// <summary>Gets the owner's strictly increasing issue sequence.</summary>
+        public long Sequence => Contact.Sequence;
+        /// <summary>Gets the expiry of the contact.</summary>
+        public DateTimeOffset ExpiresAt => Contact.ExpiresAt;
+        /// <summary>Gets whether the contact lease is still valid.</summary>
+        public bool IsExpired => Contact.IsExpired;
+        /// <summary>Gets the identity work of the contact owner.</summary>
+        public int IdentityWork => Contact.IdentityWork;
 
-        /// <summary>Parses and verifies canonical contact bytes.</summary>
-        /// <param name="encoded">The signed bytes.</param>
-        /// <exception cref="InvalidDataException">The contact is malformed, expired or forged.</exception>
-        internal DHTPeer(ReadOnlyMemory<byte> encoded) : this(encoded, true)
+        /// <summary>Pairs a contact with the endpoints at which it was observed.</summary>
+        /// <param name="contact">The signed contact.</param>
+        /// <param name="endpoints">At most four observed endpoints with distinct addresses; the list is copied.</param>
+        /// <exception cref="ArgumentNullException">The contact or list is null.</exception>
+        /// <exception cref="ArgumentException">The list has more than four endpoints, a null entry or repeated addresses.</exception>
+        public DHTPeer(DHTContact contact, IReadOnlyList<DHTEndpoint> endpoints)
         {
-        }
-
-        /// <summary>Gets the verified contact for canonical bytes, reusing the cached instance when the same bytes were verified before.</summary>
-        /// <param name="encoded">The borrowed signed bytes; they are never retained.</param>
-        /// <returns>The verified, unexpired contact.</returns>
-        /// <exception cref="InvalidDataException">The contact is malformed, expired or forged.</exception>
-        public static DHTPeer Parse(ReadOnlyMemory<byte> encoded)
-        {
-            if (encoded.Length > MaxEncodedLength)
+            Contact = contact ?? throw new ArgumentNullException(nameof(contact));
+            if (endpoints == null)
             {
-                throw new InvalidDataException("Oversized node contact.");
+                throw new ArgumentNullException(nameof(endpoints));
             }
-            return s_cache.Get(encoded);
-        }
-
-        /// <summary>Parses and verifies canonical contact bytes, optionally rejecting nested relay hints.</summary>
-        /// <param name="encoded">The signed bytes.</param>
-        /// <param name="allowRelayHints">Whether the contact may embed relay hints.</param>
-        /// <exception cref="InvalidDataException">The contact is malformed, expired, forged or illegally nested.</exception>
-        private DHTPeer(ReadOnlyMemory<byte> encoded, bool allowRelayHints)
-        {
-            if (encoded.Length > MaxEncodedLength)
+            if (endpoints.Count > MaxEndpoints)
             {
-                throw new InvalidDataException("Oversized node contact.");
+                throw new ArgumentException("At most four observed endpoints are kept for one node.", nameof(endpoints));
             }
-            _encoded = encoded.ToArray();
-            using var wrapper = new Wire(_encoded);
-            var payload = wrapper.Bytes(MaxPayloadLength);
-            var signature = wrapper.Bytes(64);
-            wrapper.End();
-            using var wire = new Wire(payload);
-            if (!wire.Tag(ProtocolTags.Contact))
-            {
-                throw new InvalidDataException("Unsupported contact version.");
-            }
-            _signingKey = wire.Bytes(32);
-            _agreementKey = wire.Bytes(32);
-            var capabilities = (DHTCapabilities)wire.Byte();
-            var reachability = wire.Byte();
-            var sequence = wire.Long();
-            var expiry = wire.Long();
-            var external = wire.Text(96);
-            var endpointCount = wire.Long();
-            if (endpointCount < 0 || endpointCount > MaxEndpoints)
-            {
-                throw new InvalidDataException("Invalid contact endpoint count.");
-            }
-            _endpoints = new DHTEndpoint[endpointCount];
+            _endpoints = new DHTEndpoint[endpoints.Count];
             for (var index = 0; index < _endpoints.Length; index++)
             {
-                _endpoints[index] = ReadEndpoint(wire);
-            }
-            var hintCount = wire.Long();
-            if (hintCount < 0 || hintCount > (allowRelayHints ? MaxRelayHints : 0))
-            {
-                throw new InvalidDataException("Invalid contact relay hint count.");
-            }
-            _relayHints = new DHTPeer[hintCount];
-            for (var index = 0; index < _relayHints.Length; index++)
-            {
-                _relayHints[index] = new DHTPeer(wire.Bytes(MaxHintLength), false);
-            }
-            wire.End();
-            _nodeHash = Crypto.Hash(_signingKey.Span);
-            NodeId = Crypto.Hex(_nodeHash);
-            _externalAddress = external.Length == 0 ? null : ParseAddress(external);
-            Capabilities = capabilities;
-            Reachability = (DHTReachability)(reachability & ReachabilityMask);
-            HasEndpointDependentMapping = (reachability & EndpointDependentBit) != 0;
-            Sequence = sequence;
-            ExpiresAt = DateTimeOffset.FromUnixTimeSeconds(expiry);
-            if (_signingKey.Length != 32 || _agreementKey.Length != 32 || sequence < 0
-                || (capabilities & ~(DHTCapabilities.Download | DHTCapabilities.Provide | DHTCapabilities.Relay)) != 0
-                || (reachability & ~(ReachabilityMask | EndpointDependentBit)) != 0 || (reachability & ReachabilityMask) == ReachabilityMask
-                || expiry <= DateTimeOffset.UtcNow.ToUnixTimeSeconds()
-                || expiry > DateTimeOffset.UtcNow.AddDays(2).ToUnixTimeSeconds()
-                || !HasValidAdvertisement()
-                || !Crypto.Verify(_signingKey, payload, signature))
-            {
-                throw new InvalidDataException("Invalid, expired or forged node contact.");
+                var endpoint = endpoints[index] ?? throw new ArgumentException("An observed endpoint is null.", nameof(endpoints));
+                for (var previous = 0; previous < index; previous++)
+                {
+                    if (_endpoints[previous].NetworkAddress.Equals(endpoint.NetworkAddress))
+                    {
+                        throw new ArgumentException("Observed endpoints must have distinct addresses.", nameof(endpoints));
+                    }
+                }
+                _endpoints[index] = endpoint;
             }
         }
 
-        /// <summary>Creates a signed contact.</summary>
-        /// <param name="identity">The contact owner.</param>
-        /// <param name="endpoints">At most four distinct advertised endpoints.</param>
-        /// <param name="capabilities">The permitted node services.</param>
-        /// <param name="reachability">The owner's reachability state.</param>
-        /// <param name="endpointDependentMapping">Whether the owner observed an endpoint-dependent NAT mapping.</param>
-        /// <param name="externalAddress">The confirmed external address, or null.</param>
-        /// <param name="relayHints">At most three public relay contacts without nested hints.</param>
-        /// <param name="lifetime">The requested lease, shortened to the earliest relay hint expiry.</param>
-        /// <returns>A verified contact.</returns>
-        /// <exception cref="InvalidDataException">The resulting contact violates the contact rules.</exception>
-        public static DHTPeer Create(DHTIdentity identity, IReadOnlyList<DHTEndpoint> endpoints, DHTCapabilities capabilities,
-            DHTReachability reachability, bool endpointDependentMapping, IPAddress? externalAddress, IReadOnlyList<DHTPeer> relayHints,
-            TimeSpan lifetime)
+        /// <summary>Pairs a contact with the single endpoint at which it was observed over one transport.</summary>
+        /// <param name="contact">The signed contact.</param>
+        /// <param name="transport">The transport the packet travelled over.</param>
+        /// <param name="endpoint">The observed socket endpoint.</param>
+        /// <returns>The peer with that one endpoint.</returns>
+        /// <exception cref="ArgumentNullException">The contact is null.</exception>
+        /// <exception cref="ArgumentException">The transport or endpoint is invalid.</exception>
+        public static DHTPeer Observed(DHTContact contact, DHTTransport transport, IPEndPoint endpoint)
         {
-            var expiry = DateTimeOffset.UtcNow.Add(lifetime).ToUnixTimeSeconds();
-            foreach (var hint in relayHints)
-            {
-                expiry = Math.Min(expiry, hint.ExpiresAt.ToUnixTimeSeconds());
-            }
-            using var payload = new Wire();
-            payload.Put(ProtocolTags.Contact);
-            payload.Put(identity.PublicKey);
-            payload.Put(identity.AgreementPublicKey);
-            payload.PutByte((byte)capabilities);
-            payload.PutByte((byte)((byte)reachability | (endpointDependentMapping ? EndpointDependentBit : 0)));
-            payload.PutLong(identity.NextSequence());
-            payload.PutLong(expiry);
-            payload.PutText(externalAddress == null ? string.Empty : externalAddress.ToString());
-            payload.PutLong(endpoints.Count);
-            foreach (var endpoint in endpoints)
-            {
-                WriteEndpoint(payload, endpoint);
-            }
-            payload.PutLong(relayHints.Count);
-            foreach (var hint in relayHints)
-            {
-                payload.Put(hint.Encoded);
-            }
-            using var wrapper = new Wire();
-            wrapper.Put(payload.WrittenSpan);
-            wrapper.Put(identity.Sign(payload.WrittenMemory));
-            return new DHTPeer(wrapper.WrittenMemory);
+            return new DHTPeer(contact, new[] { DHTEndpoint.Observed(transport, endpoint) });
         }
 
-        /// <summary>Creates a signed contact with one unverified endpoint and a one-day lease.</summary>
+        /// <summary>
+        /// Signs a contact with unknown reachability and pairs it with the endpoint the caller knows the node listens at, for a
+        /// contact handed to another node out of band, such as a test fixture or an application's own channel.
+        /// </summary>
         /// <param name="identity">The contact owner.</param>
-        /// <param name="address">The reachable IP address.</param>
+        /// <param name="address">The listening address.</param>
         /// <param name="tcpPort">The TCP port or zero.</param>
         /// <param name="udpPort">The UDP port or zero.</param>
         /// <param name="capabilities">The permitted node services.</param>
-        /// <returns>A verified contact with unknown reachability.</returns>
+        /// <returns>The peer with that one endpoint.</returns>
+        /// <exception cref="ArgumentException">The address or ports are invalid.</exception>
         public static DHTPeer Create(DHTIdentity identity, IPAddress address, int tcpPort, int udpPort, DHTCapabilities capabilities)
         {
-            return Create(identity, new[] { new DHTEndpoint(address, tcpPort, udpPort, DHTEndpointFlags.None) }, capabilities,
-                DHTReachability.Unknown, false, null, Array.Empty<DHTPeer>(), TimeSpan.FromDays(1));
+            return new DHTPeer(DHTContact.Create(identity, capabilities), new[] { new DHTEndpoint(address, tcpPort, udpPort) });
         }
 
-        /// <summary>Checks whether two contacts advertise the same reachability, endpoints and relays.</summary>
-        /// <param name="other">The other contact.</param>
-        /// <returns>Whether only the sequence, lease or signature differ.</returns>
-        public bool SameAdvertisement(DHTPeer other)
+        /// <summary>Gets a copy of this peer with another contact of the same node, keeping the observed endpoints.</summary>
+        /// <param name="contact">The newer contact of the same node.</param>
+        /// <returns>The peer with the new contact.</returns>
+        /// <exception cref="ArgumentException">The contact belongs to another node.</exception>
+        public DHTPeer WithContact(DHTContact contact)
         {
-            if (Capabilities != other.Capabilities || Reachability != other.Reachability
-                || HasEndpointDependentMapping != other.HasEndpointDependentMapping
-                || !Equals(_externalAddress, other._externalAddress)
-                || _endpoints.Length != other._endpoints.Length || _relayHints.Length != other._relayHints.Length)
+            if (contact == null || contact.NodeId != NodeId)
+            {
+                throw new ArgumentException("The contact must belong to the same node.", nameof(contact));
+            }
+            return new DHTPeer(contact, _endpoints);
+        }
+
+        /// <summary>Gets a copy of this peer with one more observation merged into its endpoints.</summary>
+        /// <param name="observed">The newly observed endpoint.</param>
+        /// <returns>The peer with the merged endpoints, dropping the oldest address when more than four are known.</returns>
+        public DHTPeer WithEndpoint(DHTEndpoint observed)
+        {
+            return new DHTPeer(Contact, Merge(_endpoints, observed));
+        }
+
+        /// <summary>Merges one observation into an endpoint list: a known address combines ports, a new address is appended.</summary>
+        /// <param name="endpoints">The known endpoints.</param>
+        /// <param name="observed">The newly observed endpoint.</param>
+        /// <returns>A new list with the observation last, dropping the oldest address beyond <see cref="MaxEndpoints"/>.</returns>
+        /// <exception cref="ArgumentNullException">The list or endpoint is null.</exception>
+        public static DHTEndpoint[] Merge(IReadOnlyList<DHTEndpoint> endpoints, DHTEndpoint observed)
+        {
+            if (endpoints == null)
+            {
+                throw new ArgumentNullException(nameof(endpoints));
+            }
+            if (observed == null)
+            {
+                throw new ArgumentNullException(nameof(observed));
+            }
+            var result = new List<DHTEndpoint>(endpoints.Count + 1);
+            var merged = observed;
+            foreach (var endpoint in endpoints)
+            {
+                if (endpoint.NetworkAddress.Equals(observed.NetworkAddress))
+                {
+                    merged = endpoint.Merge(observed);
+                }
+                else
+                {
+                    result.Add(endpoint);
+                }
+            }
+            result.Add(merged);
+            if (result.Count > MaxEndpoints)
+            {
+                result.RemoveRange(0, result.Count - MaxEndpoints);
+            }
+            return result.ToArray();
+        }
+
+        /// <summary>Checks whether another peer lists the same endpoints in the same order.</summary>
+        /// <param name="other">The other peer.</param>
+        /// <returns>Whether the endpoints are equal.</returns>
+        public bool SameEndpoints(DHTPeer other)
+        {
+            if (other == null || other._endpoints.Length != _endpoints.Length)
             {
                 return false;
             }
             for (var index = 0; index < _endpoints.Length; index++)
             {
-                var left = _endpoints[index];
-                var right = other._endpoints[index];
-                if (!left.NetworkAddress.Equals(right.NetworkAddress) || left.TcpPort != right.TcpPort
-                    || left.UdpPort != right.UdpPort || left.Flags != right.Flags)
-                {
-                    return false;
-                }
-            }
-            for (var index = 0; index < _relayHints.Length; index++)
-            {
-                if (_relayHints[index].NodeId != other._relayHints[index].NodeId)
+                if (!_endpoints[index].Equals(other._endpoints[index]))
                 {
                     return false;
                 }
@@ -262,97 +179,75 @@ namespace MajDHTNetwork
             return true;
         }
 
-        /// <summary>Validates endpoint uniqueness, relay hints and the reachability rules.</summary>
-        /// <returns>Whether the advertisement is consistent.</returns>
-        private bool HasValidAdvertisement()
+        /// <summary>Checks whether one of the observed endpoints is a socket endpoint over one transport.</summary>
+        /// <param name="transport">The transport.</param>
+        /// <param name="endpoint">The socket endpoint.</param>
+        /// <returns>Whether the node was observed there.</returns>
+        public bool WasObservedAt(DHTTransport transport, IPEndPoint endpoint)
         {
-            var reachable = false;
-            var localOnly = true;
-            for (var index = 0; index < _endpoints.Length; index++)
+            foreach (var observed in _endpoints)
             {
-                reachable |= _endpoints[index].IsReachable;
-                localOnly &= (_endpoints[index].Flags & DHTEndpointFlags.Local) != 0;
-                for (var previous = 0; previous < index; previous++)
+                if (observed.NetworkAddress.Equals(endpoint.Address) && observed.Port(transport) == endpoint.Port)
                 {
-                    if (_endpoints[previous].NetworkAddress.Equals(_endpoints[index].NetworkAddress))
-                    {
-                        return false;
-                    }
-                }
-            }
-            for (var index = 0; index < _relayHints.Length; index++)
-            {
-                var hint = _relayHints[index];
-                if ((hint.Capabilities & DHTCapabilities.Relay) == 0 || hint.Reachability != DHTReachability.Public
-                    || hint.NodeId == NodeId || hint.ExpiresAt < ExpiresAt)
-                {
-                    return false;
-                }
-                for (var previous = 0; previous < index; previous++)
-                {
-                    if (_relayHints[previous].NodeId == hint.NodeId)
-                    {
-                        return false;
-                    }
-                }
-            }
-            switch (Reachability)
-            {
-                case DHTReachability.Public:
-                    return reachable;
-                case DHTReachability.Private:
-                    return _relayHints.Length != 0 && localOnly;
-                default:
                     return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>Writes the canonical peer encoding: the signed contact bytes followed by the observed endpoint list.</summary>
+        /// <param name="writer">The destination encoder.</param>
+        public void Write(Wire writer)
+        {
+            writer.Put(Contact.Encoded);
+            WriteEndpoints(writer);
+        }
+
+        /// <summary>Writes only the observed endpoint list: an integer count followed by that many endpoints.</summary>
+        /// <param name="writer">The destination encoder.</param>
+        public void WriteEndpoints(Wire writer)
+        {
+            writer.PutLong(_endpoints.Length);
+            foreach (var endpoint in _endpoints)
+            {
+                endpoint.Write(writer);
             }
         }
 
-        /// <summary>Writes one advertised endpoint in its canonical encoding: address text, TCP port, UDP port and flags.</summary>
-        /// <param name="writer">The payload encoder.</param>
-        /// <param name="endpoint">The endpoint.</param>
-        internal static void WriteEndpoint(Wire writer, DHTEndpoint endpoint)
+        /// <summary>Reads and verifies a canonical peer written by <see cref="Write"/>, reusing cached contact verifications.</summary>
+        /// <param name="reader">The source decoder.</param>
+        /// <returns>The peer; the reader of the whole body still validates the referrer's claims against its own policy.</returns>
+        /// <exception cref="InvalidDataException">The contact is malformed, expired or forged, or the endpoint list is invalid.</exception>
+        public static DHTPeer Read(Wire reader)
         {
-            writer.PutText(endpoint.NetworkAddress.ToString());
-            writer.PutLong(endpoint.TcpPort);
-            writer.PutLong(endpoint.UdpPort);
-            writer.PutByte((byte)endpoint.Flags);
+            return ReadEndpoints(DHTContact.Parse(reader.Bytes(DHTContact.MaxEncodedLength)), reader);
         }
 
-        /// <summary>Reads one canonical advertised endpoint written by <see cref="WriteEndpoint"/>.</summary>
-        /// <param name="reader">The payload decoder.</param>
-        /// <returns>The validated endpoint.</returns>
-        /// <exception cref="InvalidDataException">The endpoint is malformed.</exception>
-        internal static DHTEndpoint ReadEndpoint(Wire reader)
+        /// <summary>Reads an observed endpoint list written by <see cref="WriteEndpoints"/> and pairs it with a contact.</summary>
+        /// <param name="contact">The already verified contact.</param>
+        /// <param name="reader">The source decoder positioned at the endpoint count.</param>
+        /// <returns>The peer.</returns>
+        /// <exception cref="InvalidDataException">The count is out of range, an endpoint is malformed or addresses repeat.</exception>
+        public static DHTPeer ReadEndpoints(DHTContact contact, Wire reader)
         {
-            var address = ParseAddress(reader.Text(96));
-            var tcp = reader.Long();
-            var udp = reader.Long();
-            var flags = (DHTEndpointFlags)reader.Byte();
-            if (tcp < 0 || tcp > 65535 || udp < 0 || udp > 65535)
+            var count = reader.Long();
+            if (count < 0 || count > MaxEndpoints)
             {
-                throw new InvalidDataException("Invalid contact endpoint port.");
+                throw new InvalidDataException("Invalid observed endpoint count.");
+            }
+            var endpoints = new DHTEndpoint[count];
+            for (var index = 0; index < endpoints.Length; index++)
+            {
+                endpoints[index] = DHTEndpoint.Read(reader);
             }
             try
             {
-                return new DHTEndpoint(address, (int)tcp, (int)udp, flags);
+                return new DHTPeer(contact, endpoints);
             }
             catch (ArgumentException exception)
             {
-                throw new InvalidDataException("Invalid contact endpoint.", exception);
+                throw new InvalidDataException("Invalid observed endpoint list.", exception);
             }
-        }
-
-        /// <summary>Parses a canonical unicast address.</summary>
-        /// <param name="text">The canonical address text.</param>
-        /// <returns>The parsed address.</returns>
-        /// <exception cref="InvalidDataException">The address is not canonical unicast text.</exception>
-        private static IPAddress ParseAddress(string text)
-        {
-            if (!IPAddress.TryParse(text, out var address) || address.ToString() != text || !NetworkScope.IsUnicast(address))
-            {
-                throw new InvalidDataException("Invalid contact address.");
-            }
-            return address;
         }
     }
 }

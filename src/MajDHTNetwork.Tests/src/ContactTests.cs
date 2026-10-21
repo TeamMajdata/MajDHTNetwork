@@ -10,71 +10,122 @@ using Xunit;
 
 namespace MajDHTNetwork.Tests
 {
-    /// <summary>Checks the signed contact rules for endpoints, reachability, relay hints and Hello envelopes.</summary>
+    /// <summary>Checks the signed contact rules for reachability and hints, the observed-endpoint encoding and Hello envelopes.</summary>
     public sealed class ContactTests
     {
-        /// <summary>Round-trips a private contact whose lease is bounded by its relay hint.</summary>
+        /// <summary>Round-trips a private contact whose lease is bounded by its hinted Forwarder, kept at the owner's observed endpoints.</summary>
         [Fact]
-        public void PrivateContactsCarryLocalEndpointsAndBoundedRelayHints()
+        public void PrivateContactsCarryHintsWithObservedEndpointsAndBoundedLeases()
         {
-            var relay = PublicRelay(IPAddress.Parse("203.0.113.10"));
+            var forwarder = PublicAssistant(IPAddress.Parse("203.0.113.10"), DHTCapabilities.Forwarder, TimeSpan.FromHours(2));
             var identity = new DHTIdentity();
-            var local = new DHTEndpoint(IPAddress.Parse("192.168.1.20"), 42000, 42001, DHTEndpointFlags.Local);
-            var contact = DHTPeer.Create(identity, new[] { local }, DHTCapabilities.Provide, DHTReachability.Private, true,
-                IPAddress.Parse("198.51.100.7"), new[] { relay }, TimeSpan.FromDays(1));
-            var parsed = new DHTPeer(contact.Encoded.ToArray());
+            var contact = DHTContact.Create(identity, DHTCapabilities.Provide, DHTReachability.Private, true, new[] { forwarder }, TimeSpan.FromDays(1));
+            var parsed = new DHTContact(contact.Encoded.ToArray());
             Assert.Equal(DHTReachability.Private, parsed.Reachability);
             Assert.True(parsed.HasEndpointDependentMapping);
-            Assert.Equal(IPAddress.Parse("198.51.100.7"), parsed.ExternalAddress);
-            Assert.Equal(relay.NodeId, Assert.Single(parsed.RelayHints).NodeId);
-            Assert.Equal(DHTEndpointFlags.Local, Assert.Single(parsed.Endpoints).Flags);
-            Assert.True(parsed.ExpiresAt <= relay.ExpiresAt, "A contact must not outlive its relay hints.");
-            Assert.True(DHTPeer.Create(identity, IPAddress.Loopback, 1, 0, DHTCapabilities.Download).Sequence > parsed.Sequence,
+            var hint = Assert.Single(parsed.Hints);
+            Assert.Equal(forwarder.NodeId, hint.NodeId);
+            Assert.True(hint.SameEndpoints(forwarder), "A hint must carry the endpoints the owner observed for the assistant.");
+            Assert.True(parsed.ExpiresAt <= forwarder.ExpiresAt, "A contact must not outlive its hints.");
+            Assert.True(contact.SameAdvertisement(parsed), "Parsing must preserve the advertisement.");
+            Assert.True(DHTContact.Create(identity, DHTCapabilities.Download).Sequence > parsed.Sequence,
                 "Each newly signed contact must supersede earlier contacts.");
         }
 
-        /// <summary>Rejects advertisements that contradict their reachability state.</summary>
+        /// <summary>Rejects reachability states and hint lists that contradict the contact rules.</summary>
         [Fact]
-        public void ReachabilityStatesRequireMatchingEvidence()
+        public void ReachabilityStatesRequireMatchingHints()
         {
             var identity = new DHTIdentity();
-            var relay = PublicRelay(IPAddress.Parse("203.0.113.10"));
-            var unverified = new DHTEndpoint(IPAddress.Parse("198.51.100.7"), 42000, 0, DHTEndpointFlags.None);
-            var noHints = Array.Empty<DHTPeer>();
-            Assert.ThrowsAny<InvalidDataException>(() => DHTPeer.Create(identity, Array.Empty<DHTEndpoint>(), DHTCapabilities.Download,
-                DHTReachability.Private, false, null, noHints, TimeSpan.FromHours(1)));
-            Assert.ThrowsAny<InvalidDataException>(() => DHTPeer.Create(identity, new[] { unverified }, DHTCapabilities.Download,
-                DHTReachability.Public, false, null, noHints, TimeSpan.FromHours(1)));
-            Assert.ThrowsAny<InvalidDataException>(() => DHTPeer.Create(identity, new[] { unverified }, DHTCapabilities.Download,
-                DHTReachability.Private, false, null, new[] { relay }, TimeSpan.FromHours(1)));
-            Assert.ThrowsAny<InvalidDataException>(() => DHTPeer.Create(identity, new[] { unverified, unverified }, DHTCapabilities.Download,
-                DHTReachability.Unknown, false, null, noHints, TimeSpan.FromHours(1)));
-            Assert.ThrowsAny<ArgumentException>(() => new DHTEndpoint(IPAddress.Any, 1, 0, DHTEndpointFlags.None));
-            Assert.ThrowsAny<ArgumentException>(() => new DHTEndpoint(IPAddress.Loopback, 1, 0, DHTEndpointFlags.Verified | DHTEndpointFlags.Local));
-            var clientOnly = DHTPeer.Create(identity, Array.Empty<DHTEndpoint>(), DHTCapabilities.Download, DHTReachability.Unknown, false, null,
-                noHints, TimeSpan.FromHours(1));
-            Assert.Empty(new DHTPeer(clientOnly.Encoded.ToArray()).Endpoints);
+            var forwarder = PublicAssistant(IPAddress.Parse("203.0.113.10"), DHTCapabilities.Forwarder, TimeSpan.FromHours(2));
+            var traversal = PublicAssistant(IPAddress.Parse("203.0.113.11"), DHTCapabilities.Traversal, TimeSpan.FromHours(2));
+            var none = Array.Empty<DHTPeer>();
+            // A private node is reached through a Forwarder; a Traversal node alone cannot carry its traffic.
+            Assert.ThrowsAny<InvalidDataException>(() => DHTContact.Create(identity, DHTCapabilities.Download, DHTReachability.Private, false, none,
+                TimeSpan.FromHours(1)));
+            Assert.ThrowsAny<InvalidDataException>(() => DHTContact.Create(identity, DHTCapabilities.Download, DHTReachability.Private, false,
+                new[] { traversal }, TimeSpan.FromHours(1)));
+            var mixed = DHTContact.Create(identity, DHTCapabilities.Download, DHTReachability.Private, false, new[] { traversal, forwarder },
+                TimeSpan.FromHours(1));
+            Assert.Equal(2, mixed.Hints.Count);
+            Assert.Empty(DHTContact.Create(identity, DHTCapabilities.Download, DHTReachability.Unknown, false, none, TimeSpan.FromHours(1)).Hints);
+            Assert.Single(DHTContact.Create(identity, DHTCapabilities.Download, DHTReachability.Unknown, false, new[] { traversal }, TimeSpan.FromHours(1)).Hints);
+            Assert.Empty(DHTContact.Create(identity, DHTCapabilities.Download, DHTReachability.Public, false, none, TimeSpan.FromHours(1)).Hints);
+            Assert.ThrowsAny<InvalidDataException>(() => DHTContact.Create(identity, DHTCapabilities.Download, (DHTReachability)3, false, none,
+                TimeSpan.FromHours(1)));
+            Assert.ThrowsAny<InvalidDataException>(() => DHTContact.Create(identity, DHTCapabilities.Download, DHTReachability.Unknown, false,
+                new[] { forwarder, forwarder }, TimeSpan.FromHours(1)));
+            var four = new[]
+            {
+                forwarder, traversal, PublicAssistant(IPAddress.Parse("203.0.113.12"), DHTCapabilities.Forwarder, TimeSpan.FromHours(2)),
+                PublicAssistant(IPAddress.Parse("203.0.113.13"), DHTCapabilities.Forwarder, TimeSpan.FromHours(2))
+            };
+            Assert.ThrowsAny<InvalidDataException>(() => DHTContact.Create(identity, DHTCapabilities.Download, DHTReachability.Unknown, false, four,
+                TimeSpan.FromHours(1)));
         }
 
-        /// <summary>Accepts only public relays without nested hints as relay hints.</summary>
+        /// <summary>Accepts only public Traversal or Forwarder nodes with an observed endpoint and without nested hints as hints.</summary>
         [Fact]
-        public void RelayHintsMustBePublicRelaysWithoutNestedHints()
+        public void HintsMustBePublicAssistantsWithEndpointsAndWithoutNestedHints()
         {
             var identity = new DHTIdentity();
-            var unknownRelay = DHTPeer.Create(new DHTIdentity(), IPAddress.Parse("203.0.113.11"), 1, 0, DHTCapabilities.Relay);
-            Assert.ThrowsAny<InvalidDataException>(() => DHTPeer.Create(identity, Array.Empty<DHTEndpoint>(), DHTCapabilities.Download,
-                DHTReachability.Private, false, null, new[] { unknownRelay }, TimeSpan.FromHours(1)));
-            var publicDownloader = DHTPeer.Create(new DHTIdentity(),
-                new[] { new DHTEndpoint(IPAddress.Parse("203.0.113.12"), 1, 0, DHTEndpointFlags.Configured) }, DHTCapabilities.Download,
-                DHTReachability.Public, false, null, Array.Empty<DHTPeer>(), TimeSpan.FromHours(1));
-            Assert.ThrowsAny<InvalidDataException>(() => DHTPeer.Create(identity, Array.Empty<DHTEndpoint>(), DHTCapabilities.Download,
-                DHTReachability.Private, false, null, new[] { publicDownloader }, TimeSpan.FromHours(1)));
-            var inner = PublicRelay(IPAddress.Parse("203.0.113.13"));
-            var nested = DHTPeer.Create(new DHTIdentity(),
-                new[] { new DHTEndpoint(IPAddress.Parse("203.0.113.14"), 1, 0, DHTEndpointFlags.Configured) }, DHTCapabilities.Relay,
-                DHTReachability.Public, false, null, new[] { inner }, TimeSpan.FromHours(1));
-            Assert.ThrowsAny<InvalidDataException>(() => DHTPeer.Create(identity, Array.Empty<DHTEndpoint>(), DHTCapabilities.Download,
-                DHTReachability.Private, false, null, new[] { nested }, TimeSpan.FromHours(1)));
+            var none = Array.Empty<DHTPeer>();
+            var unknownForwarder = DHTPeer.Create(new DHTIdentity(), IPAddress.Parse("203.0.113.11"), 1, 0, DHTCapabilities.Forwarder);
+            Assert.ThrowsAny<InvalidDataException>(() => DHTContact.Create(identity, DHTCapabilities.Download, DHTReachability.Private, false,
+                new[] { unknownForwarder }, TimeSpan.FromHours(1)));
+            var publicDownloader = new DHTPeer(DHTContact.Create(new DHTIdentity(), DHTCapabilities.Download, DHTReachability.Public, false, none,
+                TimeSpan.FromHours(1)), new[] { new DHTEndpoint(IPAddress.Parse("203.0.113.12"), 1, 0) });
+            Assert.ThrowsAny<InvalidDataException>(() => DHTContact.Create(identity, DHTCapabilities.Download, DHTReachability.Private, false,
+                new[] { publicDownloader }, TimeSpan.FromHours(1)));
+            var withoutEndpoints = new DHTPeer(DHTContact.Create(new DHTIdentity(), DHTCapabilities.Forwarder, DHTReachability.Public, false, none,
+                TimeSpan.FromHours(1)), Array.Empty<DHTEndpoint>());
+            Assert.ThrowsAny<InvalidDataException>(() => DHTContact.Create(identity, DHTCapabilities.Download, DHTReachability.Private, false,
+                new[] { withoutEndpoints }, TimeSpan.FromHours(1)));
+            var inner = PublicAssistant(IPAddress.Parse("203.0.113.13"), DHTCapabilities.Forwarder, TimeSpan.FromHours(1));
+            var nested = new DHTPeer(DHTContact.Create(new DHTIdentity(), DHTCapabilities.Forwarder, DHTReachability.Public, false, new[] { inner },
+                TimeSpan.FromHours(1)), new[] { new DHTEndpoint(IPAddress.Parse("203.0.113.14"), 1, 0) });
+            Assert.ThrowsAny<InvalidDataException>(() => DHTContact.Create(identity, DHTCapabilities.Download, DHTReachability.Private, false,
+                new[] { nested }, TimeSpan.FromHours(1)));
+            // A hint that expires before the owner shortens the owner's lease instead of failing.
+            var shortLived = PublicAssistant(IPAddress.Parse("203.0.113.15"), DHTCapabilities.Forwarder, TimeSpan.FromMinutes(10));
+            var owner = DHTContact.Create(identity, DHTCapabilities.Download, DHTReachability.Private, false, new[] { shortLived }, TimeSpan.FromHours(1));
+            Assert.True(owner.ExpiresAt <= shortLived.ExpiresAt, "The owner's lease must end with its hint.");
+        }
+
+        /// <summary>Merges observations per address, keeps at most four addresses and encodes a peer canonically.</summary>
+        [Fact]
+        public void ObservedEndpointsMergeAndRoundTrip()
+        {
+            var address = IPAddress.Parse("198.51.100.7");
+            var tcp = DHTEndpoint.Observed(DHTTransport.Tcp, new IPEndPoint(address, 4000));
+            var udp = DHTEndpoint.Observed(DHTTransport.Udp, new IPEndPoint(address, 4001));
+            var merged = tcp.Merge(udp);
+            Assert.Equal(4000, merged.TcpPort);
+            Assert.Equal(4001, merged.UdpPort);
+            Assert.ThrowsAny<ArgumentException>(() => tcp.Merge(new DHTEndpoint(IPAddress.Parse("198.51.100.8"), 1, 0)));
+            Assert.ThrowsAny<ArgumentException>(() => new DHTEndpoint(IPAddress.Any, 1, 0));
+            Assert.ThrowsAny<ArgumentException>(() => new DHTEndpoint(IPAddress.Loopback, 0, 0));
+            var contact = DHTContact.Create(new DHTIdentity(), DHTCapabilities.Download);
+            Assert.ThrowsAny<ArgumentException>(() => new DHTPeer(contact, new[] { tcp, udp }));
+            var peer = new DHTPeer(contact, new[] { tcp }).WithEndpoint(udp);
+            Assert.Equal(merged, Assert.Single(peer.Endpoints));
+            for (var index = 1; index <= 4; index++)
+            {
+                peer = peer.WithEndpoint(new DHTEndpoint(IPAddress.Parse("203.0.113." + index), 1000, 0));
+            }
+            // The oldest address gives way once more than four addresses were observed.
+            Assert.Equal(4, peer.Endpoints.Count);
+            Assert.DoesNotContain(peer.Endpoints, endpoint => endpoint.Address.Equals(address));
+            Assert.Equal(IPAddress.Parse("203.0.113.4"), peer.Endpoints[3].Address);
+            Assert.True(peer.WasObservedAt(DHTTransport.Tcp, new IPEndPoint(IPAddress.Parse("203.0.113.4"), 1000)));
+            Assert.False(peer.WasObservedAt(DHTTransport.Udp, new IPEndPoint(IPAddress.Parse("203.0.113.4"), 1000)));
+            using var writer = new Wire();
+            peer.Write(writer);
+            using var reader = new Wire(writer.WrittenMemory);
+            var read = DHTPeer.Read(reader);
+            reader.End();
+            Assert.Equal(peer.NodeId, read.NodeId);
+            Assert.True(read.SameEndpoints(peer), "A peer must round trip with its observed endpoints in order.");
         }
 
         /// <summary>Authenticates a signed plaintext Hello request and refuses to forward it.</summary>
@@ -96,7 +147,7 @@ namespace MajDHTNetwork.Tests
                 .SealHello(identity));
         }
 
-        /// <summary>Validates dual-stack listener, advertised-address and bootstrap-endpoint options.</summary>
+        /// <summary>Validates dual-stack listener and bootstrap-endpoint options.</summary>
         [Fact]
         public void AddressOptionsAreValidatedPerAddressFamily()
         {
@@ -109,21 +160,19 @@ namespace MajDHTNetwork.Tests
             Assert.ThrowsAny<ArgumentException>(() => new DHTNodeOptions { ListenAddresses = new List<IPAddress>() }.Snapshot());
             Assert.ThrowsAny<ArgumentException>(() => new DHTNodeOptions
             {
-                AdvertisedAddresses = new List<IPAddress> { IPAddress.IPv6Loopback }
-            }.Snapshot());
-            Assert.ThrowsAny<ArgumentException>(() => new DHTNodeOptions
-            {
                 BootstrapEndpoints = new List<IPEndPoint> { new IPEndPoint(IPAddress.Loopback, 0) }
             }.Snapshot());
         }
 
-        /// <summary>Creates a public relay contact with one configured endpoint.</summary>
-        /// <param name="address">The relay address.</param>
-        /// <returns>The relay contact.</returns>
-        private static DHTPeer PublicRelay(IPAddress address)
+        /// <summary>Creates a public assistant observed at one address on both transports.</summary>
+        /// <param name="address">The observed address.</param>
+        /// <param name="capabilities">The assisting capabilities.</param>
+        /// <param name="lifetime">The contact lease.</param>
+        /// <returns>The assistant.</returns>
+        private static DHTPeer PublicAssistant(IPAddress address, DHTCapabilities capabilities, TimeSpan lifetime)
         {
-            return DHTPeer.Create(new DHTIdentity(), new[] { new DHTEndpoint(address, 42000, 42000, DHTEndpointFlags.Configured) },
-                DHTCapabilities.Relay, DHTReachability.Public, false, null, Array.Empty<DHTPeer>(), TimeSpan.FromHours(2));
+            return new DHTPeer(DHTContact.Create(new DHTIdentity(), capabilities, DHTReachability.Public, false, Array.Empty<DHTPeer>(), lifetime),
+                new[] { new DHTEndpoint(address, 42000, 42000) });
         }
     }
 }

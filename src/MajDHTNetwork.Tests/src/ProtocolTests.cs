@@ -33,16 +33,17 @@ namespace MajDHTNetwork.Tests
         {
             var identity = new DHTIdentity();
             var sender = DHTPeer.Create(identity, IPAddress.Loopback, 22001, 22002, DHTCapabilities.Download);
-            var parsed = new DHTPeer(sender.Encoded.ToArray());
+            var parsed = new DHTContact(sender.Contact.Encoded.ToArray());
             Assert.True(parsed.NodeId == identity.NodeId && parsed.Sequence == sender.Sequence, "A signed contact must round trip.");
-            Assert.Equal(22001, parsed.Endpoints[0].TcpPort);
-            Assert.Equal(22002, parsed.Endpoints[0].UdpPort);
-            var contactBytes = sender.Encoded.ToArray();
+            // The endpoints belong to the observer's peer, never to the signed contact.
+            Assert.Equal(22001, sender.Endpoints[0].TcpPort);
+            Assert.Equal(22002, sender.Endpoints[0].UdpPort);
+            var contactBytes = sender.Contact.Encoded.ToArray();
             contactBytes[contactBytes.Length - 1] ^= 1;
-            Assert.ThrowsAny<InvalidDataException>(() => new DHTPeer(contactBytes));
+            Assert.ThrowsAny<InvalidDataException>(() => new DHTContact(contactBytes));
         }
 
-        /// <summary>Rejects substituted recipients, forged senders, modified ciphertext and nested relays.</summary>
+        /// <summary>Rejects substituted recipients, forged senders, modified ciphertext and nested forwards.</summary>
         [Fact]
         public void EncryptedEnvelopesAuthenticateSenderRecipientAndPayload()
         {
@@ -68,7 +69,7 @@ namespace MajDHTNetwork.Tests
             Assert.ThrowsAny<CryptographicException>(() => Packet.Open(remote, forged));
             Packet.CheckForward(encrypted, recipient.NodeId);
             Assert.ThrowsAny<InvalidDataException>(() => Packet.CheckForward(encrypted, sender.NodeId));
-            var nested = new Packet(sender, Crypto.Random(16), (byte)Operation.Relay, Array.Empty<byte>()).Seal(identity, recipient);
+            var nested = new Packet(sender, Crypto.Random(16), (byte)Operation.Forward, Array.Empty<byte>()).Seal(identity, recipient);
             Assert.ThrowsAny<InvalidDataException>(() => Packet.CheckForward(nested, recipient.NodeId));
         }
 

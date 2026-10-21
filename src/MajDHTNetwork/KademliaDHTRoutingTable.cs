@@ -31,8 +31,8 @@ namespace MajDHTNetwork
 
         /// <summary>Creates an unbound table.</summary>
         /// <param name="maxPerNetworkInBucket">
-        /// The maximum contacts whose verified addresses share one IPv4 /24 or IPv6 /32 in a bucket, from 1; loopback, private and
-        /// link-local addresses are not limited.
+        /// The maximum contacts whose admission addresses share one IPv4 /24 or IPv6 /32 in a bucket, from 1; loopback, private
+        /// and link-local addresses are not limited.
         /// </param>
         /// <param name="maxPerNetwork">The maximum contacts from one such network in the whole table, from 1.</param>
         /// <exception cref="ArgumentOutOfRangeException">A limit is below one.</exception>
@@ -95,16 +95,16 @@ namespace MajDHTNetwork
         }
 
         /// <summary>
-        /// Refreshes a known contact, or admits a new one with a verified address when its bucket has room and its network is
-        /// below the per-bucket and per-table limits; a full live bucket is never displaced.
+        /// Refreshes a known contact and merges a newly observed endpoint, or admits a new contact at an observed endpoint when
+        /// its bucket has room and its network is below the per-bucket and per-table limits; a full live bucket is never displaced.
         /// </summary>
-        /// <param name="peer">The authenticated contact.</param>
-        /// <param name="verifiedAddress">The address that proved an advertised endpoint, or null to refresh only.</param>
+        /// <param name="contact">The authenticated contact.</param>
+        /// <param name="observed">The endpoint this node exchanged an authenticated packet with, or null to refresh only.</param>
         /// <exception cref="InvalidOperationException">The table has not been initialized.</exception>
-        public void Observe(DHTPeer peer, IPAddress? verifiedAddress)
+        public void Observe(DHTContact contact, DHTEndpoint? observed)
         {
-            var index = Bucket(peer.NodeHash);
-            if (index < 0 || peer.IsExpired)
+            var index = Bucket(contact.NodeHash);
+            if (index < 0 || contact.IsExpired)
             {
                 return;
             }
@@ -114,13 +114,13 @@ namespace MajDHTNetwork
                 Entry? known = null;
                 for (var i = bucket.Count - 1; i >= 0; i--)
                 {
-                    if (bucket[i].Peer.NodeId == peer.NodeId)
+                    if (bucket[i].Contact.NodeId == contact.NodeId)
                     {
                         known = bucket[i];
                         bucket.RemoveAt(i);
                         _count--;
                     }
-                    else if (bucket[i].Peer.IsExpired)
+                    else if (bucket[i].Contact.IsExpired)
                     {
                         bucket.RemoveAt(i);
                         _count--;
@@ -128,24 +128,25 @@ namespace MajDHTNetwork
                 }
                 if (known != null)
                 {
-                    // Keep the newest contact and the last verified address, and move the entry to the most recent position.
-                    var newest = known.Peer.Sequence > peer.Sequence ? known.Peer : peer;
-                    bucket.Add(new Entry(newest, verifiedAddress ?? known.Address));
+                    // Keep the newest contact, merge the observation and move the entry to the most recent position.
+                    var newest = known.Contact.Sequence > contact.Sequence ? known.Contact : contact;
+                    var endpoints = observed == null ? known.Endpoints : DHTPeer.Merge(known.Endpoints, observed);
+                    bucket.Add(new Entry(newest, endpoints, known.Address));
                     _count++;
                     return;
                 }
-                if (verifiedAddress == null || bucket.Count >= _capacity || !HasNetworkRoomLocked(bucket, verifiedAddress))
+                if (observed == null || bucket.Count >= _capacity || !HasNetworkRoomLocked(bucket, observed.NetworkAddress))
                 {
                     return;
                 }
-                bucket.Add(new Entry(peer, verifiedAddress));
+                bucket.Add(new Entry(contact, new[] { observed }, observed.NetworkAddress));
                 _count++;
             }
         }
 
-        /// <summary>Checks the per-bucket and per-table network limits for a new verified address.</summary>
+        /// <summary>Checks the per-bucket and per-table network limits for a new admission address.</summary>
         /// <param name="bucket">The target bucket.</param>
-        /// <param name="address">The verified address.</param>
+        /// <param name="address">The admission address.</param>
         /// <returns>Whether the network may add another contact.</returns>
         /// <remarks>The caller must hold the table lock.</remarks>
         private bool HasNetworkRoomLocked(List<Entry> bucket, IPAddress address)
@@ -169,7 +170,7 @@ namespace MajDHTNetwork
             return total < _maxPerNetwork;
         }
 
-        /// <summary>Counts the entries of a bucket whose verified address shares a network with an address.</summary>
+        /// <summary>Counts the entries of a bucket whose admission address shares a network with an address.</summary>
         /// <param name="bucket">The bucket.</param>
         /// <param name="address">The address.</param>
         /// <returns>The count.</returns>
@@ -178,7 +179,7 @@ namespace MajDHTNetwork
             var count = 0;
             foreach (var entry in bucket)
             {
-                if (entry.Address != null && NetworkScope.SameNetwork(entry.Address, address))
+                if (NetworkScope.SameNetwork(entry.Address, address))
                 {
                     count++;
                 }
@@ -207,7 +208,7 @@ namespace MajDHTNetwork
                 }
                 for (var i = bucket.Count - 1; i >= 0; i--)
                 {
-                    if (bucket[i].Peer.NodeId == nodeId)
+                    if (bucket[i].Contact.NodeId == nodeId)
                     {
                         bucket.RemoveAt(i);
                         _count--;
@@ -240,7 +241,7 @@ namespace MajDHTNetwork
                     }
                     for (var i = bucket.Count - 1; i >= 0; i--)
                     {
-                        if (bucket[i].Peer.IsExpired)
+                        if (bucket[i].Contact.IsExpired)
                         {
                             bucket.RemoveAt(i);
                             _count--;
@@ -268,20 +269,25 @@ namespace MajDHTNetwork
             }
         }
 
-        /// <summary>Associates a contact with the address at which it proved an advertised endpoint.</summary>
+        /// <summary>Associates a contact with the endpoints this node observed for it and the address that admitted it.</summary>
         private sealed class Entry
         {
-            /// <summary>Gets the newest contact.</summary>
+            /// <summary>Gets the contact at its observed endpoints.</summary>
             internal DHTPeer Peer { get; }
-            /// <summary>Gets the verified address, or null when unknown.</summary>
-            internal IPAddress? Address { get; }
+            /// <summary>Gets the newest contact.</summary>
+            internal DHTContact Contact => Peer.Contact;
+            /// <summary>Gets the observed endpoints.</summary>
+            internal IReadOnlyList<DHTEndpoint> Endpoints => Peer.Endpoints;
+            /// <summary>Gets the address of the first observation, which counts towards the network limits.</summary>
+            internal IPAddress Address { get; }
 
             /// <summary>Creates an entry.</summary>
-            /// <param name="peer">The contact.</param>
-            /// <param name="address">The verified address.</param>
-            internal Entry(DHTPeer peer, IPAddress? address)
+            /// <param name="contact">The contact.</param>
+            /// <param name="endpoints">The observed endpoints.</param>
+            /// <param name="address">The admission address.</param>
+            internal Entry(DHTContact contact, IReadOnlyList<DHTEndpoint> endpoints, IPAddress address)
             {
-                Peer = peer;
+                Peer = new DHTPeer(contact, endpoints);
                 Address = address;
             }
         }

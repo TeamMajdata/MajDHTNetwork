@@ -308,7 +308,7 @@ namespace MajDHTNetwork.Tests
         public void PacketConstructorRejectsMissingSenders()
         {
             var exception = Assert.Throws<ArgumentNullException>(() =>
-                new Packet(null!, new byte[16], (byte)Operation.Ping, ReadOnlyMemory<byte>.Empty));
+                new Packet((DHTContact)null!, new byte[16], (byte)Operation.Ping, ReadOnlyMemory<byte>.Empty));
 
             Assert.Equal("sender", exception.ParamName);
         }
@@ -340,7 +340,7 @@ namespace MajDHTNetwork.Tests
             var copy = original;
             original = default;
 
-            Assert.Same(sender, copy.Sender);
+            Assert.Same(sender.Contact, copy.Sender);
             Assert.Equal((byte)Operation.Find, copy.Kind);
             Assert.True(MemoryMarshal.TryGetArray(copy.RequestId, out var requestView));
             Assert.Same(requestBytes, requestView.Array);
@@ -419,7 +419,7 @@ namespace MajDHTNetwork.Tests
             var selected = optional ?? fallback;
             var expected = hasAuthenticatedPacket ? authenticated : fallback;
 
-            Assert.Same(sender, selected.Sender);
+            Assert.Same(sender.Contact, selected.Sender);
             Assert.Equal(expected.Kind, selected.Kind);
             Assert.Equal(expected.RequestId, selected.RequestId);
             Assert.Equal(expected.Body, selected.Body);
@@ -468,7 +468,7 @@ namespace MajDHTNetwork.Tests
 
             _output.WriteLine("Packet construction and copying: " + allocated + " bytes for 10000 iterations.");
             var retained = packets[9999 % packets.Length];
-            Assert.Same(sender, retained.Sender);
+            Assert.Same(sender.Contact, retained.Sender);
             Assert.Equal((ReadOnlyMemory<byte>)requestId, retained.RequestId);
             Assert.Equal((ReadOnlyMemory<byte>)body, retained.Body);
             Assert.Equal(0L, allocated);

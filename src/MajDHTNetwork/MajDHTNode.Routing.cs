@@ -13,8 +13,8 @@ namespace MajDHTNetwork
     {
         /// <summary>The maximum direct routes attempted for one request.</summary>
         private const int MaxDirectRoutes = 16;
-        /// <summary>The maximum relay routes attempted for one request.</summary>
-        private const int MaxRelayRoutes = 32;
+        /// <summary>The maximum assisted routes attempted for one request.</summary>
+        private const int MaxAssistedRoutes = 32;
         /// <summary>The maximum inbound senders verified concurrently.</summary>
         private const int MaxPendingVerifications = 16;
         /// <summary>The maximum inbound senders verified per source network and quota window.</summary>
@@ -25,17 +25,17 @@ namespace MajDHTNetwork
         private readonly List<Task> _verificationWork = new List<Task>();
 
         /// <summary>Checks whether a contact proves the identity work this node requires.</summary>
-        /// <param name="peer">The contact.</param>
+        /// <param name="contact">The contact.</param>
         /// <returns>Whether the contact's proof of work reaches <see cref="DHTNodeOptions.IdentityWorkBits"/>.</returns>
-        private bool HasRequiredWork(DHTPeer peer)
+        private bool HasRequiredWork(DHTContact contact)
         {
-            return _options.IdentityWorkBits == 0 || peer.IdentityWork >= _options.IdentityWorkBits;
+            return _options.IdentityWorkBits == 0 || contact.IdentityWork >= _options.IdentityWorkBits;
         }
 
         /// <summary>Queries the routing table and discards entries that must never be used as lookup hops.</summary>
         /// <param name="routingId">The lowercase SHA-256 target identifier.</param>
-        /// <param name="count">The maximum number of contacts.</param>
-        /// <returns>Distinct live non-private remote contacts in the table's order.</returns>
+        /// <param name="count">The maximum number of peers.</param>
+        /// <returns>Distinct live non-private remote peers in the table's order, each at the endpoints observed for it.</returns>
         private List<DHTPeer> RoutedPeers(string routingId, int count)
         {
             var result = new List<DHTPeer>();
@@ -56,63 +56,58 @@ namespace MajDHTNetwork
             return result;
         }
 
-        /// <summary>Offers an authenticated contact to the routing table unless it can only be reached through relays.</summary>
-        /// <param name="peer">The authenticated contact.</param>
-        /// <param name="verifiedAddress">The advertised address the exchange proved, or null to refresh a known contact only.</param>
+        /// <summary>Offers an authenticated contact to the routing table unless it can only be reached through forwarders.</summary>
+        /// <param name="contact">The authenticated contact.</param>
+        /// <param name="observed">
+        /// The endpoint this node exchanged an authenticated packet with, or null to refresh a known contact only, such as after a
+        /// response over a punched route, a hosted registration or a Forwarder.
+        /// </param>
         /// <remarks>
         /// Private nodes participate as clients: they are never returned as lookup hops, and a node that becomes private
         /// is removed together with its earlier contact.
         /// </remarks>
-        private void ObservePeer(DHTPeer peer, IPAddress? verifiedAddress)
+        private void ObservePeer(DHTContact contact, DHTEndpoint? observed)
         {
-            if (peer.Reachability == DHTReachability.Private)
+            if (contact.Reachability == DHTReachability.Private)
             {
-                _routing.Remove(peer.NodeId);
+                _routing.Remove(contact.NodeId);
             }
             else
             {
-                _routing.Observe(peer, verifiedAddress);
+                _routing.Observe(contact, observed);
             }
         }
 
         /// <summary>
-        /// Handles the sender of an inbound request: it is admitted at once when the request came from one of its advertised
-        /// endpoints, and otherwise only refreshed and queued for an outbound verification.
+        /// Handles the sender of an inbound request: a known contact is refreshed, and an unknown one is queued for a bounded
+        /// verification at its observed source before it can occupy the routing table.
         /// </summary>
         /// <param name="sender">The authenticated sender.</param>
         /// <param name="transport">The receiving transport.</param>
         /// <param name="source">The observed source endpoint.</param>
         /// <remarks>
-        /// Nodes send from their listening ports, so an honest directly reachable node arrives from an advertised endpoint.
-        /// Anything else, including a contact advertising someone else's address, must answer at an advertised endpoint
-        /// before it can occupy the routing table.
+        /// Nodes send from their listening ports, so an honest directly reachable node answers a Ping at the endpoint its
+        /// request came from. A sender with unknown reachability that holds a traversal registration or forwarding session with
+        /// this node asked for NAT assistance, so its source stays unverified until a dial-back makes its contact public.
         /// </remarks>
-        private void AdmitInbound(DHTPeer sender, DHTTransport transport, IPEndPoint source)
+        private void AdmitInbound(DHTContact sender, DHTTransport transport, IPEndPoint source)
         {
             if (sender.Reachability == DHTReachability.Private)
             {
                 _routing.Remove(sender.NodeId);
                 return;
             }
-            foreach (var endpoint in sender.Endpoints)
-            {
-                if (endpoint.NetworkAddress.Equals(source.Address) && endpoint.Port(transport) == source.Port)
-                {
-                    _routing.Observe(sender, source.Address);
-                    return;
-                }
-            }
             _routing.Observe(sender, null);
-            if (sender.Endpoints.Count != 0)
+            if (sender.Reachability == DHTReachability.Unknown && HoldsHostedSession(sender.NodeId))
             {
-                ScheduleVerification(sender, source.Address);
+                return;
             }
+            ScheduleVerification(DHTPeer.Observed(sender, transport, source));
         }
 
-        /// <summary>Starts a bounded, rate-limited verification of an inbound sender's advertised endpoints.</summary>
-        /// <param name="candidate">The candidate contact.</param>
-        /// <param name="source">The observed source address, used for per-network rate limits.</param>
-        private void ScheduleVerification(DHTPeer candidate, IPAddress source)
+        /// <summary>Starts a bounded, rate-limited verification of an inbound sender at its observed source endpoint.</summary>
+        /// <param name="candidate">The candidate at its observed source.</param>
+        private void ScheduleVerification(DHTPeer candidate)
         {
             foreach (var routed in _routing.Closest(candidate.NodeId, 1) ?? Array.Empty<DHTPeer>())
             {
@@ -121,6 +116,7 @@ namespace MajDHTNetwork
                     return;
                 }
             }
+            var source = candidate.Endpoints[0].NetworkAddress;
             lock (_gate)
             {
                 if (!_started || _stopped || _lifetime.IsCancellationRequested || _verifying.Count >= MaxPendingVerifications
@@ -135,16 +131,23 @@ namespace MajDHTNetwork
             }
         }
 
-        /// <summary>Pings a candidate directly; an answer from an advertised endpoint admits it through <see cref="ObservePeer"/>.</summary>
-        /// <param name="candidate">The candidate contact.</param>
+        /// <summary>Pings a candidate at its observed source; an authenticated answer admits it there through <see cref="ObservePeer"/>.</summary>
+        /// <param name="candidate">The candidate at its observed source.</param>
         /// <returns>Completion after the verification attempt.</returns>
         private async Task VerifyCandidateAsync(DHTPeer candidate)
         {
             await Task.Yield();
             try
             {
-                using var pong = await RequestAsync(candidate, Operation.Ping, ReadOnlyMemory<byte>.Empty, _lifetime.Token, allowRelay: false)
-                    .ConfigureAwait(false);
+                var observed = candidate.Endpoints[0];
+                var transport = observed.TcpPort != 0 ? DHTTransport.Tcp : DHTTransport.Udp;
+                var request = new Packet(LocalContact, Crypto.Random(16), (byte)Operation.Ping, ReadOnlyMemory<byte>.Empty);
+                // The exchange is pinned to the observed source, so a hosted registration or punched route cannot stand in for it.
+                var encoded = await ExchangeCountedAsync(candidate, transport, observed.ToIPEndPoint(transport)!, request.Seal(_identity, candidate.Contact),
+                    _lifetime.Token).ConfigureAwait(false);
+                using var response = AuthenticateResponse(encoded, candidate.Contact, request);
+                ResponseStatus.ReadResult(response.Packet.Body);
+                ObservePeer(response.Packet.Sender, observed);
             }
             catch (Exception exception) when (IsPeerFailure(exception) || exception is OperationCanceledException
                 || exception is InvalidOperationException)
@@ -161,18 +164,18 @@ namespace MajDHTNetwork
         }
 
         /// <summary>Captures the routing state passed to the route selector.</summary>
-        /// <returns>A snapshot of the preferred transport, external addresses and live relay registrations.</returns>
+        /// <returns>A snapshot of the preferred transport and live traversal registrations.</returns>
         private DHTRouteContext RouteContext()
         {
             lock (_gate)
             {
-                return new DHTRouteContext(_options.PreferredTransport, _options.EnableNatTraversal, _externalAddresses.Values,
-                    _natRelays.Keys, _options.BucketSize, GetPeerStatistics);
+                return new DHTRouteContext(_options.PreferredTransport, _options.EnableNatTraversal, _traversalNodes.Keys, _options.BucketSize,
+                    GetPeerStatistics);
             }
         }
 
         /// <summary>Asks the route selector for direct attempts and bounds the result.</summary>
-        /// <param name="destination">The destination contact.</param>
+        /// <param name="destination">The destination at its observed endpoints.</param>
         /// <returns>At most sixteen direct routes.</returns>
         private List<DHTDirectRoute> SelectDirectRoutes(DHTPeer destination)
         {
@@ -191,30 +194,31 @@ namespace MajDHTNetwork
             return result;
         }
 
-        /// <summary>Asks the route selector for relay attempts and discards relays that cannot serve the destination.</summary>
-        /// <param name="destination">The destination contact.</param>
-        /// <returns>At most thirty-two distinct usable relay routes.</returns>
-        private List<DHTRelayRoute> SelectRelayRoutes(DHTPeer destination)
+        /// <summary>Asks the route selector for assisted attempts and discards assistants that cannot serve the destination.</summary>
+        /// <param name="destination">The destination.</param>
+        /// <returns>At most thirty-two distinct usable assisted routes.</returns>
+        private List<DHTAssistedRoute> SelectAssistedRoutes(DHTPeer destination)
         {
+            const DHTCapabilities assisting = DHTCapabilities.Traversal | DHTCapabilities.Forwarder;
             var known = new List<DHTPeer>();
             foreach (var peer in RoutedPeers(destination.NodeId, 256))
             {
-                if (peer.NodeId != destination.NodeId && (peer.Capabilities & DHTCapabilities.Relay) != 0)
+                if (peer.NodeId != destination.NodeId && (peer.Capabilities & assisting) != 0)
                 {
                     known.Add(peer);
                 }
             }
-            var result = new List<DHTRelayRoute>();
+            var result = new List<DHTAssistedRoute>();
             var seen = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var route in _routeSelector.SelectRelayRoutes(destination, known.AsReadOnly(), RouteContext()) ?? Array.Empty<DHTRelayRoute>())
+            foreach (var route in _routeSelector.SelectAssistedRoutes(destination, known.AsReadOnly(), RouteContext()) ?? Array.Empty<DHTAssistedRoute>())
             {
-                if (result.Count >= MaxRelayRoutes)
+                if (result.Count >= MaxAssistedRoutes)
                 {
                     break;
                 }
-                var relay = route?.Relay;
-                if (relay == null || relay.IsExpired || relay.NodeId == NodeId || relay.NodeId == destination.NodeId
-                    || (relay.Capabilities & DHTCapabilities.Relay) == 0 || !HasRequiredWork(relay) || !seen.Add(relay.NodeId))
+                var assistant = route?.Assistant;
+                if (assistant == null || assistant.IsExpired || assistant.NodeId == NodeId || assistant.NodeId == destination.NodeId
+                    || (assistant.Capabilities & assisting) == 0 || !HasRequiredWork(assistant.Contact) || !seen.Add(assistant.NodeId))
                 {
                     continue;
                 }

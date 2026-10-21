@@ -122,7 +122,7 @@ namespace MajDHTNetwork.Tests
             Assert.ThrowsAny<System.Security.Cryptography.CryptographicException>(() =>
                 Crypto.EncryptTo(writer, scalar, new byte[32], new byte[8], new byte[12], ReadOnlyMemory<byte>.Empty));
             var contact = Peer(identity, 30003);
-            Assert.True(contact.AgreementKey.Span.SequenceEqual(identity.AgreementPublicKey), "Contacts advertise the identity agreement key.");
+            Assert.True(contact.Contact.AgreementKey.Span.SequenceEqual(identity.AgreementPublicKey), "Contacts advertise the identity agreement key.");
         }
 
         /// <summary>Returns the cached verified contact for repeated bytes and drops it once the lease expires.</summary>
@@ -131,18 +131,17 @@ namespace MajDHTNetwork.Tests
         public async Task ContactCacheReusesVerifiedContactsUntilTheyExpire()
         {
             var identity = new DHTIdentity();
-            var endpoints = new[] { new DHTEndpoint(IPAddress.Loopback, 30004, 0, DHTEndpointFlags.Configured) };
-            var shortLived = DHTPeer.Create(identity, endpoints, DHTCapabilities.Download, DHTReachability.Public, false, null,
-                Array.Empty<DHTPeer>(), TimeSpan.FromSeconds(1));
+            var shortLived = DHTContact.Create(identity, DHTCapabilities.Download, DHTReachability.Public, false, Array.Empty<DHTPeer>(),
+                TimeSpan.FromSeconds(1));
             var encoded = shortLived.Encoded.ToArray();
-            var first = DHTPeer.Parse(encoded);
-            Assert.Same(first, DHTPeer.Parse((byte[])encoded.Clone()));
-            Assert.NotSame(first, new DHTPeer(encoded));
+            var first = DHTContact.Parse(encoded);
+            Assert.Same(first, DHTContact.Parse((byte[])encoded.Clone()));
+            Assert.NotSame(first, new DHTContact(encoded));
             var record = DHTRecord.Create(identity, "cache/record", Crypto.Hex(Crypto.Hash(encoded)), Crypto.Hex(MerkleTree.Leaf(encoded)),
                 encoded.Length, 1024, 1, DateTimeOffset.UtcNow.AddHours(1));
             Assert.Same(DHTRecord.ParseCached(record.ToBytes()), DHTRecord.ParseCached(record.ToBytes()));
             await Task.Delay(TimeSpan.FromMilliseconds(1200), TestContext.Current.CancellationToken);
-            Assert.ThrowsAny<InvalidDataException>(() => DHTPeer.Parse(encoded));
+            Assert.ThrowsAny<InvalidDataException>(() => DHTContact.Parse(encoded));
         }
 
         /// <summary>Evicts the oldest entries first and keys entries by the exact bytes.</summary>
@@ -217,7 +216,7 @@ namespace MajDHTNetwork.Tests
             header.Put(ephemeral.GeneratePublicKey().GetEncoded());
             header.Put(nonce);
             using var plain = new Wire();
-            plain.Put(sender.Encoded);
+            plain.Put(sender.Contact.Encoded);
             plain.Put(requestId);
             plain.PutLong(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
             plain.Put(body);
@@ -227,7 +226,7 @@ namespace MajDHTNetwork.Tests
             using var payload = new Wire();
             payload.Put(plain.WrittenSpan);
             payload.Put(identity.Sign(signed.WrittenMemory));
-            var key = LegacyDerive(ephemeral, recipient.AgreementKey.ToArray(), header.ToArray());
+            var key = LegacyDerive(ephemeral, recipient.Contact.AgreementKey.ToArray(), header.ToArray());
             using var outer = new Wire();
             outer.Put(header.WrittenSpan);
             outer.Put(LegacyTransform(true, key, nonce, header.ToArray(), payload.ToArray()));
@@ -238,7 +237,7 @@ namespace MajDHTNetwork.Tests
         /// <param name="identity">The receiving identity.</param>
         /// <param name="encoded">The envelope, which is not modified.</param>
         /// <returns>The authenticated fields.</returns>
-        private static (DHTPeer Sender, byte[] RequestId, byte Kind, byte[] Body) LegacyOpen(DHTIdentity identity, byte[] encoded)
+        private static (DHTContact Sender, byte[] RequestId, byte Kind, byte[] Body) LegacyOpen(DHTIdentity identity, byte[] encoded)
         {
             using var outer = new Wire(encoded);
             var header = outer.Bytes(256);
@@ -257,7 +256,7 @@ namespace MajDHTNetwork.Tests
             var signature = payload.Bytes(64);
             payload.End();
             using var fields = new Wire(plain);
-            var sender = new DHTPeer(fields.Bytes(DHTPeer.MaxEncodedLength));
+            var sender = new DHTContact(fields.Bytes(DHTContact.MaxEncodedLength));
             var requestId = fields.Bytes(16).ToArray();
             fields.Long();
             var body = fields.Bytes(Wire.MaxPacket).ToArray();

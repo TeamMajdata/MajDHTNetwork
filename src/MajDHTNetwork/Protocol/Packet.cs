@@ -17,15 +17,15 @@ namespace MajDHTNetwork.Protocol
         Store = 3,
         /// <summary>Returns an authenticated content block.</summary>
         Block = 4,
-        /// <summary>Forwards one opaque request without permitting nested forwarding.</summary>
-        Relay = 5,
-        /// <summary>Registers observed endpoints and coordinates an authenticated introduction.</summary>
-        Rendezvous = 6,
+        /// <summary>Opens a forwarding session, relays one opaque request through a Forwarder or delivers one to its destination.</summary>
+        Forward = 5,
+        /// <summary>Registers observed endpoints, coordinates an authenticated introduction or arranges a dial-back.</summary>
+        Traversal = 6,
         /// <summary>Confirms an introduced direct path.</summary>
         Punch = 7,
         /// <summary>Learns an unknown endpoint's signed contact; the request is signed but not encrypted.</summary>
         Hello = 8,
-        /// <summary>Delivers an independent dial-back that proves an advertised endpoint is reachable.</summary>
+        /// <summary>Delivers an independent dial-back that proves an observed endpoint is reachable.</summary>
         Probe = 9
     }
 
@@ -38,11 +38,11 @@ namespace MajDHTNetwork.Protocol
         /// <summary>The correlation identifier length.</summary>
         public const int RequestIdLength = 16;
         /// <summary>The sender contact, or null for an uninitialized packet.</summary>
-        private readonly DHTPeer? _sender;
+        private readonly DHTContact? _sender;
 
         /// <summary>Gets the authenticated sender contact.</summary>
         /// <exception cref="InvalidOperationException">The packet is uninitialized.</exception>
-        public DHTPeer Sender
+        public DHTContact Sender
         {
             get
             {
@@ -63,7 +63,7 @@ namespace MajDHTNetwork.Protocol
         /// <param name="body">The borrowed operation body.</param>
         /// <exception cref="ArgumentNullException">The sender is null.</exception>
         /// <exception cref="ArgumentException">The correlation identifier is not 16 bytes long.</exception>
-        public Packet(DHTPeer sender, ReadOnlyMemory<byte> requestId, byte kind, ReadOnlyMemory<byte> body)
+        public Packet(DHTContact sender, ReadOnlyMemory<byte> requestId, byte kind, ReadOnlyMemory<byte> body)
         {
             if (requestId.Length != RequestIdLength)
             {
@@ -75,6 +75,31 @@ namespace MajDHTNetwork.Protocol
             Body = body;
         }
 
+        /// <summary>Creates an immutable view of borrowed message memory before encryption, sent under a peer's contact.</summary>
+        /// <param name="sender">The sender, whose contact becomes the packet's sender.</param>
+        /// <param name="requestId">The borrowed 16-byte random correlation identifier.</param>
+        /// <param name="kind">The operation and response bit.</param>
+        /// <param name="body">The borrowed operation body.</param>
+        /// <exception cref="ArgumentNullException">The sender is null.</exception>
+        /// <exception cref="ArgumentException">The correlation identifier is not 16 bytes long.</exception>
+        public Packet(DHTPeer sender, ReadOnlyMemory<byte> requestId, byte kind, ReadOnlyMemory<byte> body)
+            : this((sender ?? throw new ArgumentNullException(nameof(sender))).Contact, requestId, kind, body)
+        {
+        }
+
+        /// <summary>Encrypts and signs a fresh envelope to a peer using an ephemeral X25519 sender key.</summary>
+        /// <param name="identity">The sending identity.</param>
+        /// <param name="recipient">The final recipient, whose contact seals the envelope.</param>
+        /// <returns>The bounded encrypted envelope.</returns>
+        /// <exception cref="ArgumentNullException">The recipient is null.</exception>
+        /// <exception cref="InvalidDataException">The encoded packet exceeds protocol limits.</exception>
+        /// <exception cref="InvalidOperationException">The packet is uninitialized.</exception>
+        /// <exception cref="CryptographicException">The cryptographic provider cannot seal the packet.</exception>
+        public byte[] Seal(DHTIdentity identity, DHTPeer recipient)
+        {
+            return Seal(identity, (recipient ?? throw new ArgumentNullException(nameof(recipient))).Contact);
+        }
+
         /// <summary>Encrypts and signs a fresh envelope using an ephemeral X25519 sender key.</summary>
         /// <param name="identity">The sending identity.</param>
         /// <param name="recipient">The final recipient contact.</param>
@@ -82,7 +107,7 @@ namespace MajDHTNetwork.Protocol
         /// <exception cref="InvalidDataException">The encoded packet exceeds protocol limits.</exception>
         /// <exception cref="InvalidOperationException">The packet is uninitialized.</exception>
         /// <exception cref="CryptographicException">The cryptographic provider cannot seal the packet.</exception>
-        public byte[] Seal(DHTIdentity identity, DHTPeer recipient)
+        public byte[] Seal(DHTIdentity identity, DHTContact recipient)
         {
             using var header = new Wire();
             WriteHeader(header, recipient.NodeHash);
@@ -223,7 +248,7 @@ namespace MajDHTNetwork.Protocol
             return new EnvelopeHeader(kind, recipient, publicKey, nonce, header, cipher);
         }
 
-        /// <summary>Allows only data requests to the declared recipient through an opaque relay.</summary>
+        /// <summary>Allows only data requests to the declared recipient through a Forwarder.</summary>
         /// <param name="encoded">The opaque inner packet.</param>
         /// <param name="recipient">The expected final node identifier.</param>
         /// <exception cref="InvalidDataException">The packet is a response, a control operation or addressed elsewhere.</exception>
@@ -232,7 +257,7 @@ namespace MajDHTNetwork.Protocol
             var header = Header(encoded);
             if (!Crypto.AsciiEquals(header.Recipient.Span, recipient) || header.Kind < (byte)Operation.Ping || header.Kind > (byte)Operation.Block)
             {
-                throw new InvalidDataException("Only Ping, Find, Store and Block requests to the declared recipient may be relayed.");
+                throw new InvalidDataException("Only Ping, Find, Store and Block requests to the declared recipient may be forwarded.");
             }
         }
 
@@ -270,7 +295,7 @@ namespace MajDHTNetwork.Protocol
             var signature = payload.Bytes(SignatureLength);
             payload.End();
             using var reader = new Wire(plain);
-            var sender = DHTPeer.Parse(reader.Bytes(DHTPeer.MaxEncodedLength));
+            var sender = DHTContact.Parse(reader.Bytes(DHTContact.MaxEncodedLength));
             var requestId = reader.Bytes(RequestIdLength);
             var timestamp = reader.Long();
             var body = reader.Bytes(Wire.MaxPacket);

@@ -8,7 +8,7 @@ namespace MajDHTNetwork.Protocol
     /// <summary>The decoded arguments of a Probe request.</summary>
     public readonly struct ProbeRequest
     {
-        /// <summary>Gets the 16-byte dial-back nonce issued by the relay, borrowing the request body.</summary>
+        /// <summary>Gets the 16-byte dial-back nonce issued by the Traversal node, borrowing the request body.</summary>
         public ReadOnlyMemory<byte> Nonce { get; }
         /// <summary>Gets the index of the probed port in the dial-back's candidate port list.</summary>
         public int PortIndex { get; }
@@ -24,7 +24,7 @@ namespace MajDHTNetwork.Protocol
             {
                 throw new ArgumentException("A dial-back nonce must contain 16 bytes.", nameof(nonce));
             }
-            if (portIndex < 0 || portIndex >= RendezvousMessage.MaxProbePorts)
+            if (portIndex < 0 || portIndex >= TraversalMessage.MaxProbePorts)
             {
                 throw new ArgumentOutOfRangeException(nameof(portIndex));
             }
@@ -34,8 +34,9 @@ namespace MajDHTNetwork.Protocol
     }
 
     /// <summary>
-    /// Encodes the Probe operation, the independent dial-back a helper sends to prove that an advertised endpoint is
-    /// reachable: the request carries the relay-issued nonce and the candidate port index, and a successful result is empty.
+    /// Encodes the Probe operation, the independent dial-back a helper sends to prove that an observed endpoint is
+    /// reachable: the request carries the nonce issued by the Traversal node and the candidate port index, and a successful
+    /// result is empty.
     /// </summary>
     public static class ProbeMessage
     {
@@ -61,7 +62,7 @@ namespace MajDHTNetwork.Protocol
             var nonce = reader.Bytes(NonceLength);
             var index = reader.Long();
             reader.End();
-            if (nonce.Length != NonceLength || index < 0 || index >= RendezvousMessage.MaxProbePorts)
+            if (nonce.Length != NonceLength || index < 0 || index >= TraversalMessage.MaxProbePorts)
             {
                 throw new InvalidDataException("Invalid dial-back probe.");
             }

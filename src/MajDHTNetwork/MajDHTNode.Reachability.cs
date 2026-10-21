@@ -17,38 +17,38 @@ namespace MajDHTNetwork
     {
         /// <summary>The lease of a public contact.</summary>
         private static readonly TimeSpan s_publicContactLifetime = TimeSpan.FromDays(1);
-        /// <summary>The lease of a contact that depends on relay hints or unverified endpoints.</summary>
-        private static readonly TimeSpan s_relayedContactLifetime = TimeSpan.FromHours(1);
-        /// <summary>How long a relay-observed endpoint counts towards the external-address vote.</summary>
+        /// <summary>The lease of a contact whose reachability is unknown or that depends on hinted forwarders.</summary>
+        private static readonly TimeSpan s_unverifiedContactLifetime = TimeSpan.FromHours(1);
+        /// <summary>How long an observed endpoint counts towards the external-address vote.</summary>
         private static readonly TimeSpan s_observationLifetime = TimeSpan.FromMinutes(10);
         /// <summary>The window of the helper-side dial-back quotas.</summary>
         private static readonly TimeSpan s_probeQuotaWindow = TimeSpan.FromMinutes(1);
         /// <summary>The pause between rounds of rejected or unanswered dial-back probes.</summary>
         private static readonly TimeSpan s_probeRetryInterval = TimeSpan.FromMilliseconds(100);
-        /// <summary>The maximum dial-back delegations accepted from one relay per quota window.</summary>
-        private const int ProbesPerRelay = 10;
+        /// <summary>The maximum dial-back delegations accepted from one Traversal node per quota window.</summary>
+        private const int ProbesPerDelegator = 10;
         /// <summary>The maximum dial-backs sent to one target address per quota window.</summary>
         private const int ProbesPerTarget = 4;
-        /// <summary>The maximum dial-back requests a relay accepts from one requester per quota window.</summary>
+        /// <summary>The maximum dial-back requests a Traversal node accepts from one requester per quota window.</summary>
         internal const int DialBacksPerRequester = 3;
         /// <summary>The maximum probe rounds a helper sends for one delegation, bounding traffic towards an arbitrary target.</summary>
         internal const int MaxProbeRounds = 5;
-        /// <summary>The number of helpers a relay asks before rejecting a dial-back request.</summary>
+        /// <summary>The number of helpers a Traversal node asks before rejecting a dial-back request.</summary>
         private const int DialBackHelperAttempts = 3;
-        /// <summary>The number of failed dial-backs, from distinct relay networks, that marks the node private.</summary>
+        /// <summary>The number of failed dial-backs, from distinct Traversal node networks, that marks the node private.</summary>
         private const int PrivateFailureThreshold = 2;
-        /// <summary>The relay-observed endpoints keyed by reporter, address family and transport.</summary>
-        private readonly Dictionary<(string Reporter, AddressFamily Family, DHTTransport Transport), ObservedEndpoint> _observations =
-            new Dictionary<(string, AddressFamily, DHTTransport), ObservedEndpoint>();
-        /// <summary>The external addresses confirmed by independent relays, indexed by address family.</summary>
+        /// <summary>The observed endpoints of this node keyed by reporter, address family and transport.</summary>
+        private readonly Dictionary<(string Reporter, AddressFamily Family, DHTTransport Transport), EndpointObservation> _observations =
+            new Dictionary<(string, AddressFamily, DHTTransport), EndpointObservation>();
+        /// <summary>The external addresses confirmed by independent observers, indexed by address family.</summary>
         private readonly Dictionary<AddressFamily, IPAddress> _externalAddresses = new Dictionary<AddressFamily, IPAddress>();
         /// <summary>The endpoints verified by dial-back in the current epoch, indexed by address family.</summary>
         private readonly Dictionary<AddressFamily, VerifiedEndpoint> _verifiedEndpoints = new Dictionary<AddressFamily, VerifiedEndpoint>();
-        /// <summary>The relay addresses whose dial-back timed out in the current epoch.</summary>
+        /// <summary>The Traversal node addresses whose dial-back timed out in the current epoch.</summary>
         private readonly List<IPAddress> _dialBackFailures = new List<IPAddress>();
         /// <summary>The pending local dial-back jobs keyed by their hexadecimal nonce.</summary>
         private readonly Dictionary<string, DialBackJob> _dialBacks = new Dictionary<string, DialBackJob>();
-        /// <summary>The helper-side dial-back quotas keyed by relay identifier or target address.</summary>
+        /// <summary>The helper-side dial-back quotas keyed by delegator identifier or target address.</summary>
         private readonly Dictionary<string, Queue<DateTimeOffset>> _probeQuotas = new Dictionary<string, Queue<DateTimeOffset>>();
         /// <summary>The helper-side probes still running.</summary>
         private readonly List<Task> _probeWork = new List<Task>();
@@ -66,9 +66,9 @@ namespace MajDHTNetwork
 
         /// <summary>Re-signs the local contact and schedules an announcement when its advertisement changed.</summary>
         /// <remarks>The caller must hold the state lock.</remarks>
-        private void RefreshLocalPeerLocked()
+        private void RefreshLocalContactLocked()
         {
-            var next = BuildLocalPeerLocked();
+            var next = BuildLocalContactLocked();
             var changed = _self != null && !_self.SameAdvertisement(next);
             _self = next;
             if (changed)
@@ -81,127 +81,112 @@ namespace MajDHTNetwork
             }
         }
 
-        /// <summary>Builds the signed local contact from listeners, configuration and reachability evidence.</summary>
+        /// <summary>Builds the signed local contact from configuration, live assistant sessions and reachability evidence.</summary>
         /// <returns>The freshly signed contact.</returns>
         /// <remarks>The caller must hold the state lock.</remarks>
-        private DHTPeer BuildLocalPeerLocked()
+        private DHTContact BuildLocalContactLocked()
         {
-            var endpoints = new List<DHTEndpoint>();
-            foreach (var address in _options.AdvertisedAddresses)
-            {
-                AddLocalEndpoint(endpoints, address, _transport.TcpPortFor(address.AddressFamily),
-                    _transport.UdpPortFor(address.AddressFamily), DHTEndpointFlags.Configured);
-            }
-            foreach (var verified in _verifiedEndpoints.Values)
-            {
-                // A single relay chooses both the reported address and the helper, so a colluding pair could otherwise make
-                // this node advertise an attacker's address; only the address confirmed by independent relays is advertised.
-                if (_externalAddresses.TryGetValue(verified.Address.AddressFamily, out var external) && external.Equals(verified.Address))
-                {
-                    AddLocalEndpoint(endpoints, verified.Address, verified.TcpPort, verified.UdpPort, DHTEndpointFlags.Verified);
-                }
-            }
-            if (_options.AdvertisedAddresses.Count == 0)
-            {
-                foreach (var address in _options.ListenAddresses)
-                {
-                    if (!NetworkScope.IsWildcard(address))
-                    {
-                        var flags = NetworkScope.Classify(address) == NetworkScope.Scope.Global ? DHTEndpointFlags.None : DHTEndpointFlags.Local;
-                        AddLocalEndpoint(endpoints, address, _transport.TcpPortFor(address.AddressFamily),
-                            _transport.UdpPortFor(address.AddressFamily), flags);
-                    }
-                }
-            }
-            var reachable = false;
-            foreach (var endpoint in endpoints)
-            {
-                reachable |= endpoint.IsReachable;
-            }
-            var hints = reachable ? new List<DHTPeer>() : RelayHintsLocked();
+            var reachable = _options.PubliclyReachable || HasVerifiedEndpointLocked();
+            // Public contacts carry no hints: a hinted node must itself be hint-free, so a public assistant stays usable as a hint.
+            var hints = reachable ? new List<DHTPeer>() : HintsLocked();
             var reachability = DHTReachability.Unknown;
             if (reachable)
             {
                 reachability = DHTReachability.Public;
             }
-            else if (_dialBackFailures.Count >= PrivateFailureThreshold && hints.Count != 0)
+            else if (_dialBackFailures.Count >= PrivateFailureThreshold && HasForwarder(hints))
             {
                 reachability = DHTReachability.Private;
-                endpoints.RemoveAll(endpoint => (endpoint.Flags & DHTEndpointFlags.Local) == 0);
             }
             while (true)
             {
                 try
                 {
-                    return DHTPeer.Create(_identity, endpoints, _options.Capabilities, reachability, HasEndpointDependentMappingLocked(),
-                        PreferredExternalAddressLocked(), hints, reachable ? s_publicContactLifetime : s_relayedContactLifetime);
+                    return DHTContact.Create(_identity, _options.Capabilities, reachability, HasEndpointDependentMappingLocked(), hints,
+                        reachable ? s_publicContactLifetime : s_unverifiedContactLifetime);
                 }
                 catch (InvalidDataException) when (hints.Count > 1)
                 {
-                    // Unusually long relay contacts can exceed the payload limit; one hint always fits.
+                    // Unusually long hinted contacts can exceed the payload limit; one hint always fits, and forwarders come first.
                     hints.RemoveAt(hints.Count - 1);
                 }
             }
         }
 
-        /// <summary>Adds a distinct endpoint with at least one bound port while respecting the endpoint limit.</summary>
-        /// <param name="endpoints">The endpoint list under construction.</param>
-        /// <param name="address">The advertised address.</param>
-        /// <param name="tcpPort">The TCP port or zero.</param>
-        /// <param name="udpPort">The UDP port or zero.</param>
-        /// <param name="flags">The endpoint flags.</param>
-        private static void AddLocalEndpoint(List<DHTEndpoint> endpoints, IPAddress address, int tcpPort, int udpPort, DHTEndpointFlags flags)
+        /// <summary>Checks whether a dial-back verified this node in the current epoch at its confirmed external address.</summary>
+        /// <returns>Whether an independent helper reached this node at the address confirmed by two independent observers.</returns>
+        /// <remarks>
+        /// A single Traversal node chooses both the reported address and the helper, so a colluding pair could otherwise make this
+        /// node claim public reachability at an attacker's address; only the address confirmed by independent observers counts.
+        /// The caller must hold the state lock.
+        /// </remarks>
+        private bool HasVerifiedEndpointLocked()
         {
-            if (endpoints.Count >= DHTPeer.MaxEndpoints || (tcpPort == 0 && udpPort == 0))
+            foreach (var verified in _verifiedEndpoints.Values)
             {
-                return;
-            }
-            foreach (var existing in endpoints)
-            {
-                if (existing.NetworkAddress.Equals(address))
+                if (_externalAddresses.TryGetValue(verified.Address.AddressFamily, out var external) && external.Equals(verified.Address))
                 {
-                    return;
+                    return true;
                 }
             }
-            endpoints.Add(new DHTEndpoint(address, tcpPort, udpPort, flags));
+            return false;
         }
 
-        /// <summary>Selects public relays with live registrations, preferring distinct networks.</summary>
-        /// <returns>At most three relay hint contacts.</returns>
+        /// <summary>Checks whether a hint list contains a Forwarder, which a private contact needs to stay reachable.</summary>
+        /// <param name="hints">The hints.</param>
+        /// <returns>Whether a Forwarder is hinted.</returns>
+        private static bool HasForwarder(List<DHTPeer> hints)
+        {
+            foreach (var hint in hints)
+            {
+                if ((hint.Capabilities & DHTCapabilities.Forwarder) != 0)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>Selects public assistants with live sessions as hints: Forwarders first, preferring distinct networks.</summary>
+        /// <returns>At most three hints.</returns>
         /// <remarks>The caller must hold the state lock.</remarks>
-        private List<DHTPeer> RelayHintsLocked()
+        private List<DHTPeer> HintsLocked()
         {
             var result = new List<DHTPeer>();
             var deferred = new List<DHTPeer>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
             var now = DateTimeOffset.UtcNow;
-            foreach (var relay in _natRelays.Values)
+            foreach (var sessions in new[] { _forwarders.Values, _traversalNodes.Values })
             {
-                var peer = relay.Peer;
-                if (peer.IsExpired || peer.ExpiresAt <= now.AddMinutes(1) || peer.Reachability != DHTReachability.Public
-                    || peer.RelayHints.Count != 0 || peer.Encoded.Length > DHTPeer.MaxHintLength
-                    || relay.LastSuccess + _options.NatRegistrationLifetime <= now)
+                foreach (var session in sessions)
                 {
-                    continue;
+                    var peer = session.Peer;
+                    if (peer.IsExpired || peer.ExpiresAt <= now.AddMinutes(1) || peer.Reachability != DHTReachability.Public
+                        || peer.Hints.Count != 0 || peer.Endpoints.Count == 0 || peer.Contact.Encoded.Length > DHTContact.MaxHintLength
+                        || session.LastSuccess + _options.NatRegistrationLifetime <= now || !seen.Add(peer.NodeId))
+                    {
+                        continue;
+                    }
+                    var distinct = true;
+                    foreach (var selected in result)
+                    {
+                        distinct &= !SharesNetwork(selected, peer);
+                    }
+                    (distinct ? result : deferred).Add(peer);
                 }
-                var distinct = true;
-                foreach (var selected in result)
-                {
-                    distinct &= !SharesNetwork(selected, peer);
-                }
-                (distinct ? result : deferred).Add(peer);
             }
             result.AddRange(deferred);
-            if (result.Count > DHTPeer.MaxRelayHints)
+            if (result.Count > DHTContact.MaxHints)
             {
-                result.RemoveRange(DHTPeer.MaxRelayHints, result.Count - DHTPeer.MaxRelayHints);
+                result.RemoveRange(DHTContact.MaxHints, result.Count - DHTContact.MaxHints);
             }
             return result;
         }
 
-        /// <summary>Checks whether two contacts advertise an endpoint in the same network.</summary>
-        /// <param name="left">The first contact.</param>
-        /// <param name="right">The second contact.</param>
-        /// <returns>Whether any pair of advertised endpoints shares a network prefix.</returns>
+        /// <summary>Checks whether two peers were observed in the same network.</summary>
+        /// <param name="left">The first peer.</param>
+        /// <param name="right">The second peer.</param>
+        /// <returns>Whether any pair of observed endpoints shares a network prefix.</returns>
         private static bool SharesNetwork(DHTPeer left, DHTPeer right)
         {
             foreach (var a in left.Endpoints)
@@ -217,19 +202,7 @@ namespace MajDHTNetwork
             return false;
         }
 
-        /// <summary>Gets the confirmed external address to advertise, preferring IPv4 because IPv4 is usually translated.</summary>
-        /// <returns>The confirmed external address, or null.</returns>
-        /// <remarks>The caller must hold the state lock.</remarks>
-        private IPAddress? PreferredExternalAddressLocked()
-        {
-            if (_externalAddresses.TryGetValue(AddressFamily.InterNetwork, out var address))
-            {
-                return address;
-            }
-            return _externalAddresses.TryGetValue(AddressFamily.InterNetworkV6, out address) ? address : null;
-        }
-
-        /// <summary>Checks whether relays observed different ports for the confirmed external address.</summary>
+        /// <summary>Checks whether observers reported different ports for the confirmed external address.</summary>
         /// <returns>Whether the NAT mapping depends on the destination endpoint.</returns>
         /// <remarks>The caller must hold the state lock.</remarks>
         private bool HasEndpointDependentMappingLocked()
@@ -258,18 +231,18 @@ namespace MajDHTNetwork
             return false;
         }
 
-        /// <summary>Records an endpoint observed by an authenticated remote node and updates the external-address vote.</summary>
+        /// <summary>Records an endpoint observed for this node by an authenticated remote node and updates the external-address vote.</summary>
         /// <param name="reporter">The authenticated observing node.</param>
         /// <param name="reporterAddress">The address this node used to reach the reporter.</param>
         /// <param name="transport">The transport whose mapping was observed.</param>
         /// <param name="observed">The observed source endpoint of this node.</param>
-        private void RecordObservation(DHTPeer reporter, IPAddress reporterAddress, DHTTransport transport, IPEndPoint observed)
+        private void RecordObservation(DHTContact reporter, IPAddress reporterAddress, DHTTransport transport, IPEndPoint observed)
         {
             var family = observed.AddressFamily;
             lock (_gate)
             {
                 var now = DateTimeOffset.UtcNow;
-                _observations[(reporter.NodeId, family, transport)] = new ObservedEndpoint(observed, reporterAddress, now);
+                _observations[(reporter.NodeId, family, transport)] = new EndpointObservation(observed, reporterAddress, now);
                 var expired = new List<(string, AddressFamily, DHTTransport)>();
                 foreach (var entry in _observations)
                 {
@@ -298,12 +271,12 @@ namespace MajDHTNetwork
                     }
                     else
                     {
-                        Log(LogLevel.Information, "External address confirmed by independent relays.");
+                        Log(LogLevel.Information, "External address confirmed by independent observers.");
                     }
                 }
                 if (_self != null && (addressChanged || _self.HasEndpointDependentMapping != HasEndpointDependentMappingLocked()))
                 {
-                    RefreshLocalPeerLocked();
+                    RefreshLocalContactLocked();
                 }
             }
         }
@@ -354,8 +327,7 @@ namespace MajDHTNetwork
         {
             lock (_gate)
             {
-                if (!_options.EnableNatTraversal || _options.AdvertisedAddresses.Count != 0 || !_started || _stopped
-                    || _lifetime.IsCancellationRequested)
+                if (!_options.EnableNatTraversal || _options.PubliclyReachable || !_started || _stopped || _lifetime.IsCancellationRequested)
                 {
                     return;
                 }
@@ -368,7 +340,7 @@ namespace MajDHTNetwork
             }
         }
 
-        /// <summary>Asks the registered relays to arrange dial-backs until each transport is verified or every relay was tried.</summary>
+        /// <summary>Asks the registered Traversal nodes to arrange dial-backs until each transport is verified or every node was tried.</summary>
         /// <returns>Completion after the requested passes.</returns>
         private async Task RunReachabilityChecksAsync()
         {
@@ -377,28 +349,28 @@ namespace MajDHTNetwork
             {
                 while (true)
                 {
-                    var relays = new List<DHTPeer>();
+                    var traversalNodes = new List<DHTPeer>();
                     lock (_gate)
                     {
                         _reachabilityRerun = false;
                         _lastReachabilityCheck = DateTimeOffset.UtcNow;
-                        foreach (var relay in _natRelays.Values)
+                        foreach (var session in _traversalNodes.Values)
                         {
-                            relays.Add(relay.Peer);
+                            traversalNodes.Add(session.Peer);
                         }
                     }
                     for (var index = 0; index < 2; index++)
                     {
                         var transport = index == 0 ? _options.PreferredTransport : OtherTransport(_options.PreferredTransport);
-                        foreach (var relay in relays)
+                        foreach (var traversal in traversalNodes)
                         {
-                            if (!SupportsNatTransport(relay, transport))
+                            if (!SupportsAssistantTransport(traversal, transport))
                             {
                                 continue;
                             }
                             try
                             {
-                                if (await DialBackAsync(relay, transport, _lifetime.Token).ConfigureAwait(false))
+                                if (await DialBackAsync(traversal, transport, _lifetime.Token).ConfigureAwait(false))
                                 {
                                     break;
                                 }
@@ -428,33 +400,33 @@ namespace MajDHTNetwork
             }
         }
 
-        /// <summary>Asks one relay to have an independent helper dial this node back.</summary>
-        /// <param name="relay">The registered relay.</param>
+        /// <summary>Asks one Traversal node to have an independent helper dial this node back.</summary>
+        /// <param name="traversal">The registered Traversal node.</param>
         /// <param name="transport">The transport to verify.</param>
         /// <param name="cancellationToken">The node lifetime.</param>
         /// <returns>True when the helper reached this node; false when the dial-back timed out.</returns>
-        /// <exception cref="IOException">The relay could not arrange a dial-back; the result is inconclusive.</exception>
-        /// <exception cref="InvalidDataException">The relay response is malformed.</exception>
-        private async Task<bool> DialBackAsync(DHTPeer relay, DHTTransport transport, CancellationToken cancellationToken)
+        /// <exception cref="IOException">The Traversal node could not arrange a dial-back; the result is inconclusive.</exception>
+        /// <exception cref="InvalidDataException">The response is malformed.</exception>
+        private async Task<bool> DialBackAsync(DHTPeer traversal, DHTTransport transport, CancellationToken cancellationToken)
         {
-            var relayEndpoint = NatEndpoint(relay, transport) ?? throw new IOException("The relay has no endpoint for this transport.");
-            var localPort = _transport.PortFor(transport, relayEndpoint.AddressFamily);
+            var endpoint = AssistantEndpoint(traversal, transport) ?? throw new IOException("The Traversal node has no endpoint for this transport.");
+            var localPort = _transport.PortFor(transport, endpoint.AddressFamily);
             if (localPort == 0)
             {
                 throw new IOException("This node has no listener for the transport being verified.");
             }
             using var body = new Wire();
-            RendezvousMessage.WriteDialBackRequest(body, new[] { localPort });
-            var response = await RequestNatAsync(relay, transport, body.WrittenMemory, cancellationToken).ConfigureAwait(false);
+            TraversalMessage.WriteDialBackRequest(body, new[] { localPort });
+            var response = await RequestAssistantAsync(traversal, Operation.Traversal, transport, body.WrittenMemory, cancellationToken).ConfigureAwait(false);
             DialBackJob job;
             string id;
             using (var arrangementBody = response.Body)
             using (var reader = new Wire(arrangementBody.Bytes))
             {
-                var arrangement = RendezvousMessage.ReadDialBackResponse(reader);
+                var arrangement = TraversalMessage.ReadDialBackResponse(reader);
                 var helper = arrangement.HelperId;
                 var expiresAt = arrangement.ExpiresAt;
-                if (helper == NodeId || helper == relay.NodeId || expiresAt > DateTimeOffset.UtcNow.AddMinutes(2))
+                if (helper == NodeId || helper == traversal.NodeId || expiresAt > DateTimeOffset.UtcNow.AddMinutes(2))
                 {
                     throw new InvalidDataException("Invalid dial-back arrangement.");
                 }
@@ -487,7 +459,7 @@ namespace MajDHTNetwork
                     if (job.Success.Task.IsCompleted)
                     {
                         RecordVerifiedLocked(job.Address, transport, job.Ports[job.Success.Task.Result]);
-                        Log(LogLevel.Information, "Independent dial-back verified a public endpoint.");
+                        Log(LogLevel.Information, "Independent dial-back verified public reachability.");
                         return true;
                     }
                     var distinct = true;
@@ -499,7 +471,7 @@ namespace MajDHTNetwork
                     {
                         _dialBackFailures.Add(response.Endpoint.Address);
                     }
-                    RefreshLocalPeerLocked();
+                    RefreshLocalContactLocked();
                 }
                 Log(LogLevel.Information, "Independent dial-back did not reach this node.");
                 return false;
@@ -514,7 +486,7 @@ namespace MajDHTNetwork
         }
 
         /// <summary>Records one verified external endpoint and re-signs the local contact.</summary>
-        /// <param name="address">The relay-observed external address.</param>
+        /// <param name="address">The observed external address.</param>
         /// <param name="transport">The verified transport.</param>
         /// <param name="port">The verified external port.</param>
         /// <remarks>The caller must hold the state lock.</remarks>
@@ -533,7 +505,7 @@ namespace MajDHTNetwork
             {
                 verified.UdpPort = port;
             }
-            RefreshLocalPeerLocked();
+            RefreshLocalContactLocked();
         }
 
         /// <summary>Arranges a dial-back by an independent helper on behalf of a registered client.</summary>
@@ -551,14 +523,14 @@ namespace MajDHTNetwork
         {
             lock (_gate)
             {
-                // Each request makes this relay contact helpers, so a requester cannot use it as a traffic multiplier.
+                // Each request makes this node contact helpers, so a requester cannot use it as a traffic multiplier.
                 if (!TakeProbeQuotaLocked("requester:" + packet.Sender.NodeId, DialBacksPerRequester))
                 {
                     throw new IOException("The dial-back request quota was reached.");
                 }
             }
             var ports = new List<int> { source.Port };
-            foreach (var port in RendezvousMessage.ReadDialBackRequest(request))
+            foreach (var port in TraversalMessage.ReadDialBackRequest(request))
             {
                 if (!ports.Contains(port))
                 {
@@ -568,7 +540,7 @@ namespace MajDHTNetwork
             var nonce = Crypto.Random(16);
             var expiresAt = DateTimeOffset.UtcNow + _options.NatTraversalTimeout;
             using var assist = new Wire();
-            RendezvousMessage.WriteDialBackAssistRequest(assist, new DialBackDelegation(packet.Sender, transport, source.Address, ports, nonce, expiresAt));
+            TraversalMessage.WriteDialBackAssistRequest(assist, new DialBackDelegation(packet.Sender, transport, source.Address, ports, nonce, expiresAt));
             var attempts = 0;
             foreach (var helper in DialBackHelpers(packet.Sender, source, transport))
             {
@@ -578,7 +550,7 @@ namespace MajDHTNetwork
                 }
                 try
                 {
-                    using var acceptance = await RequestAsync(helper, Operation.Rendezvous, assist.WrittenMemory, cancellationToken, allowRelay: false)
+                    using var acceptance = await RequestAsync(helper, Operation.Traversal, assist.WrittenMemory, cancellationToken, allowAssisted: false)
                         .ConfigureAwait(false);
                 }
                 catch (Exception exception) when (IsPeerFailure(exception))
@@ -587,26 +559,22 @@ namespace MajDHTNetwork
                     Log(LogLevel.Debug, "Dial-back helper declined: ", exception);
                     continue;
                 }
-                RendezvousMessage.WriteDialBackResponse(response, new DialBackArrangement(source, helper.NodeId, nonce, expiresAt, ports));
+                TraversalMessage.WriteDialBackResponse(response, new DialBackArrangement(source, helper.NodeId, nonce, expiresAt, ports));
                 return;
             }
             throw new IOException("No independent dial-back helper is available.");
         }
 
-        /// <summary>Lists public relay-capable helpers in networks distinct from the client and this relay.</summary>
+        /// <summary>Lists public Traversal nodes observed in networks distinct from the client and this node as dial-back helpers.</summary>
         /// <param name="client">The client requesting the dial-back.</param>
         /// <param name="source">The client's observed endpoint.</param>
         /// <param name="transport">The transport to dial.</param>
-        /// <returns>Candidate helpers ordered by routing distance to the client.</returns>
-        private List<DHTPeer> DialBackHelpers(DHTPeer client, IPEndPoint source, DHTTransport transport)
+        /// <returns>Candidate helpers, one per network, in random order.</returns>
+        private List<DHTPeer> DialBackHelpers(DHTContact client, IPEndPoint source, DHTTransport transport)
         {
             var own = new List<IPAddress>();
             lock (_gate)
             {
-                foreach (var endpoint in _self!.Endpoints)
-                {
-                    own.Add(endpoint.NetworkAddress);
-                }
                 own.AddRange(_externalAddresses.Values);
             }
             foreach (var address in _options.ListenAddresses)
@@ -622,15 +590,14 @@ namespace MajDHTNetwork
             foreach (var peer in RoutedPeers(client.NodeId, 256))
             {
                 if (peer.NodeId == client.NodeId || peer.NodeId == NodeId || peer.Reachability != DHTReachability.Public
-                    || (peer.Capabilities & DHTCapabilities.Relay) == 0)
+                    || (peer.Capabilities & DHTCapabilities.Traversal) == 0)
                 {
                     continue;
                 }
                 foreach (var endpoint in peer.Endpoints)
                 {
                     var address = endpoint.NetworkAddress;
-                    if (!endpoint.IsReachable || endpoint.Port(transport) == 0 || address.AddressFamily != source.AddressFamily
-                        || NetworkScope.SameNetwork(address, source.Address))
+                    if (endpoint.Port(transport) == 0 || address.AddressFamily != source.AddressFamily || NetworkScope.SameNetwork(address, source.Address))
                     {
                         continue;
                     }
@@ -661,18 +628,18 @@ namespace MajDHTNetwork
             return result;
         }
 
-        /// <summary>Accepts a relay's dial-back delegation and probes the client's observed address in the background.</summary>
-        /// <param name="packet">The authenticated relay request.</param>
+        /// <summary>Accepts a Traversal node's dial-back delegation and probes the client's observed address in the background.</summary>
+        /// <param name="packet">The authenticated delegation request.</param>
         /// <param name="request">The remaining request arguments.</param>
-        /// <exception cref="IOException">The relay or target exceeded a quota, or the target scope is not permitted.</exception>
-        /// <exception cref="InvalidDataException">The delegation is malformed or expired.</exception>
+        /// <exception cref="IOException">The delegator or target exceeded a quota, or the target scope is not permitted.</exception>
+        /// <exception cref="InvalidDataException">The delegation is malformed, expired or not sent by a Traversal node.</exception>
         private void DispatchDialBackAssist(Packet packet, Wire request)
         {
-            if ((packet.Sender.Capabilities & DHTCapabilities.Relay) == 0)
+            if ((packet.Sender.Capabilities & DHTCapabilities.Traversal) == 0)
             {
-                throw new InvalidDataException("Only relays may delegate dial-backs.");
+                throw new InvalidDataException("Only Traversal nodes may delegate dial-backs.");
             }
-            var delegation = RendezvousMessage.ReadDialBackAssistRequest(request);
+            var delegation = TraversalMessage.ReadDialBackAssistRequest(request);
             var owner = delegation.Owner;
             var target = delegation.TargetAddress;
             var expiresAt = delegation.ExpiresAt;
@@ -687,7 +654,7 @@ namespace MajDHTNetwork
             }
             lock (_gate)
             {
-                if (!TakeProbeQuotaLocked("relay:" + packet.Sender.NodeId, ProbesPerRelay)
+                if (!TakeProbeQuotaLocked("delegator:" + packet.Sender.NodeId, ProbesPerDelegator)
                     || !TakeProbeQuotaLocked("target:" + target, ProbesPerTarget))
                 {
                     throw new IOException("The dial-back quota was reached.");
@@ -773,17 +740,17 @@ namespace MajDHTNetwork
         /// </summary>
         /// <param name="owner">The client whose reachability is checked.</param>
         /// <param name="transport">The transport to dial.</param>
-        /// <param name="target">The relay-observed client address.</param>
+        /// <param name="target">The observed client address.</param>
         /// <param name="ports">The candidate ports.</param>
-        /// <param name="nonce">The relay-issued nonce.</param>
+        /// <param name="nonce">The nonce issued by the Traversal node.</param>
         /// <param name="expiresAt">The dial-back expiry.</param>
         /// <returns>Completion after a probe was accepted or the probe budget was spent.</returns>
         /// <remarks>
-        /// The client registers its pending job only after the relay answers, which can be later than the first probe, so a
-        /// rejected probe is retried with a fresh request identifier. A relay can name any target, so the helper never sends
-        /// more than <see cref="MaxProbeRounds"/> rounds and never probes longer than its own traversal budget.
+        /// The client registers its pending job only after the Traversal node answers, which can be later than the first probe,
+        /// so a rejected probe is retried with a fresh request identifier. A delegator can name any target, so the helper never
+        /// sends more than <see cref="MaxProbeRounds"/> rounds and never probes longer than its own traversal budget.
         /// </remarks>
-        private async Task SendProbesAsync(DHTPeer owner, DHTTransport transport, IPAddress target, IReadOnlyList<int> ports, byte[] nonce,
+        private async Task SendProbesAsync(DHTContact owner, DHTTransport transport, IPAddress target, IReadOnlyList<int> ports, byte[] nonce,
             DateTimeOffset expiresAt)
         {
             await Task.Yield();
@@ -824,19 +791,19 @@ namespace MajDHTNetwork
         /// <param name="owner">The client whose reachability is checked.</param>
         /// <param name="transport">The transport to dial.</param>
         /// <param name="endpoint">The candidate endpoint.</param>
-        /// <param name="nonce">The relay-issued nonce.</param>
+        /// <param name="nonce">The nonce issued by the Traversal node.</param>
         /// <param name="index">The candidate port index.</param>
         /// <param name="cancellationToken">The dial-back lifetime.</param>
         /// <returns>Whether the client accepted the probe.</returns>
         /// <exception cref="OperationCanceledException">The dial-back expired or the node stopped.</exception>
-        private async Task<bool> SendProbeAsync(DHTPeer owner, DHTTransport transport, IPEndPoint endpoint, byte[] nonce, int index,
+        private async Task<bool> SendProbeAsync(DHTContact owner, DHTTransport transport, IPEndPoint endpoint, byte[] nonce, int index,
             CancellationToken cancellationToken)
         {
             try
             {
                 using var body = new Wire();
                 ProbeMessage.WriteRequest(body, nonce, index);
-                var probe = new Packet(LocalPeer, Crypto.Random(16), (byte)Operation.Probe, body.ToArray());
+                var probe = new Packet(LocalContact, Crypto.Random(16), (byte)Operation.Probe, body.ToArray());
                 var encoded = await _transport.ExchangeAtAsync(transport, endpoint, probe.Seal(_identity, owner), cancellationToken)
                     .ConfigureAwait(false);
                 using var response = AuthenticateResponse(encoded, owner, probe);
@@ -898,8 +865,8 @@ namespace MajDHTNetwork
             return work;
         }
 
-        /// <summary>Stores one relay-observed endpoint and its reporter.</summary>
-        private readonly struct ObservedEndpoint
+        /// <summary>Stores one endpoint observed for this node and its reporter.</summary>
+        private readonly struct EndpointObservation
         {
             /// <summary>Gets the observed endpoint of this node.</summary>
             internal IPEndPoint Endpoint { get; }
@@ -912,7 +879,7 @@ namespace MajDHTNetwork
             /// <param name="endpoint">The observed endpoint.</param>
             /// <param name="reporterAddress">The reporter's address.</param>
             /// <param name="observedAt">The observation time.</param>
-            internal ObservedEndpoint(IPEndPoint endpoint, IPAddress reporterAddress, DateTimeOffset observedAt)
+            internal EndpointObservation(IPEndPoint endpoint, IPAddress reporterAddress, DateTimeOffset observedAt)
             {
                 Endpoint = endpoint;
                 ReporterAddress = reporterAddress;
@@ -945,7 +912,7 @@ namespace MajDHTNetwork
             internal string HelperId { get; }
             /// <summary>Gets the transport being verified.</summary>
             internal DHTTransport Transport { get; }
-            /// <summary>Gets the relay-observed address being verified.</summary>
+            /// <summary>Gets the observed address being verified.</summary>
             internal IPAddress Address { get; }
             /// <summary>Gets the candidate ports.</summary>
             internal IReadOnlyList<int> Ports { get; }

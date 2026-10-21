@@ -4,7 +4,7 @@ using System.Collections.Generic;
 
 namespace MajDHTNetwork.Protocol
 {
-    /// <summary>Orders contacts by XOR distance to one target using their cached digests.</summary>
+    /// <summary>Orders peers by XOR distance to one target using their contacts' cached digests.</summary>
     public sealed class XorDistanceComparer : IComparer<DHTPeer>
     {
         /// <summary>The target digest reused for every comparison.</summary>

@@ -357,7 +357,7 @@ namespace MajDHTNetwork
             {
                 if (_contents.ContainsKey(ContentId(record)) && !providers.Exists(peer => peer.NodeId == NodeId))
                 {
-                    providers.Insert(0, _self!);
+                    providers.Insert(0, new DHTPeer(_self!, Array.Empty<DHTEndpoint>()));
                 }
             }
             if (providers.Count == 0)
@@ -383,20 +383,20 @@ namespace MajDHTNetwork
             return record;
         }
 
-        /// <summary>Downloads and authenticates one block directly or through a chosen relay.</summary>
+        /// <summary>Downloads and authenticates one block directly or through a chosen Forwarder.</summary>
         /// <param name="record">The trusted signed manifest.</param>
-        /// <param name="provider">The final content provider.</param>
+        /// <param name="provider">The final content provider at the endpoints observed for it.</param>
         /// <param name="index">The zero-based block index.</param>
-        /// <param name="relay">An optional relay; null permits direct access with automatic relay fallback.</param>
+        /// <param name="forwarder">An optional Forwarder; null permits direct access with automatic assisted fallback.</param>
         /// <param name="cancellationToken">Cancels transfer.</param>
         /// <returns>The raw block after exact length, position and Merkle authentication.</returns>
         /// <exception cref="InvalidOperationException">A remote transfer was requested with the local Download capability disabled.</exception>
         /// <exception cref="ArgumentException">The record is a withdrawal.</exception>
         /// <exception cref="ArgumentOutOfRangeException">The index is outside the signed file.</exception>
         /// <exception cref="InvalidDataException">The manifest or returned block is invalid.</exception>
-        /// <exception cref="IOException">The provider or relay is unavailable.</exception>
+        /// <exception cref="IOException">The provider or Forwarder is unavailable.</exception>
         /// <exception cref="OperationCanceledException">Transfer was cancelled.</exception>
-        public async Task<ReadOnlyMemory<byte>> ReadBlockAsync(DHTRecord record, DHTPeer provider, int index, DHTPeer? relay = null,
+        public async Task<ReadOnlyMemory<byte>> ReadBlockAsync(DHTRecord record, DHTPeer provider, int index, DHTPeer? forwarder = null,
             CancellationToken cancellationToken = default)
         {
             if (record == null || provider == null)
@@ -420,7 +420,7 @@ namespace MajDHTNetwork
                 RequireDownloader();
             }
             using var cancellation = OperationCancellation(cancellationToken);
-            using var block = await ReadBlockCoreAsync(record, provider, index, relay, cancellation.Token).ConfigureAwait(false);
+            using var block = await ReadBlockCoreAsync(record, provider, index, forwarder, cancellation.Token).ConfigureAwait(false);
             // A pooled frame never escapes as a public result: a remote block is copied before its frame is released.
             return block.Preserve();
         }
@@ -429,22 +429,22 @@ namespace MajDHTNetwork
         /// <param name="record">The validated signed manifest.</param>
         /// <param name="provider">The final content provider.</param>
         /// <param name="index">The validated block index.</param>
-        /// <param name="relay">An optional relay; null permits direct access with automatic relay fallback.</param>
+        /// <param name="forwarder">An optional Forwarder; null permits direct access with automatic assisted fallback.</param>
         /// <param name="cancellationToken">The transfer lifetime, already linked to the node lifetime.</param>
         /// <returns>
         /// The raw block after exact length, position and Merkle authentication: a stable store view for a local block, or a
         /// view inside the provider's response frame that the caller releases by disposing it.
         /// </returns>
-        private async Task<OwnedMemory> ReadBlockCoreAsync(DHTRecord record, DHTPeer provider, int index, DHTPeer? relay,
+        private async Task<OwnedMemory> ReadBlockCoreAsync(DHTRecord record, DHTPeer provider, int index, DHTPeer? forwarder,
             CancellationToken cancellationToken)
         {
-            if (provider.NodeId == NodeId && relay == null)
+            if (provider.NodeId == NodeId && forwarder == null)
             {
                 return new OwnedMemory((await ReadLocalBlockAsync(record, index, cancellationToken).ConfigureAwait(false)).Bytes);
             }
             using var body = new Wire();
             BlockMessage.WriteRequest(body, record, index);
-            var response = await RequestAsync(provider, Operation.Block, body.WrittenMemory, cancellationToken, relay).ConfigureAwait(false);
+            var response = await RequestAsync(provider, Operation.Block, body.WrittenMemory, cancellationToken, forwarder).ConfigureAwait(false);
             try
             {
                 using var reader = new Wire(response.Bytes);
@@ -551,7 +551,7 @@ namespace MajDHTNetwork
                         throw new IOException("The local Merkle metadata quota is full.");
                     }
                 }
-                CacheRecord(record, (_options.Capabilities & DHTCapabilities.Provide) == 0 ? null : _self);
+                CacheRecord(record, (_options.Capabilities & DHTCapabilities.Provide) == 0 ? null : new DHTPeer(_self!, Array.Empty<DHTEndpoint>()));
                 _contents[id] = new LocalContent(record, tree);
             }
         }
@@ -579,7 +579,7 @@ namespace MajDHTNetwork
         private async Task<int> AnnounceRecordAsync(DHTRecord record, CancellationToken cancellationToken)
         {
             RequireProvider();
-            CacheRecord(record, LocalPeer);
+            CacheRecord(record, new DHTPeer(LocalContact, Array.Empty<DHTEndpoint>()));
             var accepted = await ReplicateAsync(record, record.Key.RoutingId, record.FileHash, cancellationToken).ConfigureAwait(false);
             if (accepted == 0)
             {

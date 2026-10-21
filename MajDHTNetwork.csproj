@@ -18,7 +18,7 @@
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <PackageId>MajDHTNetwork</PackageId>
     <Authors>MajdataPlay contributors</Authors>
-    <Description>An authenticated DHT file distribution library with verified blocks, TCP/UDP NAT traversal, relay-assisted rendezvous and end-to-end encrypted relays.</Description>
+    <Description>An authenticated DHT file distribution library with verified blocks, observed peer endpoints, Traversal-coordinated TCP/UDP hole punching and end-to-end encrypted forwarding.</Description>
     <PackageTags>dht;p2p;file-distribution;encryption;netstandard</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageLicenseFile>LICENSE</PackageLicenseFile>

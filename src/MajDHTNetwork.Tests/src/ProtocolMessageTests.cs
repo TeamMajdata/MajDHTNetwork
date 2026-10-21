@@ -49,9 +49,9 @@ namespace MajDHTNetwork.Tests
             Assert.ThrowsAny<InvalidDataException>(() => ResponseStatus.ReadResult(trailing.WrittenMemory));
         }
 
-        /// <summary>Bounds contact lists by count and byte budget and verifies every contact when reading.</summary>
+        /// <summary>Bounds peer lists by count and byte budget and verifies every contact and endpoint list when reading.</summary>
         [Fact]
-        public void ContactListsRespectCountAndBudget()
+        public void PeerListsRespectCountAndBudget()
         {
             var peers = new List<DHTPeer>();
             for (var index = 0; index < 3; index++)
@@ -59,27 +59,37 @@ namespace MajDHTNetwork.Tests
                 peers.Add(DHTPeer.Create(new DHTIdentity(), IPAddress.Loopback, 1000 + index, 0, DHTCapabilities.Download));
             }
             using var full = new Wire();
-            ContactList.Write(full, peers);
+            PeerList.Write(full, peers);
             using var fullReader = new Wire(full.WrittenMemory);
-            var read = ContactList.Read(fullReader);
+            var read = PeerList.Read(fullReader);
             fullReader.End();
             Assert.Equal(3, read.Count);
             Assert.Equal(peers[2].NodeId, read[2].NodeId);
+            Assert.True(read[2].SameEndpoints(peers[2]), "The observed endpoints must round trip with their contact.");
             using var budgeted = new Wire();
-            ContactList.Write(budgeted, peers, 8 + peers[0].Encoded.Length);
+            PeerList.Write(budgeted, peers, 8 + peers[0].Contact.Encoded.Length + PeerList.MaxEndpointsLength);
             using var budgetedReader = new Wire(budgeted.WrittenMemory);
-            Assert.Single(ContactList.Read(budgetedReader));
+            Assert.Single(PeerList.Read(budgetedReader));
             using var oversized = new Wire();
-            oversized.PutLong(ContactList.MaxContacts + 1);
+            oversized.PutLong(PeerList.MaxPeers + 1);
             using var oversizedReader = new Wire(oversized.WrittenMemory);
-            Assert.ThrowsAny<InvalidDataException>(() => ContactList.Read(oversizedReader));
+            Assert.ThrowsAny<InvalidDataException>(() => PeerList.Read(oversizedReader));
             using var forged = new Wire();
             forged.PutLong(1);
-            var bytes = peers[0].Encoded.ToArray();
+            var bytes = peers[0].Contact.Encoded.ToArray();
             bytes[bytes.Length - 1] ^= 1;
             forged.Put(bytes);
+            forged.PutLong(0);
             using var forgedReader = new Wire(forged.WrittenMemory);
-            Assert.ThrowsAny<InvalidDataException>(() => ContactList.Read(forgedReader));
+            Assert.ThrowsAny<InvalidDataException>(() => PeerList.Read(forgedReader));
+            using var repeated = new Wire();
+            repeated.PutLong(1);
+            repeated.Put(peers[0].Contact.Encoded);
+            repeated.PutLong(2);
+            peers[0].Endpoints[0].Write(repeated);
+            peers[0].Endpoints[0].Write(repeated);
+            using var repeatedReader = new Wire(repeated.WrittenMemory);
+            Assert.ThrowsAny<InvalidDataException>(() => PeerList.Read(repeatedReader));
         }
 
         /// <summary>Round-trips every Find mode and result shape and rejects unknown modes.</summary>
@@ -109,7 +119,8 @@ namespace MajDHTNetwork.Tests
             using var responseReader = new Wire(response.WrittenMemory);
             var result = FindMessage.ReadResponse(responseReader);
             Assert.True(result.Record != null && result.Record.Key.Equals(record.Key), "The record must round trip.");
-            Assert.True(result.Peers.Count == 1 && result.Providers.Count == 1 && result.Peers[0].NodeId == peer.NodeId, "Contacts must round trip.");
+            Assert.True(result.Peers.Count == 1 && result.Providers.Count == 1 && result.Peers[0].NodeId == peer.NodeId
+                && result.Providers[0].SameEndpoints(peer), "Peers must round trip with their observed endpoints.");
             using var empty = new Wire();
             FindMessage.WriteResponse(empty, null, Array.Empty<DHTPeer>(), Array.Empty<DHTPeer>());
             using var emptyReader = new Wire(empty.WrittenMemory);
@@ -153,9 +164,9 @@ namespace MajDHTNetwork.Tests
             Assert.ThrowsAny<InvalidDataException>(() => BlockMessage.ReadResponse(tamperedReader, record, 2));
         }
 
-        /// <summary>Forwards only data requests addressed to the declared destination and round-trips opaque responses.</summary>
+        /// <summary>Relays and delivers only data requests addressed to the declared destination and round-trips sessions and opaque responses.</summary>
         [Fact]
-        public void RelayMessagesOnlyForwardDataRequests()
+        public void ForwardMessagesRelayOnlyDataRequests()
         {
             var sender = new DHTIdentity();
             var destination = new DHTIdentity();
@@ -164,24 +175,49 @@ namespace MajDHTNetwork.Tests
             var inner = new Packet(senderPeer, Crypto.Random(Packet.RequestIdLength), (byte)Operation.Ping, ReadOnlyMemory<byte>.Empty)
                 .Seal(sender, destinationPeer);
             using var request = new Wire();
-            RelayMessage.WriteRequest(request, destinationPeer.NodeId, inner);
+            ForwardMessage.WriteRelayRequest(request, destinationPeer.NodeId, inner);
             using var requestReader = new Wire(request.WrittenMemory);
-            var decoded = RelayMessage.ReadRequest(requestReader);
+            Assert.Equal(ForwardAction.Relay, ForwardMessage.ReadAction(requestReader));
+            var decoded = ForwardMessage.ReadRelayRequest(requestReader);
             Assert.True(decoded.DestinationId == destinationPeer.NodeId && BytesEqual(decoded.Envelope, inner), "A relay request must round trip.");
             using var misaddressed = new Wire();
-            RelayMessage.WriteRequest(misaddressed, senderPeer.NodeId, inner);
+            ForwardMessage.WriteRelayRequest(misaddressed, senderPeer.NodeId, inner);
             using var misaddressedReader = new Wire(misaddressed.WrittenMemory);
-            Assert.ThrowsAny<InvalidDataException>(() => RelayMessage.ReadRequest(misaddressedReader));
-            var nested = new Packet(senderPeer, Crypto.Random(Packet.RequestIdLength), (byte)Operation.Relay, ReadOnlyMemory<byte>.Empty)
+            ForwardMessage.ReadAction(misaddressedReader);
+            Assert.ThrowsAny<InvalidDataException>(() => ForwardMessage.ReadRelayRequest(misaddressedReader));
+            var nested = new Packet(senderPeer, Crypto.Random(Packet.RequestIdLength), (byte)Operation.Forward, ReadOnlyMemory<byte>.Empty)
                 .Seal(sender, destinationPeer);
             using var nestedRequest = new Wire();
-            RelayMessage.WriteRequest(nestedRequest, destinationPeer.NodeId, nested);
+            ForwardMessage.WriteRelayRequest(nestedRequest, destinationPeer.NodeId, nested);
             using var nestedReader = new Wire(nestedRequest.WrittenMemory);
-            Assert.ThrowsAny<InvalidDataException>(() => RelayMessage.ReadRequest(nestedReader));
+            ForwardMessage.ReadAction(nestedReader);
+            Assert.ThrowsAny<InvalidDataException>(() => ForwardMessage.ReadRelayRequest(nestedReader));
+            using var deliver = new Wire();
+            ForwardMessage.WriteDeliverRequest(deliver, inner);
+            using var deliverReader = new Wire(deliver.WrittenMemory);
+            Assert.Equal(ForwardAction.Deliver, ForwardMessage.ReadAction(deliverReader));
+            Assert.True(BytesEqual(ForwardMessage.ReadDeliverRequest(deliverReader, destinationPeer.NodeId), inner), "A delivery must round trip.");
+            using var misdelivered = new Wire(deliver.WrittenMemory);
+            ForwardMessage.ReadAction(misdelivered);
+            Assert.ThrowsAny<InvalidDataException>(() => ForwardMessage.ReadDeliverRequest(misdelivered, senderPeer.NodeId));
+            using var session = new Wire();
+            ForwardMessage.WriteSessionRequest(session);
+            using var sessionReader = new Wire(session.WrittenMemory);
+            Assert.Equal(ForwardAction.Session, ForwardMessage.ReadAction(sessionReader));
+            ForwardMessage.ReadSessionRequest(sessionReader);
+            var observed = new IPEndPoint(IPAddress.Parse("198.51.100.7"), 6000);
+            using var sessionResponse = new Wire();
+            ForwardMessage.WriteSessionResponse(sessionResponse, observed);
+            using var sessionResponseReader = new Wire(sessionResponse.WrittenMemory);
+            Assert.Equal(observed, ForwardMessage.ReadSessionResponse(sessionResponseReader));
+            using var unknown = new Wire();
+            unknown.PutByte(3);
+            using var unknownReader = new Wire(unknown.WrittenMemory);
+            Assert.ThrowsAny<InvalidDataException>(() => ForwardMessage.ReadAction(unknownReader));
             using var response = new Wire();
-            RelayMessage.WriteResponse(response, inner);
+            ForwardMessage.WriteEnvelopeResponse(response, inner);
             using var responseReader = new Wire(response.WrittenMemory);
-            Assert.True(BytesEqual(RelayMessage.ReadResponse(responseReader), inner), "An opaque response must round trip.");
+            Assert.True(BytesEqual(ForwardMessage.ReadEnvelopeResponse(responseReader), inner), "An opaque response must round trip.");
         }
 
         /// <summary>Round-trips the Hello result, Punch tickets and Probe arguments, rejecting wrong lengths.</summary>
@@ -210,80 +246,80 @@ namespace MajDHTNetwork.Tests
             var decoded = ProbeMessage.ReadRequest(probeReader);
             Assert.True(decoded.PortIndex == 2 && BytesEqual(decoded.Nonce, nonce), "A probe must round trip.");
             using var badIndex = new Wire();
-            ProbeMessage.WriteRequest(badIndex, nonce, RendezvousMessage.MaxProbePorts);
+            ProbeMessage.WriteRequest(badIndex, nonce, TraversalMessage.MaxProbePorts);
             using var badIndexReader = new Wire(badIndex.WrittenMemory);
             Assert.ThrowsAny<InvalidDataException>(() => ProbeMessage.ReadRequest(badIndexReader));
         }
 
-        /// <summary>Round-trips every Rendezvous action and result and enforces the action, port and nonce rules.</summary>
+        /// <summary>Round-trips every Traversal action and result and enforces the action, port and nonce rules.</summary>
         [Fact]
-        public void RendezvousMessagesRoundTrip()
+        public void TraversalMessagesRoundTrip()
         {
             var identity = new DHTIdentity();
             var peer = DHTPeer.Create(identity, IPAddress.Loopback, 5000, 5000, DHTCapabilities.Provide);
             var observed = new IPEndPoint(IPAddress.Parse("198.51.100.7"), 6000);
             var expiry = DateTimeOffset.FromUnixTimeMilliseconds(DateTimeOffset.UtcNow.AddSeconds(5).ToUnixTimeMilliseconds());
             using var register = new Wire();
-            RendezvousMessage.WriteRegisterRequest(register);
+            TraversalMessage.WriteRegisterRequest(register);
             using var registerReader = new Wire(register.WrittenMemory);
-            Assert.Equal(RendezvousAction.Register, RendezvousMessage.ReadAction(registerReader));
-            RendezvousMessage.ReadRegisterRequest(registerReader);
+            Assert.Equal(TraversalAction.Register, TraversalMessage.ReadAction(registerReader));
+            TraversalMessage.ReadRegisterRequest(registerReader);
             using var introduce = new Wire();
-            RendezvousMessage.WriteIntroduceRequest(introduce, peer.NodeId);
+            TraversalMessage.WriteIntroduceRequest(introduce, peer.NodeId);
             using var introduceReader = new Wire(introduce.WrittenMemory);
-            Assert.Equal(RendezvousAction.Introduce, RendezvousMessage.ReadAction(introduceReader));
-            Assert.Equal(peer.NodeId, RendezvousMessage.ReadIntroduceRequest(introduceReader));
+            Assert.Equal(TraversalAction.Introduce, TraversalMessage.ReadAction(introduceReader));
+            Assert.Equal(peer.NodeId, TraversalMessage.ReadIntroduceRequest(introduceReader));
             using var badTarget = new Wire();
-            RendezvousMessage.WriteIntroduceRequest(badTarget, "not-a-node-id");
+            TraversalMessage.WriteIntroduceRequest(badTarget, "not-a-node-id");
             using var badTargetReader = new Wire(badTarget.WrittenMemory);
-            RendezvousMessage.ReadAction(badTargetReader);
-            Assert.ThrowsAny<InvalidDataException>(() => RendezvousMessage.ReadIntroduceRequest(badTargetReader));
+            TraversalMessage.ReadAction(badTargetReader);
+            Assert.ThrowsAny<InvalidDataException>(() => TraversalMessage.ReadIntroduceRequest(badTargetReader));
             using var unknown = new Wire();
             unknown.PutByte(4);
             using var unknownReader = new Wire(unknown.WrittenMemory);
-            Assert.ThrowsAny<InvalidDataException>(() => RendezvousMessage.ReadAction(unknownReader));
-            var ticket = Crypto.Random(RendezvousMessage.TicketLength);
-            var introduction = new RendezvousIntroduction(peer, observed, ticket, expiry);
+            Assert.ThrowsAny<InvalidDataException>(() => TraversalMessage.ReadAction(unknownReader));
+            var ticket = Crypto.Random(TraversalMessage.TicketLength);
+            var introduction = new TraversalIntroduction(peer.Contact, observed, ticket, expiry);
             using var poll = new Wire();
-            RendezvousMessage.WritePollResponse(poll, observed, introduction);
+            TraversalMessage.WritePollResponse(poll, observed, introduction);
             using var pollReader = new Wire(poll.WrittenMemory);
-            var polled = RendezvousMessage.ReadPollResponse(pollReader);
+            var polled = TraversalMessage.ReadPollResponse(pollReader);
             Assert.True(polled.Observed.Equals(observed) && polled.Introduction.HasValue, "A poll with an introduction must round trip.");
             Assert.True(polled.Introduction!.Value.Peer.NodeId == peer.NodeId && BytesEqual(polled.Introduction.Value.Ticket, ticket)
                 && polled.Introduction.Value.ExpiresAt == expiry && polled.Introduction.Value.Endpoint.Equals(observed), "The introduction must round trip.");
             using var idle = new Wire();
-            RendezvousMessage.WritePollResponse(idle, observed, null);
+            TraversalMessage.WritePollResponse(idle, observed, null);
             using var idleReader = new Wire(idle.WrittenMemory);
-            Assert.False(RendezvousMessage.ReadPollResponse(idleReader).Introduction.HasValue, "An idle poll carries no introduction.");
+            Assert.False(TraversalMessage.ReadPollResponse(idleReader).Introduction.HasValue, "An idle poll carries no introduction.");
             using var introduced = new Wire();
-            RendezvousMessage.WriteIntroduction(introduced, introduction);
+            TraversalMessage.WriteIntroduction(introduced, introduction);
             using var introducedReader = new Wire(introduced.WrittenMemory);
-            Assert.Equal(peer.NodeId, RendezvousMessage.ReadIntroduceResponse(introducedReader).Peer.NodeId);
+            Assert.Equal(peer.NodeId, TraversalMessage.ReadIntroduceResponse(introducedReader).Peer.NodeId);
             using var dialBack = new Wire();
-            RendezvousMessage.WriteDialBackRequest(dialBack, new[] { 7000, 7001 });
+            TraversalMessage.WriteDialBackRequest(dialBack, new[] { 7000, 7001 });
             using var dialBackReader = new Wire(dialBack.WrittenMemory);
-            Assert.Equal(RendezvousAction.DialBack, RendezvousMessage.ReadAction(dialBackReader));
-            Assert.Equal(new[] { 7000, 7001 }, RendezvousMessage.ReadDialBackRequest(dialBackReader));
-            Assert.ThrowsAny<ArgumentException>(() => RendezvousMessage.WriteDialBackRequest(dialBack, new[] { 1, 2, 3 }));
-            var nonce = Crypto.Random(RendezvousMessage.NonceLength);
+            Assert.Equal(TraversalAction.DialBack, TraversalMessage.ReadAction(dialBackReader));
+            Assert.Equal(new[] { 7000, 7001 }, TraversalMessage.ReadDialBackRequest(dialBackReader));
+            Assert.ThrowsAny<ArgumentException>(() => TraversalMessage.WriteDialBackRequest(dialBack, new[] { 1, 2, 3 }));
+            var nonce = Crypto.Random(TraversalMessage.NonceLength);
             var ports = new List<int> { 6000, 7000 };
             using var assist = new Wire();
-            RendezvousMessage.WriteDialBackAssistRequest(assist, new DialBackDelegation(peer, DHTTransport.Udp, observed.Address, ports, nonce, expiry));
+            TraversalMessage.WriteDialBackAssistRequest(assist, new DialBackDelegation(peer.Contact, DHTTransport.Udp, observed.Address, ports, nonce, expiry));
             using var assistReader = new Wire(assist.WrittenMemory);
-            Assert.Equal(RendezvousAction.DialBackAssist, RendezvousMessage.ReadAction(assistReader));
-            var delegation = RendezvousMessage.ReadDialBackAssistRequest(assistReader);
+            Assert.Equal(TraversalAction.DialBackAssist, TraversalMessage.ReadAction(assistReader));
+            var delegation = TraversalMessage.ReadDialBackAssistRequest(assistReader);
             Assert.True(delegation.Owner.NodeId == peer.NodeId && delegation.Transport == DHTTransport.Udp && delegation.TargetAddress.Equals(observed.Address)
                 && delegation.ExpiresAt == expiry && BytesEqual(delegation.Nonce, nonce), "A delegation must round trip.");
             Assert.Equal(ports, new List<int>(delegation.Ports));
             using var arranged = new Wire();
-            RendezvousMessage.WriteDialBackResponse(arranged, new DialBackArrangement(observed, peer.NodeId, nonce, expiry, ports));
+            TraversalMessage.WriteDialBackResponse(arranged, new DialBackArrangement(observed, peer.NodeId, nonce, expiry, ports));
             using var arrangedReader = new Wire(arranged.WrittenMemory);
-            var arrangement = RendezvousMessage.ReadDialBackResponse(arrangedReader);
+            var arrangement = TraversalMessage.ReadDialBackResponse(arrangedReader);
             Assert.True(arrangement.HelperId == peer.NodeId && arrangement.Observed.Equals(observed) && BytesEqual(arrangement.Nonce, nonce)
                 && arrangement.ExpiresAt == expiry, "An arrangement must round trip.");
             Assert.Equal(ports, new List<int>(arrangement.Ports));
             Assert.ThrowsAny<ArgumentException>(() => new DialBackArrangement(observed, peer.NodeId, nonce, expiry, Array.Empty<int>()));
-            Assert.ThrowsAny<ArgumentException>(() => new RendezvousIntroduction(peer, observed, new byte[8], expiry));
+            Assert.ThrowsAny<ArgumentException>(() => new TraversalIntroduction(peer.Contact, observed, new byte[8], expiry));
         }
     }
 }

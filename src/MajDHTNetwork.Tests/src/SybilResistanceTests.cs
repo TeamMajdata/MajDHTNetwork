@@ -65,7 +65,7 @@ namespace MajDHTNetwork.Tests
             Assert.Equal(identity.NodeId, restored.NodeId);
             Assert.Equal(identity.IdentityWork, restored.IdentityWork);
             var contact = DHTPeer.Create(restored, IPAddress.Loopback, 1000, 0, DHTCapabilities.Download);
-            Assert.Equal(identity.IdentityWork, new DHTPeer(contact.Encoded.ToArray()).IdentityWork);
+            Assert.Equal(identity.IdentityWork, new DHTContact(contact.Contact.Encoded.ToArray()).IdentityWork);
             Assert.ThrowsAny<ArgumentOutOfRangeException>(() => DHTIdentity.Create(21, TestContext.Current.CancellationToken));
             Assert.ThrowsAny<ArgumentException>(() => new DHTNodeOptions { IdentityWorkBits = 21 }.Snapshot());
         }
@@ -82,7 +82,7 @@ namespace MajDHTNetwork.Tests
             // Distinct /48 networks inside one IPv6 /32 allocation still count as one operator network.
             var allocation = Observe(table, 6, index => "2001:db8:" + (index + 1).ToString("x") + "::1");
             var unverified = DHTPeer.Create(new DHTIdentity(), IPAddress.Parse("198.18.0.1"), 1000, 0, DHTCapabilities.Download);
-            table.Observe(unverified, null);
+            table.Observe(unverified.Contact, null);
             var routed = table.Closest(NodeHash(), 1000);
             Assert.InRange(CountIn(routed, sybils), 1, 3);
             Assert.Equal(3, CountIn(routed, others));
@@ -112,12 +112,12 @@ namespace MajDHTNetwork.Tests
         }
 
         /// <summary>
-        /// Admits a sender arriving from its advertised endpoint at once, but never admits senders that advertise someone
-        /// else's endpoint, and verifies such claims only a bounded number of times per source network.
+        /// Admits an inbound sender only after it answered a Ping at the source its request came from, and verifies senders
+        /// only a bounded number of times per source network, so one host cannot flood the table with minted identities.
         /// </summary>
         /// <returns>Completion after the admission and verification assertions.</returns>
         [Fact]
-        public async Task InboundSendersMustProveAnAdvertisedEndpoint()
+        public async Task InboundSendersAreVerifiedAtTheirObservedSource()
         {
             using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
             var token = deadline.Token;
@@ -126,19 +126,25 @@ namespace MajDHTNetwork.Tests
             await using var honest = new ScriptedPeer(IPAddress.Parse("127.0.0.6"), DHTCapabilities.Download, DHTReachability.Unknown);
             Assert.Equal(0, (await honest.SendAsync(node.LocalPeer, Operation.Ping, ReadOnlyMemory<byte>.Empty, token)).Status);
             await WaitUntilAsync(() => Contains(node.KnownPeers, honest.Peer.NodeId), token);
-            await using var victim = new FrameCounter(IPAddress.Parse("127.0.0.8"));
+            var admitted = node.KnownPeers[0];
+            Assert.True(admitted.WasObservedAt(DHTTransport.Tcp, honest.Endpoint), "The sender must be admitted at the source it sent from.");
+            // The forger mints identities; the verification pings sealed to them cannot be answered by its own identity.
             await using var forger = new ScriptedPeer(IPAddress.Parse("127.0.0.7"), DHTCapabilities.Download, DHTReachability.Unknown);
             var forged = new HashSet<string>();
             for (var index = 0; index < 20; index++)
             {
                 var identity = new DHTIdentity();
                 forged.Add(identity.NodeId);
-                Assert.Equal(0, (await forger.SendAsync(node.LocalPeer, Operation.Ping, ReadOnlyMemory<byte>.Empty, token, identity,
-                    victim.Endpoint)).Status);
+                Assert.Equal(0, (await forger.SendAsync(node.LocalPeer, Operation.Ping, ReadOnlyMemory<byte>.Empty, token, identity)).Status);
             }
             await Task.Delay(TimeSpan.FromSeconds(2), token);
             Assert.Equal(0, CountIn(node.KnownPeers, forged));
-            Assert.InRange(victim.Frames, 1, MajDHTNode.VerificationsPerNetwork);
+            var verifications = 0;
+            foreach (var identity in forged)
+            {
+                verifications += node.GetPeerStatistics(identity) == null ? 0 : 1;
+            }
+            Assert.InRange(verifications, 1, MajDHTNode.VerificationsPerNetwork);
         }
 
         /// <summary>Draws at most one dial-back helper per network, so one network cannot supply every helper.</summary>
@@ -148,18 +154,17 @@ namespace MajDHTNetwork.Tests
         {
             using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
             var token = deadline.Token;
-            var relayAddress = IPAddress.Loopback;
-            var relayOptions = Options(DHTTransport.Tcp, DHTCapabilities.Relay);
-            relayOptions.ListenAddresses = new List<IPAddress> { relayAddress };
-            relayOptions.AdvertisedAddresses = new List<IPAddress> { relayAddress };
+            var relayOptions = Options(DHTTransport.Tcp, DHTCapabilities.Traversal);
+            relayOptions.ListenAddresses = new List<IPAddress> { IPAddress.Loopback };
+            relayOptions.PubliclyReachable = true;
             await using var relay = new MajDHTNode(relayOptions);
             await relay.StartAsync(token);
-            await using var first = new ScriptedPeer(IPAddress.Parse("127.0.0.3"), DHTCapabilities.Relay);
-            await using var second = new ScriptedPeer(IPAddress.Parse("127.0.0.3"), DHTCapabilities.Relay);
-            await using var third = new ScriptedPeer(IPAddress.Parse("127.0.0.4"), DHTCapabilities.Relay);
+            await using var first = new ScriptedPeer(IPAddress.Parse("127.0.0.3"), DHTCapabilities.Traversal);
+            await using var second = new ScriptedPeer(IPAddress.Parse("127.0.0.3"), DHTCapabilities.Traversal);
+            await using var third = new ScriptedPeer(IPAddress.Parse("127.0.0.4"), DHTCapabilities.Traversal);
             foreach (var helper in new[] { first, second, third })
             {
-                helper.Script((packet, source) => packet.Kind == (byte)Operation.Rendezvous ? ((byte)1, Array.Empty<byte>()) : ((byte)0, Array.Empty<byte>()));
+                helper.Script((packet, source) => packet.Kind == (byte)Operation.Traversal ? ((byte)1, Array.Empty<byte>()) : ((byte)0, Array.Empty<byte>()));
                 Assert.Equal(0, (await helper.SendAsync(relay.LocalPeer, Operation.Ping, ReadOnlyMemory<byte>.Empty, token)).Status);
             }
             await WaitUntilAsync(() => relay.KnownPeers.Count >= 3, token);
@@ -167,10 +172,10 @@ namespace MajDHTNetwork.Tests
             var request = new byte[] { 2, 0, 0, 0, 0, 0, 0, 0, 0 };
             for (var attempt = 0; attempt < 3; attempt++)
             {
-                Assert.Equal(1, (await requester.SendAsync(relay.LocalPeer, Operation.Rendezvous, request, token)).Status);
+                Assert.Equal(1, (await requester.SendAsync(relay.LocalPeer, Operation.Traversal, request, token)).Status);
             }
-            Assert.Equal(3, first.Received(Operation.Rendezvous) + second.Received(Operation.Rendezvous));
-            Assert.Equal(3, third.Received(Operation.Rendezvous));
+            Assert.Equal(3, first.Received(Operation.Traversal) + second.Received(Operation.Traversal));
+            Assert.Equal(3, third.Received(Operation.Traversal));
         }
 
         /// <summary>
@@ -223,8 +228,8 @@ namespace MajDHTNetwork.Tests
             }
         }
 
-        /// <summary>Encodes a Find result without a record, with the given nearest contacts and no providers.</summary>
-        /// <param name="peers">The referral contacts.</param>
+        /// <summary>Encodes a Find result without a record, with the given nearest peers and no providers.</summary>
+        /// <param name="peers">The referred peers at the endpoints the referrer claims for them.</param>
         /// <returns>The result body.</returns>
         private static byte[] FindReply(IReadOnlyList<DHTPeer> peers)
         {
@@ -233,7 +238,7 @@ namespace MajDHTNetwork.Tests
             body.PutLong(peers.Count);
             foreach (var peer in peers)
             {
-                body.Put(peer.Encoded);
+                peer.Write(body);
             }
             body.PutLong(0);
             return body.ToArray();
@@ -291,19 +296,18 @@ namespace MajDHTNetwork.Tests
             return port;
         }
 
-        /// <summary>Observes generated contacts with verified addresses.</summary>
+        /// <summary>Observes generated contacts at observed endpoints.</summary>
         /// <param name="table">The routing table.</param>
         /// <param name="count">The number of contacts.</param>
-        /// <param name="address">Selects the verified address of each contact.</param>
+        /// <param name="address">Selects the observed address of each contact.</param>
         /// <returns>The generated node identifiers.</returns>
         private static HashSet<string> Observe(IDHTRoutingTable table, int count, Func<int, string> address)
         {
             var result = new HashSet<string>();
             for (var index = 0; index < count; index++)
             {
-                var ip = IPAddress.Parse(address(index));
-                var peer = DHTPeer.Create(new DHTIdentity(), ip, 1000, 0, DHTCapabilities.Download);
-                table.Observe(peer, ip);
+                var peer = DHTPeer.Create(new DHTIdentity(), IPAddress.Parse(address(index)), 1000, 0, DHTCapabilities.Download);
+                table.Observe(peer.Contact, peer.Endpoints[0]);
                 result.Add(peer.NodeId);
             }
             return result;
@@ -369,11 +373,11 @@ namespace MajDHTNetwork.Tests
             }
 
             /// <inheritdoc />
-            public void Observe(DHTPeer peer, IPAddress? verifiedAddress)
+            public void Observe(DHTContact contact, DHTEndpoint? observed)
             {
-                if (_allowed.Contains(peer.NodeId))
+                if (_allowed.Contains(contact.NodeId))
                 {
-                    _inner.Observe(peer, verifiedAddress);
+                    _inner.Observe(contact, observed);
                 }
             }
 
@@ -386,89 +390,6 @@ namespace MajDHTNetwork.Tests
             public IReadOnlyList<DHTPeer> Closest(string routingId, int count)
             {
                 return _inner.Closest(routingId, count);
-            }
-        }
-
-        /// <summary>A TCP listener that counts complete length-prefixed frames without answering them.</summary>
-        private sealed class FrameCounter : IAsyncDisposable
-        {
-            /// <summary>The listener.</summary>
-            private readonly TcpListener _listener;
-            /// <summary>The accept loop.</summary>
-            private readonly Task _loop;
-            /// <summary>Stops the accepted connections.</summary>
-            private readonly CancellationTokenSource _stop = new CancellationTokenSource();
-            /// <summary>The number of frames received.</summary>
-            private int _frames;
-
-            /// <summary>Gets the listening endpoint.</summary>
-            internal IPEndPoint Endpoint { get; }
-            /// <summary>Gets the number of frames received.</summary>
-            internal int Frames => Volatile.Read(ref _frames);
-
-            /// <summary>Starts counting.</summary>
-            /// <param name="address">The listener address.</param>
-            internal FrameCounter(IPAddress address)
-            {
-                _listener = new TcpListener(address, 0);
-                _listener.Start();
-                Endpoint = (IPEndPoint)_listener.LocalEndpoint;
-                _loop = AcceptAsync();
-            }
-
-            /// <summary>Accepts connections until disposal.</summary>
-            /// <returns>Completion after the listener stops.</returns>
-            private async Task AcceptAsync()
-            {
-                var readers = new List<Task>();
-                try
-                {
-                    while (!_stop.IsCancellationRequested)
-                    {
-                        var client = await _listener.AcceptTcpClientAsync();
-                        readers.Add(ReadAsync(client));
-                    }
-                }
-                catch (Exception exception) when (exception is SocketException || exception is ObjectDisposedException)
-                {
-                }
-                await Task.WhenAll(readers);
-            }
-
-            /// <summary>Counts the frames of one connection.</summary>
-            /// <param name="client">The accepted connection.</param>
-            /// <returns>Completion after the connection closes.</returns>
-            private async Task ReadAsync(TcpClient client)
-            {
-                using (client)
-                {
-                    try
-                    {
-                        var stream = client.GetStream();
-                        var prefix = new byte[4];
-                        while (true)
-                        {
-                            await stream.ReadExactlyAsync(prefix, _stop.Token);
-                            var length = (prefix[0] << 24) | (prefix[1] << 16) | (prefix[2] << 8) | prefix[3];
-                            await stream.ReadExactlyAsync(new byte[length], _stop.Token);
-                            Interlocked.Increment(ref _frames);
-                        }
-                    }
-                    catch (Exception exception) when (exception is IOException || exception is OperationCanceledException
-                        || exception is ObjectDisposedException)
-                    {
-                    }
-                }
-            }
-
-            /// <summary>Stops the listener and every reader.</summary>
-            /// <returns>Completion after shutdown.</returns>
-            public async ValueTask DisposeAsync()
-            {
-                _stop.Cancel();
-                _listener.Stop();
-                await _loop;
-                _stop.Dispose();
             }
         }
     }

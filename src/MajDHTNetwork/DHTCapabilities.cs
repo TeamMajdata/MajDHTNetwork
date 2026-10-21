@@ -12,8 +12,16 @@ namespace MajDHTNetwork
         Download = 1,
         /// <summary>Serves locally available content blocks.</summary>
         Provide = 2,
-        /// <summary>Forwards encrypted requests to known peers.</summary>
-        Relay = 4
+        /// <summary>
+        /// Coordinates direct connections: observes the endpoints of registered peers, introduces two peers to each other for
+        /// TCP or UDP hole punching and arranges or performs the dial-backs that probe direct reachability.
+        /// </summary>
+        Traversal = 4,
+        /// <summary>
+        /// Relays encrypted envelopes between two peers: hosts forwarding sessions, addresses their destinations by observed
+        /// endpoint and forwards traffic, so two peers that cannot connect directly still communicate.
+        /// </summary>
+        Forwarder = 8
     }
 
     /// <summary>Identifies the preferred transport for outgoing requests.</summary>
@@ -28,26 +36,11 @@ namespace MajDHTNetwork
     /// <summary>Describes how other nodes can reach a signed contact.</summary>
     public enum DHTReachability
     {
-        /// <summary>Reachability has not been established; advertised endpoints are tried before relay hints.</summary>
+        /// <summary>Reachability has not been established; the observed endpoints are tried before the hinted forwarders.</summary>
         Unknown = 0,
-        /// <summary>At least one advertised endpoint was configured or verified by an independent dial-back.</summary>
+        /// <summary>The node accepts unsolicited packets at its observed endpoint, verified by an independent dial-back or configured.</summary>
         Public = 1,
-        /// <summary>The node is behind a NAT or firewall and is reached through its relay hints.</summary>
+        /// <summary>The node is behind a NAT or firewall and is reached through the forwarders in its hints.</summary>
         Private = 2
     }
-
-    /// <summary>Describes the provenance and scope of one advertised contact endpoint.</summary>
-    [Flags]
-    public enum DHTEndpointFlags
-    {
-        /// <summary>The endpoint is an unverified listener address.</summary>
-        None = 0,
-        /// <summary>An independent node reached this endpoint during the current external-address epoch.</summary>
-        Verified = 1,
-        /// <summary>The endpoint is only reachable inside the owner's local network.</summary>
-        Local = 2,
-        /// <summary>The endpoint was configured by the application, for example after a router port mapping.</summary>
-        Configured = 4
-    }
-
 }

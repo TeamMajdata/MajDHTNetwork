@@ -3,6 +3,8 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Net;
+using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 using MajDHTNetwork.Protocol;
@@ -12,7 +14,7 @@ using MajDHTNetwork.Transport;
 
 namespace MajDHTNetwork
 {
-    /// <summary>Runs an authenticated DHT participant, content provider and optional opaque relay.</summary>
+    /// <summary>Runs an authenticated DHT participant, content provider and optional Traversal node or Forwarder.</summary>
     public sealed partial class MajDHTNode : IDisposable, IAsyncDisposable
     {
         /// <summary>The validated immutable configuration snapshot.</summary>
@@ -63,7 +65,7 @@ namespace MajDHTNetwork
         /// <summary>The owned socket listeners and exchange implementation.</summary>
         private readonly SocketTransport _transport;
         /// <summary>The current signed contact, refreshed during maintenance.</summary>
-        private DHTPeer? _self;
+        private DHTContact? _self;
         /// <summary>The maintenance loop task.</summary>
         private Task _maintenance = Task.CompletedTask;
         /// <summary>The initial background bootstrap through the configured endpoints.</summary>
@@ -77,9 +79,9 @@ namespace MajDHTNetwork
 
         /// <summary>Gets the node's stable public identity fingerprint.</summary>
         public string NodeId => _identity.NodeId;
-        /// <summary>Gets the currently signed bootstrap contact after startup.</summary>
+        /// <summary>Gets the currently signed local contact after startup.</summary>
         /// <exception cref="InvalidOperationException">The node is not running.</exception>
-        public DHTPeer LocalPeer
+        public DHTContact LocalContact
         {
             get
             {
@@ -90,8 +92,44 @@ namespace MajDHTNetwork
                 }
             }
         }
-        /// <summary>Gets a snapshot of all known live peers.</summary>
+        /// <summary>
+        /// Gets the currently signed local contact paired with the endpoints this node listens on, for handing to another node
+        /// out of band, such as a bootstrap contact passed between processes on one host. Remote nodes learn this node's
+        /// endpoints by observing its packets, never from the contact; a wildcard listener is paired with its loopback address.
+        /// </summary>
+        /// <exception cref="InvalidOperationException">The node is not running.</exception>
+        public DHTPeer LocalPeer
+        {
+            get
+            {
+                EnsureRunning();
+                lock (_gate)
+                {
+                    return new DHTPeer(_self!, ListenerEndpoints());
+                }
+            }
+        }
+        /// <summary>Gets a snapshot of all known live peers, each at the endpoints this node observed for it.</summary>
         public IReadOnlyList<DHTPeer> KnownPeers => RoutedPeers(NodeId, 4096).AsReadOnly();
+        /// <summary>
+        /// Gets copies of the external addresses of this node, at most one per address family, as confirmed by Traversal nodes,
+        /// Forwarders and Hello responders in at least two distinct networks; empty until confirmed.
+        /// </summary>
+        public IReadOnlyList<IPAddress> ExternalAddresses
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    var result = new List<IPAddress>(_externalAddresses.Count);
+                    foreach (var address in _externalAddresses.Values)
+                    {
+                        result.Add(NetworkScope.CopyAddress(address));
+                    }
+                    return result.AsReadOnly();
+                }
+            }
+        }
 
         /// <summary>Constructs an unstarted node without performing filesystem access.</summary>
         /// <param name="options">Listener, resource and protocol limits, or defaults.</param>
@@ -150,7 +188,7 @@ namespace MajDHTNetwork
                 _transport.Bind();
                 lock (_gate)
                 {
-                    RefreshLocalPeerLocked();
+                    RefreshLocalContactLocked();
                     _started = true;
                 }
                 _transport.Run();
@@ -199,7 +237,7 @@ namespace MajDHTNetwork
                 await _transport.DisposeAsync().ConfigureAwait(false);
                 await _maintenance.ConfigureAwait(false);
                 await _bootstrap.ConfigureAwait(false);
-                await DrainNatAsync().ConfigureAwait(false);
+                await DrainAssistanceAsync().ConfigureAwait(false);
                 Log(LogLevel.Information, "Node stopped.");
             }
             finally
@@ -232,6 +270,27 @@ namespace MajDHTNetwork
                     throw new InvalidOperationException("The node is not running.");
                 }
             }
+        }
+
+        /// <summary>Lists the endpoints this node listens on, pairing a wildcard listener with its loopback address.</summary>
+        /// <returns>At most one endpoint per listener address family with the bound TCP and UDP ports.</returns>
+        private List<DHTEndpoint> ListenerEndpoints()
+        {
+            var result = new List<DHTEndpoint>();
+            foreach (var address in _options.ListenAddresses)
+            {
+                var tcp = _transport.TcpPortFor(address.AddressFamily);
+                var udp = _transport.UdpPortFor(address.AddressFamily);
+                if (tcp == 0 && udp == 0)
+                {
+                    continue;
+                }
+                var local = NetworkScope.IsWildcard(address)
+                    ? address.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Loopback : IPAddress.Loopback
+                    : address;
+                result.Add(new DHTEndpoint(local, tcp, udp));
+            }
+            return result;
         }
 
         /// <summary>Links an operation to explicit cancellation and the node lifetime.</summary>

@@ -14,7 +14,7 @@ using static MajDHTNetwork.Tests.TestSupport;
 
 namespace MajDHTNetwork.Tests
 {
-    /// <summary>Exercises real TCP-only and UDP-only discovery, aliases, verified transfers and opaque relays.</summary>
+    /// <summary>Exercises real TCP-only and UDP-only discovery, aliases, verified transfers and forwarding through a Forwarder.</summary>
     public sealed class NetworkTests
     {
         /// <summary>Discovers the genuine provider and preserves exact multi-block content through an alias.</summary>
@@ -40,7 +40,7 @@ namespace MajDHTNetwork.Tests
             var found = await downloader.ResolveAsync(alias.Key, token);
             Assert.True(found != null && found.FileHash == record.FileHash, "An indirect join must resolve a replicated alias.");
             var providers = await downloader.FindProvidersAsync(record.FileHash, token);
-            Assert.True(providers.Count == 1 && providers[0].NodeId == provider.NodeId, "The relay must not claim content it does not hold.");
+            Assert.True(providers.Count == 1 && providers[0].NodeId == provider.NodeId, "The Forwarder must not claim content it does not hold.");
             using var destination = new MemoryStream();
             await downloader.DownloadAsync(alias.Key, destination, record.FileHash, token);
             Assert.True(BytesEqual(input, destination.ToArray()), "Multi-block network download must match exact file bytes.");
@@ -50,13 +50,13 @@ namespace MajDHTNetwork.Tests
             Assert.True((await downloader.FindNodesAsync(Crypto.Hex(Crypto.Random(32)), token)).Count >= 1, "XOR lookup must return reachable contacts.");
         }
 
-        /// <summary>Reads through an explicit relay and recovers an unreachable direct contact through the relay.</summary>
+        /// <summary>Reads through an explicit Forwarder and recovers a provider with a stale observed endpoint through the Forwarder.</summary>
         /// <param name="transport">The only transport enabled on all three nodes.</param>
         /// <returns>Completion after the regression assertions and node cleanup.</returns>
         [Theory]
         [InlineData(DHTTransport.Tcp)]
         [InlineData(DHTTransport.Udp)]
-        public async Task ExplicitAndAutomaticRelaysAuthenticateBlocks(DHTTransport transport)
+        public async Task ExplicitAndAutomaticForwardersAuthenticateBlocks(DHTTransport transport)
         {
             using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(90));
             var token = deadline.Token;
@@ -69,12 +69,13 @@ namespace MajDHTNetwork.Tests
             var record = network.Record;
             var alias = network.Alias;
             var providers = await downloader.FindProvidersAsync(record.FileHash, token);
-            Assert.True(providers.Count == 1 && providers[0].NodeId == provider.NodeId, "The relay must not claim content it does not hold.");
-            var relayed = await downloader.ReadBlockAsync(record, provider.LocalPeer, 1, bootstrap.LocalPeer, token);
-            Assert.True(BytesEqual(relayed, input.AsSpan(16384, 16384).ToArray()), "Explicit relay must preserve end-to-end authenticated blocks.");
+            Assert.True(providers.Count == 1 && providers[0].NodeId == provider.NodeId, "The Forwarder must not claim content it does not hold.");
+            var forwarded = await downloader.ReadBlockAsync(record, provider.LocalPeer, 1, bootstrap.LocalPeer, token);
+            Assert.True(BytesEqual(forwarded, input.AsSpan(16384, 16384).ToArray()), "An explicit Forwarder must preserve end-to-end authenticated blocks.");
+            // A stale observation: the provider is known at a port where nothing listens, so only the routed Forwarder can reach it.
             var unreachable = DHTPeer.Create(providerIdentity, IPAddress.Loopback, 1, 0, DHTCapabilities.Provide);
             var recovered = await downloader.ReadBlockAsync(record, unreachable, 0, cancellationToken: token);
-            Assert.True(BytesEqual(recovered, input.AsSpan(0, 16384).ToArray()), "Automatic relay must recover a failed direct path.");
+            Assert.True(BytesEqual(recovered, input.AsSpan(0, 16384).ToArray()), "Automatic forwarding must recover a failed direct path.");
         }
 
         /// <summary>Rejects rollback announcements and conflicting revisions after a newer signed binding is observed.</summary>

@@ -118,9 +118,9 @@ namespace MajDHTNetwork.Tests
             Assert.ThrowsAny<ArgumentException>(() => provider.StopProviding("not-a-hash"));
         }
 
-        /// <summary>Counts the provider contacts of a Find result.</summary>
+        /// <summary>Counts the providers of a Find result.</summary>
         /// <param name="result">The Find result body.</param>
-        /// <returns>The number of provider contacts.</returns>
+        /// <returns>The number of providers.</returns>
         private static long ProviderCount(ReadOnlyMemory<byte> result)
         {
             using var reader = new Wire(result);
@@ -128,7 +128,7 @@ namespace MajDHTNetwork.Tests
             var nearest = reader.Long();
             for (var index = 0; index < nearest; index++)
             {
-                reader.Bytes(DHTPeer.MaxEncodedLength);
+                DHTPeer.Read(reader);
             }
             return reader.Long();
         }

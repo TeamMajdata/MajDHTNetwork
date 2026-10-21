@@ -7,7 +7,7 @@ namespace MajDHTNetwork.Protocol
 {
     /// <summary>
     /// Encodes an endpoint that a node observed as the socket source of an authenticated request: a canonical address string
-    /// followed by an integer port. Hello and Rendezvous responses report observed endpoints.
+    /// followed by an integer port. Hello, Traversal and Forward session responses report observed endpoints.
     /// </summary>
     public static class ObservedEndpoint
     {

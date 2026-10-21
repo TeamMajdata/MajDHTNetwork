@@ -8,93 +8,93 @@ using MajDHTNetwork.Protocol;
 namespace MajDHTNetwork
 {
     /// <summary>
-    /// The default route selection: verified or configured endpoints first, then unverified and local endpoints; the
-    /// destination's relay hints before other routed relays. Within each tier, routes and relays with a lower measured
+    /// The default route selection: the destination's observed endpoints, most recently observed first, then the destination's
+    /// hints before other routed Traversal and Forwarder nodes. Within each tier, routes and assistants with a lower measured
     /// packet loss rate come first, and equal rates keep their natural order.
     /// </summary>
     public sealed class DefaultDHTRouteSelector : IDHTRouteSelector
     {
         /// <summary>
-        /// Orders configured or verified endpoints, then unverified endpoints, then local endpoints. Within each tier the
-        /// routes with the lowest measured loss come first; untried routes count as lossless, and equal rates keep the
-        /// preferred transport before the alternate transport. A private destination's local endpoints are only selected
-        /// when both nodes share an external address.
+        /// Lists the destination's observed endpoints, most recently observed first, each with the preferred and then the
+        /// alternate transport; routes with the lowest measured loss come first and untried routes count as lossless. A private
+        /// destination has no direct routes: its observed endpoints are NAT mappings that failed an independent dial-back.
         /// </summary>
-        /// <param name="destination">The signed destination contact.</param>
+        /// <param name="destination">The destination at its observed endpoints.</param>
         /// <param name="context">The local node's routing state and loss statistics.</param>
         /// <returns>The direct attempts in order.</returns>
         public IReadOnlyList<DHTDirectRoute> SelectDirectRoutes(DHTPeer destination, DHTRouteContext context)
         {
-            var result = new List<DHTDirectRoute>();
-            var sameNetwork = context.SharesExternalAddress(destination);
-            for (var pass = 0; pass < 3; pass++)
+            var routes = new List<DHTDirectRoute>();
+            if (destination.Reachability == DHTReachability.Private)
             {
-                var tier = new List<DHTDirectRoute>();
-                foreach (var endpoint in destination.Endpoints)
-                {
-                    var local = (endpoint.Flags & DHTEndpointFlags.Local) != 0;
-                    var rank = endpoint.IsReachable ? 0 : local ? 2 : 1;
-                    if (rank != pass || (local && destination.Reachability == DHTReachability.Private && !sameNetwork))
-                    {
-                        continue;
-                    }
-                    AddDirectRoute(tier, endpoint, context.PreferredTransport);
-                    AddDirectRoute(tier, endpoint, context.AlternateTransport);
-                }
-                result.AddRange(OrderByLoss(tier, route => context.PacketLossRate(destination.NodeId, route)));
+                return routes;
             }
-            return result;
+            for (var index = destination.Endpoints.Count - 1; index >= 0; index--)
+            {
+                AddDirectRoute(routes, destination.Endpoints[index], context.PreferredTransport);
+                AddDirectRoute(routes, destination.Endpoints[index], context.AlternateTransport);
+            }
+            return OrderByLoss(routes, route => context.PacketLossRate(destination.NodeId, route));
         }
 
         /// <summary>
-        /// Lists the destination's relay hints, then at most <see cref="DHTRouteContext.MaxRelayAttempts"/> relays drawn from the
-        /// nearest twice that many routed relays in random order,
-        /// each group ordered by the relays' measured packet loss. Punching is requested unless the destination reported an
-        /// endpoint-dependent mapping, and through a hinted relay only when this node is already registered with it.
+        /// Lists the destination's hints, then at most <see cref="DHTRouteContext.MaxAssistedAttempts"/> assistants drawn from
+        /// the nearest twice that many routed assistants in random order, each group ordered by the assistants' measured packet
+        /// loss. Punching is requested from Traversal nodes unless the destination reported an endpoint-dependent mapping, and
+        /// through a hinted Traversal node only when this node is already registered with it.
         /// </summary>
-        /// <param name="destination">The signed destination contact, including its relay hints.</param>
-        /// <param name="knownRelays">Routed relay-capable contacts, nearest to the destination first.</param>
+        /// <param name="destination">The destination, whose contact carries its hints.</param>
+        /// <param name="knownAssistants">Routed Traversal or Forwarder nodes, nearest to the destination first.</param>
         /// <param name="context">The local node's routing state and loss statistics.</param>
-        /// <returns>The relay attempts in order.</returns>
-        public IReadOnlyList<DHTRelayRoute> SelectRelayRoutes(DHTPeer destination, IReadOnlyList<DHTPeer> knownRelays, DHTRouteContext context)
+        /// <returns>The assisted attempts in order.</returns>
+        public IReadOnlyList<DHTAssistedRoute> SelectAssistedRoutes(DHTPeer destination, IReadOnlyList<DHTPeer> knownAssistants, DHTRouteContext context)
         {
-            var result = new List<DHTRelayRoute>();
-            var selected = new HashSet<string>();
+            var result = new List<DHTAssistedRoute>();
+            var selected = new HashSet<string>(StringComparer.Ordinal);
             var punchable = context.NatTraversalEnabled && !destination.HasEndpointDependentMapping;
             var hints = new List<DHTPeer>();
-            foreach (var hint in destination.RelayHints)
+            foreach (var hint in destination.Hints)
             {
                 if (selected.Add(hint.NodeId))
                 {
                     hints.Add(hint);
                 }
             }
-            foreach (var hint in OrderByLoss(hints, relay => context.PacketLossRate(relay.NodeId)))
+            foreach (var hint in OrderByLoss(hints, assistant => context.PacketLossRate(assistant.NodeId)))
             {
-                // Registering with a hinted relay only to punch would consume a relay slot, so forward instead.
-                result.Add(new DHTRelayRoute(hint, punchable && context.IsRegisteredWith(hint.NodeId)));
+                // Registering with a hinted Traversal node only to punch would consume a registration slot, so forward instead.
+                result.Add(new DHTAssistedRoute(hint, punchable && IsTraversal(hint) && context.IsRegisteredWith(hint.NodeId)));
             }
             var routed = new List<DHTPeer>();
-            foreach (var relay in knownRelays)
+            foreach (var assistant in knownAssistants)
             {
-                if (routed.Count >= context.MaxRelayAttempts * 2)
+                if (routed.Count >= context.MaxAssistedAttempts * 2)
                 {
                     break;
                 }
-                if (relay.NodeId != destination.NodeId && (relay.Capabilities & DHTCapabilities.Relay) != 0 && selected.Add(relay.NodeId))
+                if (assistant.NodeId != destination.NodeId
+                    && (assistant.Capabilities & (DHTCapabilities.Traversal | DHTCapabilities.Forwarder)) != 0 && selected.Add(assistant.NodeId))
                 {
-                    routed.Add(relay);
+                    routed.Add(assistant);
                 }
             }
             // Shuffling the nearest candidates before the stable loss ordering randomizes ties, so identities minted near a
-            // destination cannot predictably capture its relay traffic.
+            // destination cannot predictably capture its assisted traffic.
             Crypto.Shuffle(routed);
-            var ordered = OrderByLoss(routed, relay => context.PacketLossRate(relay.NodeId));
-            for (var index = 0; index < ordered.Count && index < context.MaxRelayAttempts; index++)
+            var ordered = OrderByLoss(routed, assistant => context.PacketLossRate(assistant.NodeId));
+            for (var index = 0; index < ordered.Count && index < context.MaxAssistedAttempts; index++)
             {
-                result.Add(new DHTRelayRoute(ordered[index], punchable));
+                result.Add(new DHTAssistedRoute(ordered[index], punchable && IsTraversal(ordered[index])));
             }
             return result;
+        }
+
+        /// <summary>Checks whether a peer coordinates hole punching.</summary>
+        /// <param name="peer">The peer.</param>
+        /// <returns>Whether it advertises the Traversal capability.</returns>
+        private static bool IsTraversal(DHTPeer peer)
+        {
+            return (peer.Capabilities & DHTCapabilities.Traversal) != 0;
         }
 
         /// <summary>Stably orders items by ascending loss rate, so equal rates keep their original order.</summary>
@@ -118,9 +118,9 @@ namespace MajDHTNetwork
             return result;
         }
 
-        /// <summary>Adds the direct attempt for one transport when the endpoint accepts it.</summary>
+        /// <summary>Adds the direct attempt for one transport when the node was observed over it at the endpoint.</summary>
         /// <param name="routes">The routes under construction.</param>
-        /// <param name="endpoint">The advertised endpoint.</param>
+        /// <param name="endpoint">The observed endpoint.</param>
         /// <param name="transport">The transport.</param>
         private static void AddDirectRoute(List<DHTDirectRoute> routes, DHTEndpoint endpoint, DHTTransport transport)
         {

@@ -28,11 +28,11 @@ namespace MajDHTNetwork
         /// </summary>
         public IList<IPAddress> ListenAddresses { get; set; } = new List<IPAddress> { IPAddress.Loopback };
         /// <summary>
-        /// Gets or sets up to four directly reachable addresses, such as a fixed public address or a router port mapping.
-        /// Each address must match a listener's address family and is advertised as configured and public.
-        /// When empty, specific (non-wildcard) listen addresses are advertised and reachability is discovered automatically.
+        /// Gets or sets whether the application knows that the listeners accept unsolicited packets from other networks, for
+        /// example on a fixed public address or behind a router port mapping. The contact then advertises Public reachability
+        /// at once and the node skips its own dial-back checks; otherwise reachability is discovered automatically.
         /// </summary>
-        public IList<IPAddress> AdvertisedAddresses { get; set; } = new List<IPAddress>();
+        public bool PubliclyReachable { get; set; }
         /// <summary>Gets or sets up to sixteen endpoints of existing nodes contacted to join the network.</summary>
         public IList<IPEndPoint> BootstrapEndpoints { get; set; } = new List<IPEndPoint>();
         /// <summary>Gets or sets the TCP port, zero for an assigned port, or null to disable the TCP listener.</summary>
@@ -82,20 +82,31 @@ namespace MajDHTNetwork
         public TimeSpan RecordLifetime { get; set; } = TimeSpan.FromHours(24);
         /// <summary>Gets or sets the interval for peer refresh, expiry cleanup and local record reannouncement.</summary>
         public TimeSpan MaintenanceInterval { get; set; } = TimeSpan.FromMinutes(5);
-        /// <summary>Gets or sets whether this client registers with relays, checks its reachability and attempts assisted direct connections.</summary>
+        /// <summary>
+        /// Gets or sets whether this node registers with Traversal nodes, opens forwarding sessions with Forwarders, checks its
+        /// reachability and attempts assisted direct connections.
+        /// </summary>
         public bool EnableNatTraversal { get; set; } = true;
         /// <summary>Gets or sets the total budget for an assisted direct connection or dial-back, from 50 milliseconds to two minutes.</summary>
         public TimeSpan NatTraversalTimeout { get; set; } = TimeSpan.FromSeconds(5);
         /// <summary>Gets or sets the interval for refreshing mappings and receiving introductions, from 50 milliseconds to one minute.</summary>
         public TimeSpan NatPollInterval { get; set; } = TimeSpan.FromSeconds(1);
-        /// <summary>Gets or sets the relay's observed mapping lease, at least three poll intervals and at most five minutes.</summary>
+        /// <summary>
+        /// Gets or sets the lease of a traversal registration or forwarding session hosted by this node, at least three poll
+        /// intervals and at most five minutes.
+        /// </summary>
         public TimeSpan NatRegistrationLifetime { get; set; } = TimeSpan.FromSeconds(30);
         /// <summary>Gets or sets the interval between reachability dial-back checks, from one minute to one day.</summary>
         public TimeSpan ReachabilityCheckInterval { get; set; } = TimeSpan.FromMinutes(30);
-        /// <summary>Gets or sets the maximum observed peer registrations hosted by a relay and retained direct routes.</summary>
+        /// <summary>
+        /// Gets or sets the maximum traversal registrations and, separately, forwarding sessions hosted by this node, and the
+        /// maximum retained direct routes.
+        /// </summary>
         public int MaxNatRegistrations { get; set; } = 256;
-        /// <summary>Gets or sets the maximum assisting relays maintained by this client, from one to sixteen.</summary>
-        public int MaxNatRelays { get; set; } = 4;
+        /// <summary>Gets or sets the maximum Traversal nodes this node stays registered with, from one to sixteen.</summary>
+        public int MaxTraversalNodes { get; set; } = 4;
+        /// <summary>Gets or sets the maximum Forwarders this node keeps forwarding sessions with, from one to sixteen.</summary>
+        public int MaxForwarders { get; set; } = 4;
         /// <summary>Gets or sets the standard logger used by node services; defaults to a disabled logger.</summary>
         public ILogger Logger { get; set; } = NullLogger.Instance;
 
@@ -138,16 +149,16 @@ namespace MajDHTNetwork
                 || NatRegistrationLifetime < TimeSpan.FromSeconds(1) || NatRegistrationLifetime > TimeSpan.FromMinutes(5)
                 || NatRegistrationLifetime.Ticks / 3 < NatPollInterval.Ticks
                 || ReachabilityCheckInterval < TimeSpan.FromMinutes(1) || ReachabilityCheckInterval > TimeSpan.FromDays(1)
-                || MaxNatRegistrations < 1 || MaxNatRegistrations > 65536 || MaxNatRelays < 1 || MaxNatRelays > 16
+                || MaxNatRegistrations < 1 || MaxNatRegistrations > 65536 || MaxTraversalNodes < 1 || MaxTraversalNodes > 16
+                || MaxForwarders < 1 || MaxForwarders > 16
                 || (PreferredTransport != DHTTransport.Tcp && PreferredTransport != DHTTransport.Udp)
-                || (Capabilities & ~(DHTCapabilities.Download | DHTCapabilities.Provide | DHTCapabilities.Relay)) != 0)
+                || (Capabilities & ~(DHTCapabilities.Download | DHTCapabilities.Provide | DHTCapabilities.Traversal | DHTCapabilities.Forwarder)) != 0)
             {
                 throw new ArgumentException("Invalid DHT node port, capability, limit or timeout.");
             }
             var copy = (DHTNodeOptions)MemberwiseClone();
             copy.Logger = Logger ?? NullLogger.Instance;
             copy.ListenAddresses = CopyListenAddresses(ListenAddresses);
-            copy.AdvertisedAddresses = CopyAdvertisedAddresses(AdvertisedAddresses, copy);
             copy.BootstrapEndpoints = CopyBootstrapEndpoints(BootstrapEndpoints);
             return copy;
         }
@@ -176,34 +187,6 @@ namespace MajDHTNetwork
                     {
                         throw new ArgumentException("Configure at most one listen address per address family.");
                     }
-                }
-                result.Add(NetworkScope.CopyAddress(address));
-            }
-            return result;
-        }
-
-        /// <summary>Validates and copies the configured advertised addresses.</summary>
-        /// <param name="addresses">The configured addresses.</param>
-        /// <param name="snapshot">The snapshot whose listener families must match.</param>
-        /// <returns>An owned copy.</returns>
-        /// <exception cref="ArgumentException">An address is invalid, repeated or has no listener of its family.</exception>
-        private static List<IPAddress> CopyAdvertisedAddresses(IList<IPAddress>? addresses, DHTNodeOptions snapshot)
-        {
-            var result = new List<IPAddress>();
-            if (addresses == null)
-            {
-                return result;
-            }
-            if (addresses.Count > DHTPeer.MaxEndpoints)
-            {
-                throw new ArgumentException("Configure at most four advertised addresses.");
-            }
-            foreach (var address in addresses)
-            {
-                if (address == null || !NetworkScope.IsUnicast(address) || snapshot.ListenAddress(address.AddressFamily) == null
-                    || result.Contains(address))
-                {
-                    throw new ArgumentException("Advertised addresses must be distinct unicast addresses of a listener's address family.");
                 }
                 result.Add(NetworkScope.CopyAddress(address));
             }

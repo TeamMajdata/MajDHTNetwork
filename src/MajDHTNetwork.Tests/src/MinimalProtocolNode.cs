@@ -65,9 +65,10 @@ namespace MajDHTNetwork.Tests
             _transport = new SocketTransport(options, HandleAsync);
             _transport.Bind();
             Endpoint = new IPEndPoint(address, _transport.TcpPort);
-            var endpoint = new DHTEndpoint(address, _transport.TcpPort, 0, DHTEndpointFlags.Configured);
-            LocalPeer = DHTPeer.Create(_identity, new[] { endpoint }, DHTCapabilities.Download | DHTCapabilities.Provide, DHTReachability.Public,
-                false, null, Array.Empty<DHTPeer>(), TimeSpan.FromHours(1));
+            // The contact carries no endpoint; this node pairs it with its own listener for the peers it lists itself to.
+            var contact = DHTContact.Create(_identity, DHTCapabilities.Download | DHTCapabilities.Provide, DHTReachability.Public, false,
+                Array.Empty<DHTPeer>(), TimeSpan.FromHours(1));
+            LocalPeer = new DHTPeer(contact, new[] { new DHTEndpoint(address, _transport.TcpPort, 0) });
             using var leaves = new Wire();
             var blockCount = Math.Max(1, (_content.Length + blockSize - 1) / blockSize);
             for (var index = 0; index < blockCount; index++)
@@ -107,8 +108,10 @@ namespace MajDHTNetwork.Tests
             }
             using var reader = new Wire(ResponseStatus.ReadResult(response.Body));
             HelloMessage.ReadResponse(reader);
-            Remember(response.Sender);
-            return response.Sender;
+            // The contact answered at this endpoint, which is how this node learns where the contact can be reached.
+            var peer = DHTPeer.Observed(response.Sender, DHTTransport.Tcp, endpoint);
+            Remember(peer);
+            return peer;
         }
 
         /// <summary>Performs one Find lookup at a peer.</summary>
@@ -183,7 +186,7 @@ namespace MajDHTNetwork.Tests
             {
                 throw new CryptographicException("Response sender, operation or correlation mismatch.");
             }
-            Remember(response.Sender);
+            Remember(DHTPeer.Observed(response.Sender, DHTTransport.Tcp, endpoint));
             // The frame is released when this method returns, so the result is copied.
             return ResponseStatus.ReadResult(response.Body).ToArray();
         }
@@ -205,12 +208,14 @@ namespace MajDHTNetwork.Tests
             {
                 _received.Add((Operation)packet.Kind);
             }
-            Remember(packet.Sender);
+            // The sender is remembered at the source its request came from; no node announces its own endpoints.
+            var sender = DHTPeer.Observed(packet.Sender, transport, source);
+            Remember(sender);
             using var body = new Wire();
             using var result = new Wire();
             try
             {
-                Dispatch(packet, source, result);
+                Dispatch(packet, sender, source, result);
                 ResponseStatus.WriteSuccess(body, result.WrittenSpan);
             }
             catch (Exception exception) when (exception is IOException || exception is InvalidDataException)
@@ -223,11 +228,12 @@ namespace MajDHTNetwork.Tests
 
         /// <summary>Executes one authenticated request and writes its result.</summary>
         /// <param name="packet">The authenticated request.</param>
+        /// <param name="sender">The sender at the source its request came from.</param>
         /// <param name="source">The observed source endpoint.</param>
         /// <param name="result">The result encoder.</param>
         /// <exception cref="InvalidDataException">The request is malformed or asks for content this node does not hold.</exception>
         /// <exception cref="IOException">The operation is not supported by this node.</exception>
-        private void Dispatch(Packet packet, IPEndPoint source, Wire result)
+        private void Dispatch(Packet packet, DHTPeer sender, IPEndPoint source, Wire result)
         {
             using var request = new Wire(packet.Body);
             switch ((Operation)packet.Kind)
@@ -243,7 +249,7 @@ namespace MajDHTNetwork.Tests
                     DispatchFind(FindMessage.ReadRequest(request), packet.Sender, result);
                     return;
                 case Operation.Store:
-                    DispatchStore(StoreMessage.ReadRequest(request), packet.Sender);
+                    DispatchStore(StoreMessage.ReadRequest(request), sender);
                     return;
                 case Operation.Block:
                 {
@@ -260,11 +266,11 @@ namespace MajDHTNetwork.Tests
             }
         }
 
-        /// <summary>Answers a lookup from the local index and the contacts learned so far.</summary>
+        /// <summary>Answers a lookup from the local index and the peers learned so far, each at the endpoints observed for it.</summary>
         /// <param name="find">The lookup arguments.</param>
         /// <param name="sender">The requester, which is never referred back to itself.</param>
         /// <param name="result">The result encoder.</param>
-        private void DispatchFind(FindRequest find, DHTPeer sender, Wire result)
+        private void DispatchFind(FindRequest find, DHTContact sender, Wire result)
         {
             DHTRecord? record = null;
             var providers = new List<DHTPeer>();
@@ -296,9 +302,9 @@ namespace MajDHTNetwork.Tests
             FindMessage.WriteResponse(result, record, peers, providers);
         }
 
-        /// <summary>Indexes an announced record and its provider.</summary>
+        /// <summary>Indexes an announced record and its provider at the source the announcement came from.</summary>
         /// <param name="record">The announced record.</param>
-        /// <param name="provider">The authenticated announcing peer.</param>
+        /// <param name="provider">The authenticated announcing peer at its observed source.</param>
         /// <exception cref="InvalidDataException">The sender cannot provide content.</exception>
         private void DispatchStore(DHTRecord record, DHTPeer provider)
         {
@@ -322,16 +328,24 @@ namespace MajDHTNetwork.Tests
             }
         }
 
-        /// <summary>Retains the newest contact of an authenticated peer.</summary>
-        /// <param name="peer">The authenticated contact.</param>
+        /// <summary>Retains the newest contact of an authenticated peer together with every endpoint it was observed at.</summary>
+        /// <param name="peer">The authenticated peer at its observed endpoint.</param>
         private void Remember(DHTPeer peer)
         {
             lock (_gate)
             {
-                if (!_known.TryGetValue(peer.NodeId, out var existing) || existing.Sequence < peer.Sequence)
+                if (!_known.TryGetValue(peer.NodeId, out var existing))
                 {
                     _known[peer.NodeId] = peer;
+                    return;
                 }
+                var newest = existing.Sequence < peer.Sequence ? peer.Contact : existing.Contact;
+                var merged = new DHTPeer(newest, existing.Endpoints);
+                foreach (var endpoint in peer.Endpoints)
+                {
+                    merged = merged.WithEndpoint(endpoint);
+                }
+                _known[peer.NodeId] = merged;
             }
         }
 

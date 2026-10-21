@@ -22,14 +22,14 @@ namespace MajDHTNetwork.Tests
         internal DHTIdentity Identity { get; }
         /// <summary>Gets the immutable-by-convention file bytes served by this test peer.</summary>
         internal byte[] Content { get; }
-        /// <summary>Gets the signed contact whose advertised address has no matching listener.</summary>
+        /// <summary>Gets the signed contact paired with an address where nothing listens, so only observed routes reach this peer.</summary>
         internal DHTPeer Peer { get; }
         /// <summary>Gets the valid signed manifest for the single content block.</summary>
         internal DHTRecord Record { get; }
         /// <summary>Signals that an introduced real node attempted its outgoing authenticated probe.</summary>
         internal TaskCompletionSource<bool> PunchObserved { get; } = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        /// <summary>Binds a test peer with valid content and a deliberately unreachable advertised address.</summary>
+        /// <summary>Binds a test peer with valid content whose known endpoint deliberately names an address where nothing listens.</summary>
         /// <param name="transport">The only transport to bind.</param>
         /// <param name="identity">An existing identity to reuse at a different observed endpoint, if required.</param>
         /// <param name="content">The original peer's content to retain across endpoint substitution, if required.</param>

@@ -14,7 +14,7 @@ namespace MajDHTNetwork.Tests
 {
     /// <summary>
     /// A protocol-level test peer on a real loopback TCP listener whose replies are scripted by the test, for playing a
-    /// malicious relay, helper or client.
+    /// malicious Traversal node, Forwarder, helper or client.
     /// </summary>
     internal sealed class ScriptedPeer : IAsyncDisposable
     {
@@ -29,7 +29,7 @@ namespace MajDHTNetwork.Tests
 
         /// <summary>Gets the peer identity.</summary>
         internal DHTIdentity Identity { get; }
-        /// <summary>Gets the signed contact for the listener.</summary>
+        /// <summary>Gets the signed contact paired with the listener endpoint.</summary>
         internal DHTPeer Peer { get; }
         /// <summary>Gets the bound listener endpoint.</summary>
         internal IPEndPoint Endpoint { get; }
@@ -37,7 +37,7 @@ namespace MajDHTNetwork.Tests
         /// <summary>Binds a scripted peer.</summary>
         /// <param name="address">The loopback listener address.</param>
         /// <param name="capabilities">The advertised capabilities.</param>
-        /// <param name="reachability">The advertised reachability; Public advertises a configured endpoint.</param>
+        /// <param name="reachability">The advertised reachability.</param>
         /// <param name="identity">The peer identity, or null for a random identity.</param>
         internal ScriptedPeer(IPAddress address, DHTCapabilities capabilities, DHTReachability reachability = DHTReachability.Public,
             DHTIdentity? identity = null)
@@ -52,9 +52,8 @@ namespace MajDHTNetwork.Tests
             _transport = new SocketTransport(options, HandleAsync, NullLogger.Instance);
             _transport.Bind();
             Endpoint = new IPEndPoint(address, _transport.TcpPort);
-            var flags = reachability == DHTReachability.Public ? DHTEndpointFlags.Configured : DHTEndpointFlags.None;
-            Peer = DHTPeer.Create(Identity, new[] { new DHTEndpoint(address, _transport.TcpPort, 0, flags) }, capabilities, reachability,
-                false, null, Array.Empty<DHTPeer>(), TimeSpan.FromHours(1));
+            Peer = new DHTPeer(DHTContact.Create(Identity, capabilities, reachability, false, Array.Empty<DHTPeer>(), TimeSpan.FromHours(1)),
+                new[] { new DHTEndpoint(address, _transport.TcpPort, 0) });
             _transport.Run();
         }
 
@@ -81,16 +80,14 @@ namespace MajDHTNetwork.Tests
         /// <param name="operation">The operation.</param>
         /// <param name="body">The request body.</param>
         /// <param name="token">The test deadline.</param>
-        /// <param name="identity">An alternative sender identity; its contact advertises this listener unless overridden.</param>
-        /// <param name="advertised">An endpoint the alternative identity claims instead of this listener.</param>
+        /// <param name="identity">An alternative sender identity, signing a fresh contact with this peer's capabilities.</param>
         /// <returns>The response status and result.</returns>
         /// <exception cref="InvalidDataException">The response was not authenticated by the receiver.</exception>
         internal async Task<(byte Status, ReadOnlyMemory<byte> Result)> SendAsync(DHTPeer receiver, Operation operation, ReadOnlyMemory<byte> body,
-            CancellationToken token, DHTIdentity? identity = null, IPEndPoint? advertised = null)
+            CancellationToken token, DHTIdentity? identity = null)
         {
             var sender = identity ?? Identity;
-            var claimed = advertised ?? Endpoint;
-            var contact = identity == null ? Peer : DHTPeer.Create(identity, claimed.Address, claimed.Port, 0, Peer.Capabilities);
+            var contact = identity == null ? Peer.Contact : DHTContact.Create(identity, Peer.Capabilities);
             var packet = new Packet(contact, Crypto.Random(16), (byte)operation, body);
             var endpoint = new IPEndPoint(receiver.Endpoints[0].Address, receiver.Endpoints[0].TcpPort);
             using var encoded = await _transport.ExchangeAtAsync(DHTTransport.Tcp, endpoint, packet.Seal(sender, receiver), token);

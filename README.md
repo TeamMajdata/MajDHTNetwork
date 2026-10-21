@@ -3,8 +3,9 @@
 **English** | [简体中文](README.zh-CN.md)
 
 MajDHTNetwork is an independent **.NET Standard 2.1** class library in the
-`MajDHTNetwork` namespace. A `MajDHTNode` is a DHT participant, a content
-provider and an optional end-to-end encrypted relay at the same time. The
+`MajDHTNetwork` namespace. A `MajDHTNode` is a DHT participant and a content
+provider, and can also act as a Traversal node that coordinates direct
+connections or as a Forwarder that relays end-to-end encrypted envelopes. The
 library has no Unity assembly dependency and never opens files or directories
 by itself: every stream is supplied by the caller. This is the **MajDHT v1**
 protocol, not the BitTorrent DHT.
@@ -22,7 +23,7 @@ The wire protocol is specified in [PROTOCOL.md](PROTOCOL.md)
 - [Public API](#public-api)
 - [Implementing a node with the protocol API](#implementing-a-node-with-the-protocol-api)
 - [Identity, keys and integrity](#identity-keys-and-integrity)
-- [Encryption and relays](#encryption-and-relays)
+- [Encryption and forwarding](#encryption-and-forwarding)
 - [Bootstrap and discovery](#bootstrap-and-discovery)
 - [TCP, UDP and NAT traversal](#tcp-udp-and-nat-traversal)
 - [Custom routing](#custom-routing)
@@ -43,12 +44,17 @@ The wire protocol is specified in [PROTOCOL.md](PROTOCOL.md)
   transcript and plaintext.
 - **Two transports.** Length-prefixed TCP and datagram UDP with non-amplifying
   source-address cookies, retries and a bounded replay cache.
-- **Relay-assisted traversal.** Peers advertising `Relay` observe real endpoints
-  and coordinate TCP/UDP punching; when a direct path is impossible, the same
-  relay can forward opaque encrypted envelopes.
+- **Observed endpoints only.** No node announces where it listens: a peer's
+  endpoint is what the nodes exchanging packets with it observe, and referrals
+  carry the referrer's observations alongside the signed contact.
+- **Traversal and Forwarder roles.** Peers advertising `Traversal` observe the
+  endpoints of registered peers, let them exchange those endpoints and
+  coordinate TCP/UDP hole punching; peers advertising `Forwarder` host
+  forwarding sessions and relay opaque encrypted envelopes, so two peers that
+  cannot connect directly still communicate.
 - **Reachability discovery for home networks.** Nodes behind NAT learn their
-  external address from independent relays, verify it with an independent
-  dial-back and otherwise advertise signed relay hints instead of an address.
+  external address from independent observers, verify it with an independent
+  dial-back and otherwise carry signed hints to Traversal nodes and Forwarders.
 - **Dual-stack listeners and endpoint bootstrap.** One node can listen on IPv4 and
   IPv6 at once and join the network through configured bootstrap endpoints.
 - **Pluggable storage.** Blocks live behind `IDHTContentStore`; the default
@@ -119,7 +125,7 @@ await using var provider = new MajDHTNode(new DHTNodeOptions
     ListenAddresses = new List<IPAddress> { IPAddress.Loopback, IPAddress.IPv6Loopback },
     TcpPort = 42000,
     UdpPort = 42000,
-    Capabilities = DHTCapabilities.Download | DHTCapabilities.Provide | DHTCapabilities.Relay
+    Capabilities = DHTCapabilities.Download | DHTCapabilities.Provide | DHTCapabilities.Traversal | DHTCapabilities.Forwarder
 });
 await provider.StartAsync(cancellationToken);
 
@@ -158,10 +164,10 @@ process.
 | `MajDHTNode(DHTNodeOptions?, DHTIdentity?, IDHTContentStore?, IDHTRoutingTable?, IDHTRouteSelector?, IDHTContentFallback?)` | Creates a node; every argument is optional and defaults are created internally. |
 | `StartAsync(CancellationToken)` | Binds listeners once and starts a background bootstrap when endpoints are configured; the token is a lifetime token. |
 | `StopAsync()`, `DisposeAsync()`, `Dispose()` | Idempotent shutdown; a stopped instance cannot be restarted. |
-| `NodeId`, `LocalPeer`, `KnownPeers` | Local identity fingerprint, local signed contact and the current routing contacts. |
+| `NodeId`, `LocalContact`, `LocalPeer`, `KnownPeers`, `ExternalAddresses` | Local identity fingerprint, local signed contact, that contact paired with the local listener endpoints for out-of-band handover, the current routing peers at their observed endpoints, and the external addresses confirmed by independent observers. |
 | `BootstrapAsync(CancellationToken)` | Contacts every configured bootstrap endpoint and returns how many answered. |
-| `AddPeerAsync(IPEndPoint, DHTTransport? preferredTransport, CancellationToken)` | Contacts one node at an address and port, trying the given transport first, admits it and returns its signed contact. |
-| `ExportRoutingTable()` | Exports the identities and endpoints of the current routing contacts for persistence; usable at any time. |
+| `AddPeerAsync(IPEndPoint, DHTTransport? preferredTransport, CancellationToken)` | Contacts one node at an address and port, trying the given transport first, admits it and returns it at the endpoint that answered. |
+| `ExportRoutingTable()` | Exports the identities and observed endpoints of the current routing contacts for persistence; usable at any time. |
 | `RestoreRoutingTableAsync(ReadOnlyMemory<byte>, CancellationToken)` | Re-contacts the nodes of an exported routing table, admits those that still answer under their saved identity and returns how many did. |
 | `FindNodesAsync(string routingId, CancellationToken)` | Iterative XOR-distance lookup. |
 | `PublishAsync(string, Stream, long revision, CancellationToken)` | Publishes a stream under the local publisher namespace. |
@@ -176,9 +182,10 @@ process.
 | `FindProvidersAsync(string fileHash, CancellationToken)` | Finds providers of a complete-file hash, independently of keys. |
 | `DownloadAsync(DHTKey, Stream, string? expectedFileHash, CancellationToken)` | Resolves, downloads and verifies the complete file. |
 | `DownloadAsync(DHTRecord, Stream, string? expectedFileHash, CancellationToken)` | Downloads a known signed record. |
-| `ReadBlockAsync(DHTRecord, DHTPeer, int index, DHTPeer? relay, CancellationToken)` | Verified single-block read for application-managed resume or a specific relay. |
-| `RegisterRelayAsync(DHTPeer relay, CancellationToken)` | Registers the node's observed endpoint with a relay. |
-| `TryPunchAsync(DHTPeer peer, DHTPeer relay, DHTTransport, CancellationToken)` | Attempts a direct TCP or UDP route through relay coordination. |
+| `ReadBlockAsync(DHTRecord, DHTPeer, int index, DHTPeer? forwarder, CancellationToken)` | Verified single-block read for application-managed resume or through a specific Forwarder. |
+| `RegisterTraversalAsync(DHTPeer traversal, CancellationToken)` | Registers the node's observed endpoints with a Traversal node and keeps the registration alive. |
+| `RegisterForwarderAsync(DHTPeer forwarder, CancellationToken)` | Opens a forwarding session with a Forwarder and keeps it alive, so the Forwarder can deliver traffic to this node. |
+| `TryPunchAsync(DHTPeer peer, DHTPeer traversal, DHTTransport, CancellationToken)` | Attempts a direct TCP or UDP route coordinated by a Traversal node. |
 | `PeerStatistics`, `GetPeerStatistics(string nodeId)` | Packet-loss statistics per peer and route collected during the node lifetime. |
 
 ### `DHTNodeOptions` defaults
@@ -186,7 +193,7 @@ process.
 | Option | Default |
 | --- | --- |
 | `ListenAddresses` | `{ IPAddress.Loopback }` (one or two entries, at most one per address family) |
-| `AdvertisedAddresses` | empty (advertise specific listen addresses and discover reachability; at most four) |
+| `PubliclyReachable` | `false` (discover reachability through dial-backs; `true` claims Public reachability at once) |
 | `BootstrapEndpoints` | empty (at most sixteen) |
 | `TcpPort`, `UdpPort` | `0` (OS-assigned); `null` disables that listener |
 | `PreferredTransport` | `DHTTransport.Tcp` |
@@ -207,13 +214,14 @@ process.
 | `UdpAttempts` | `3` |
 | `RecordLifetime` | `24 h` (1 s–7 days accepted) |
 | `MaintenanceInterval` | `5 min` |
-| `EnableNatTraversal` | `true` |
+| `EnableNatTraversal` | `true` (register with Traversal nodes, open forwarding sessions, check reachability, punch) |
 | `NatTraversalTimeout` | `5 s` |
 | `NatPollInterval` | `1 s` |
 | `NatRegistrationLifetime` | `30 s` (must cover at least three poll intervals) |
 | `ReachabilityCheckInterval` | `30 min` (1 min–1 day accepted) |
-| `MaxNatRegistrations` | `256` |
-| `MaxNatRelays` | `4` |
+| `MaxNatRegistrations` | `256` (hosted traversal registrations, hosted forwarding sessions and retained direct routes, each) |
+| `MaxTraversalNodes` | `4` (1–16 accepted) |
+| `MaxForwarders` | `4` (1–16 accepted) |
 | `Logger` | `NullLogger.Instance` |
 
 ### Value types and contracts
@@ -221,24 +229,24 @@ process.
 | Type | Key members |
 | --- | --- |
 | `DHTIdentity` | `DHTIdentity()`, `DHTIdentity(ReadOnlySpan<byte> seed)`, `NodeId`, `PublicKey`, `ExportSeed()`, `ExportSeed(Span<byte>)`, `IdentityWork`, `Create(int workBits, CancellationToken)` |
-| `DHTPeer` | `NodeId`, `Endpoints`, `RelayHints`, `Reachability`, `HasEndpointDependentMapping`, `ExternalAddress`, `Capabilities`, `IdentityWork`, `Sequence`, `ExpiresAt`, `IsExpired`, `Encoded`, `Create(...)`, `Parse(ReadOnlyMemory<byte>)` |
-| `DHTEndpoint` | `DHTEndpoint(IPAddress, int tcpPort, int udpPort, DHTEndpointFlags)`, `Address`, `TcpPort`, `UdpPort`, `Flags` |
+| `DHTContact` | The signed contact: `NodeId`, `Hints`, `Reachability`, `HasEndpointDependentMapping`, `Capabilities`, `IdentityWork`, `Sequence`, `ExpiresAt`, `IsExpired`, `Encoded`, `Create(...)`, `Parse(ReadOnlyMemory<byte>)`, `SameAdvertisement(DHTContact)` |
+| `DHTPeer` | A contact at the endpoints observed for it: `Contact`, `Endpoints`, the contact's members, `DHTPeer(DHTContact, IReadOnlyList<DHTEndpoint>)`, `Observed(DHTContact, DHTTransport, IPEndPoint)`, `Create(DHTIdentity, IPAddress, int tcpPort, int udpPort, DHTCapabilities)`, `WithContact`, `WithEndpoint`, `Merge`, `SameEndpoints`, `WasObservedAt`, `Write`, `Read` |
+| `DHTEndpoint` | An observed endpoint: `DHTEndpoint(IPAddress, int tcpPort, int udpPort)`, `Observed(DHTTransport, IPEndPoint)`, `Address`, `TcpPort`, `UdpPort`, `Port(DHTTransport)`, `ToIPEndPoint(DHTTransport)`, `Merge`, `Write`, `Read` |
 | `DHTReachability` | `Unknown = 0`, `Public = 1`, `Private = 2` |
-| `DHTEndpointFlags` | `None = 0`, `Verified = 1`, `Local = 2`, `Configured = 4` |
 | `DHTKey` | `DHTKey(string publisherId, string name)`, `Parse(string)`, `IsValid`, `PublisherId`, `Name`, `RoutingId`, equality and hashing |
 | `DHTRecord` | `Key`, `IsWithdrawn`, `FileHash`, `MerkleRoot`, `Length`, `BlockSize`, `BlockCount`, `Revision`, `ExpiresAt`, `IsExpired`, `EncodedLength`, `CopyTo(Span<byte>)`, `ToBytes()`, `Parse(ReadOnlySpan<byte>)`, `Create(...)`, `CreateWithdrawal(...)` |
 | `IDHTContentStore` | `PutAsync(string blockHash, ReadOnlyMemory<byte>, CancellationToken)`, `GetAsync(string blockHash, CancellationToken)` |
 | `IDHTContentFallback` | `TryAcquireAsync(DHTRecord, CancellationToken)`; makes requested but locally unavailable content available on demand |
 | `MemoryDHTContentStore` | `MemoryDHTContentStore(long capacity = 64 MiB, int maxEntries = 65536)` |
-| `IDHTRoutingTable` | `Initialize(string localNodeId, int bucketSize)`, `Observe(DHTPeer, IPAddress? verifiedAddress)`, `Remove(string nodeId)`, `Closest(string routingId, int count)` |
+| `IDHTRoutingTable` | `Initialize(string localNodeId, int bucketSize)`, `Observe(DHTContact, DHTEndpoint? observed)`, `Remove(string nodeId)`, `Closest(string routingId, int count)` |
 | `KademliaDHTRoutingTable` | `KademliaDHTRoutingTable(int maxPerNetworkInBucket = 2, int maxPerNetwork = 10)`; default table of 256 XOR buckets with per-network limits |
-| `IDHTRouteSelector` | `SelectDirectRoutes(DHTPeer, DHTRouteContext)`, `SelectRelayRoutes(DHTPeer, IReadOnlyList<DHTPeer> knownRelays, DHTRouteContext)` |
+| `IDHTRouteSelector` | `SelectDirectRoutes(DHTPeer, DHTRouteContext)`, `SelectAssistedRoutes(DHTPeer, IReadOnlyList<DHTPeer> knownAssistants, DHTRouteContext)` |
 | `DefaultDHTRouteSelector` | Default route selection described in [Custom routing](#custom-routing) |
-| `DHTRouteContext` | `PreferredTransport`, `AlternateTransport`, `NatTraversalEnabled`, `ExternalAddresses`, `MaxRelayAttempts`, `IsRegisteredWith(string)`, `SharesExternalAddress(DHTPeer)`, `GetPeerStatistics(string)`, `PacketLossRate(string)`, `PacketLossRate(string, DHTDirectRoute)` |
+| `DHTRouteContext` | `PreferredTransport`, `AlternateTransport`, `NatTraversalEnabled`, `MaxAssistedAttempts`, `IsRegisteredWith(string)`, `GetPeerStatistics(string)`, `PacketLossRate(string)`, `PacketLossRate(string, DHTDirectRoute)` |
 | `DHTPeerStatistics` | `NodeId`, `SentPackets`, `LostPackets`, `PacketLossRate`, `LastUpdated`, `Routes`, `GetRoute(IPEndPoint, DHTTransport)` |
 | `DHTRouteStatistics` | `Endpoint`, `Transport`, `SentPackets`, `LostPackets`, `PacketLossRate`, `LastUpdated` |
-| `DHTDirectRoute`, `DHTRelayRoute` | `Endpoint`, `Transport`; `Relay`, `AttemptPunch` |
-| `DHTCapabilities` | `Download = 1`, `Provide = 2`, `Relay = 4` |
+| `DHTDirectRoute`, `DHTAssistedRoute` | `Endpoint`, `Transport`; `Assistant`, `AttemptPunch` |
+| `DHTCapabilities` | `Download = 1`, `Provide = 2`, `Traversal = 4`, `Forwarder = 8` |
 | `DHTTransport` | `Tcp`, `Udp` |
 
 ## Implementing a node with the protocol API
@@ -256,21 +264,21 @@ its constructor, and how to build an independent node step by step.
 | Type (`MajDHTNetwork.Protocol` unless noted) | Purpose |
 | --- | --- |
 | `Wire` | Canonical encoder over a pooled buffer and zero-copy decoder: `PutByte`/`Byte`, `PutLong`/`Long`, `Put`/`Bytes(limit)`, `PutText`/`Text(limit)`, `PutRaw`, `PutHex`, `Tag`, `End`, `WrittenMemory`, `ToArray`, `MaxPacket`. |
-| `Operation` | The operation byte: `Ping`, `Find`, `Store`, `Block`, `Relay`, `Rendezvous`, `Punch`, `Hello`, `Probe`; responses set bit 7. |
+| `Operation` | The operation byte: `Ping`, `Find`, `Store`, `Block`, `Forward`, `Traversal`, `Punch`, `Hello`, `Probe`; responses set bit 7. |
 | `Packet` | One request or response: `Packet(sender, requestId, kind, body)`, `Seal(identity, recipient)`, `SealHello(identity)`, `Open(identity, envelope)`, `CheckForward(envelope, destinationId)`, `Sender`, `RequestId`, `Kind`, `Body`, `RequestIdLength`. |
 | `ResponseStatus` | The status wrapper of every response body: `WriteSuccess`, `WriteRejection`, `ReadResult`. |
-| `FindMessage`, `FindMode`, `FindRequest`, `FindResponse`, `ContactList` | Find request and result codecs with bounded, independently verified contact lists. |
+| `FindMessage`, `FindMode`, `FindRequest`, `FindResponse`, `PeerList` | Find request and result codecs with bounded, independently verified peer lists: each entry is a signed contact with the responder's observed endpoints. |
 | `StoreMessage`, `BlockMessage`, `BlockRequest` | Store and Block codecs; `BlockMessage.ReadResponse` verifies block length, position and Merkle proof against the requester's own record. |
-| `RelayMessage`, `RelayRequest` | Opaque relay codec; `ReadRequest` enforces the forwarding rules on the inner envelope. |
-| `HelloMessage`, `ObservedEndpoint` | Hello result and the observed-endpoint encoding shared with Rendezvous. |
-| `RendezvousMessage`, `RendezvousAction`, `RendezvousIntroduction`, `RendezvousPollResponse`, `DialBackArrangement`, `DialBackDelegation`, `PunchMessage`, `ProbeMessage`, `ProbeRequest` | Registration, introduction, dial-back, punch and probe codecs for relay-assisted traversal and reachability. |
+| `ForwardMessage`, `ForwardAction`, `ForwardRelayRequest` | Forwarding codec: forwarding sessions, relaying an opaque envelope through a Forwarder and delivering it to the destination; `ReadRelayRequest` and `ReadDeliverRequest` enforce the forwarding rules on the inner envelope. |
+| `HelloMessage`, `ObservedEndpoint` | Hello result and the observed-endpoint encoding shared with Traversal and Forward sessions. |
+| `TraversalMessage`, `TraversalAction`, `TraversalIntroduction`, `TraversalPollResponse`, `DialBackArrangement`, `DialBackDelegation`, `PunchMessage`, `ProbeMessage`, `ProbeRequest` | Registration, introduction, dial-back, punch and probe codecs for Traversal-coordinated direct connections and reachability. |
 | `MerkleTree` | Domain-separated leaf and parent hashing: `Leaf`, `AppendLeaf`, `Root`, `Count`, `LeafId`, `WriteProof`, `Proof`, `Verify`, `VerifyLocal`. |
 | `Crypto` | `Hash`, `HashPrefixed`, `Hex`, `HexTo`, `ParseHash`, `IsHash`, `AsciiEquals`, `Random`, `Fill`, `Shuffle`, `Verify`, `Hkdf` and the digest, agreement-key, nonce and tag lengths. |
 | `IdentityPuzzle` | The Argon2id identity work: `Evaluate`, `Work`, `Remember`, `Search` and its parameters. |
 | `ProtocolTags`, `NetworkScope`, `XorDistanceComparer` | Canonical labels, address scope and network-prefix rules, XOR distance ordering. |
 | `OwnedMemory`, `OwnedPacket`, `PooledBuffer` | Ownership of the pooled frames that received envelopes borrow. |
 | `MajDHTNetwork.Transport.SocketTransport`, `DHTEnvelopeHandler`, `TransmissionCounter` | TCP framing, UDP cookies and retries, listeners and sessions: `SocketTransport(options, handler)`, `Bind`, `Run`, `ExchangeAtAsync`, `PunchAsync`, `TcpPort`, `UdpPort`, `PortFor`, `Stop`, `DisposeAsync`. |
-| `DHTPeer`, `DHTRecord`, `DHTIdentity`, `DHTNodeOptions` (root namespace) | `DHTPeer.Create`, `Parse`, `Encoded`, `NodeHash`, `SigningKey`, `AgreementKey`, `SameAdvertisement`; `DHTRecord.Create`, `CreateWithdrawal`, `ParseCached`, `Encoded`, `SameContent`; `DHTIdentity.Sign`, `SignTo`, `AgreementPublicKey`, `NodeHash`, `NextSequence`; `DHTNodeOptions.Snapshot`. |
+| `DHTContact`, `DHTPeer`, `DHTEndpoint`, `DHTRecord`, `DHTIdentity`, `DHTNodeOptions` (root namespace) | `DHTContact.Create`, `Parse`, `Encoded`, `NodeHash`, `SigningKey`, `AgreementKey`, `SameAdvertisement`; `DHTPeer.Write`, `Read`, `Observed`; `DHTEndpoint.Write`, `Read`; `DHTRecord.Create`, `CreateWithdrawal`, `ParseCached`, `Encoded`, `SameContent`; `DHTIdentity.Sign`, `SignTo`, `AgreementPublicKey`, `NodeHash`, `NextSequence`; `DHTNodeOptions.Snapshot`. |
 
 A node implementation receives envelopes through a `DHTEnvelopeHandler`, opens
 them with `Packet.Open`, reads the body with the operation's codec, writes the
@@ -423,7 +431,7 @@ background; the peer otherwise fails over to other providers. Implementations mu
 be thread-safe and should coalesce concurrent requests for the same content, and
 must decide which publishers they trust.
 
-## Encryption and relays
+## Encryption and forwarding
 
 Every request and response uses fresh ephemeral X25519 agreement, HKDF-SHA256
 and ChaCha20-Poly1305, with an Ed25519 signature covering the envelope transcript
@@ -438,27 +446,30 @@ forward secrecy** against later compromise of an identity seed. Fresh ephemeral
 sender keys do not change this property. It has not undergone an independent
 cryptographic audit.
 
-When direct access fails, a node first uses the relay hints in the destination's
-signed contact, then asks other known peers advertising `Relay` to introduce a
-direct TCP or UDP path. If traversal cannot establish a path, it attempts the
-existing opaque relay operation. The relay receives a separately
-encrypted outer RPC containing the destination ID and an opaque inner envelope.
-It forwards the inner envelope unchanged and returns the opaque response. Only
-the original downloader and provider can open the file request and block
-response; the relay can observe endpoints, packet sizes, timing and the visible
-operation number. Corrupt relay responses are rejected and other known relays
-can be attempted. A relay only forwards to an already authenticated known peer or
-to a node holding a live rendezvous registration with it, and rejects explicit
-nested relay packets. A malicious participant can still
-create multiple separate connections; this is not anonymous routing or
-protection against Sybil/eclipse attacks.
+When direct access fails, a node first uses the hints in the destination's
+signed contact, then other routed peers advertising `Traversal` or `Forwarder`.
+A hinted Traversal node this node is already registered with is asked to
+introduce a direct TCP or UDP path; a Forwarder relays the request. The
+Forwarder receives a separately encrypted outer RPC containing the destination
+ID and an opaque inner envelope, delivers the inner envelope unchanged inside
+its own authenticated request to the destination's forwarding session and
+returns the opaque response. Only the original downloader and provider can open
+the file request and block response; the Forwarder can observe endpoints,
+packet sizes, timing and the visible operation number. Corrupt forwarded
+responses are rejected and other known Forwarders can be attempted. A Forwarder
+only relays to a node holding a live forwarding session with it or to an
+already authenticated routed peer, and rejects nested forwards and control
+operations. A destination accepts a delivery only from a Forwarder and learns
+no endpoint for the origin from it. A malicious participant can still create
+multiple separate connections; this is not anonymous routing or protection
+against Sybil/eclipse attacks.
 
 Use the low-level verified block API for application-managed resume or a
-specific relay:
+specific Forwarder:
 
 ```csharp
-var block = await downloader.ReadBlockAsync(record, provider.LocalPeer, 0,
-    relay: relayPeer, cancellationToken: cancellationToken);
+var block = await downloader.ReadBlockAsync(record, providerPeer, 0,
+    forwarder: forwarderPeer, cancellationToken: cancellationToken);
 ```
 
 Provider claims are availability hints; a signed contact alone does not prove
@@ -479,8 +490,8 @@ parallelism mainly comes from using several providers.
 For its whole lifetime a node records, per peer and per route (endpoint and
 transport), how many request transmissions it sent and how many received no
 response before their attempt timeout. Every UDP retransmission and TCP attempt
-counts; hole-punching and dial-back probes do not, and requests forwarded
-through a relay count towards the relay. `GetPeerStatistics(nodeId)` and
+counts; hole-punching and dial-back probes do not, and requests relayed
+through a Forwarder count towards the Forwarder. `GetPeerStatistics(nodeId)` and
 `PeerStatistics` return immutable `DHTPeerStatistics` snapshots whose
 `PacketLossRate` is `LostPackets / SentPackets`, with a per-route breakdown in
 `Routes` and `GetRoute(endpoint, transport)`. At most 4,096 peers and 16 routes
@@ -507,25 +518,27 @@ learned at run time, for example an address a user typed or one the application
 received through its own channel: it sends the Hello through the given transport
 first (the node's `PreferredTransport` when null), then through the other
 transport at the same port if the first does not answer, admits the node that
-answered, registers with it when it is a relay, discovers neighbors and returns
-the node's signed contact. It throws `IOException` when neither transport
-answers.
+answered, registers with it when it is a Traversal node or Forwarder, discovers
+neighbors and returns the node at the endpoint that answered. It throws
+`IOException` when neither transport answers.
 
 An endpoint does not identify a node: whoever answers at a configured or added
 endpoint becomes the first contact. Configure bootstrap endpoints and add peers
-only from trusted sources. Peers with the `Relay` capability also provide
-authenticated rendezvous assistance and reachability checks.
+only from trusted sources. Peers with the `Traversal` capability coordinate
+direct connections and reachability checks; peers with the `Forwarder`
+capability relay traffic for the nodes holding a forwarding session with them.
 
 ### Persisting the routing table
 
-`ExportRoutingTable()` returns a small snapshot of the identities and advertised
+`ExportRoutingTable()` returns a small snapshot of the identities and observed
 endpoints of the current routing contacts, nearest first; it works before the
 node starts and after it stopped, and the library never writes it anywhere
 itself. After a restart, `RestoreRoutingTableAsync(snapshot)` on a running node
 sends a Hello to every saved endpoint, at most sixteen contacts at a time, admits
 each node that still answers under its saved identity, registers with the
-answering relays when NAT traversal is enabled, and then discovers the current
-neighbors; it returns how many contacts were admitted. Endpoints that no longer
+answering Traversal nodes and Forwarders when NAT traversal is enabled, and then
+discovers the current neighbors; it returns how many contacts were admitted.
+Endpoints that no longer
 answer, or now answer under another identity, are skipped, so an old snapshot
 costs a few request timeouts and nothing else. A malformed snapshot throws
 `InvalidDataException`. Contact leases last at most a day, which is why the
@@ -567,17 +580,14 @@ missing or altered block fails only the requests for that block.
 dual-stack listeners on the same configured ports; wildcard addresses are
 allowed. Arbitrary TCP/UDP ports, equal or separate TCP/UDP port numbers, and
 independently enabled TCP and UDP listeners are supported. A signed contact
-advertises up to four endpoints:
-
-- every `AdvertisedAddresses` entry, flagged `Configured`, for a fixed public
-  address or a router port mapping configured by the application;
-- otherwise every specific (non-wildcard) listen address, flagged `Local` when
-  it is a loopback, private, carrier-grade NAT or link-local address;
-- an external endpoint flagged `Verified` after an independent dial-back.
-
-Outgoing requests try configured or verified endpoints first, then unverified
-and local endpoints, each with the preferred transport and then the alternative.
-Host names, external STUN servers and UPnP are outside this library.
+never names the node's own endpoints: every node sends from its listening
+ports, so the nodes it talks to observe where it can be reached, keep up to four
+observed addresses per contact with their TCP and UDP ports, and pass them on in
+referrals. `LocalPeer` pairs the local contact with the listener endpoints for
+handing it to another process on the same host. Outgoing requests try the
+destination's observed endpoints, most recently observed first, each with the
+preferred transport and then the alternative. Host names, external STUN servers
+and UPnP are outside this library.
 
 ### Sybil resistance
 
@@ -591,24 +601,24 @@ makes them costly and limits what they can reach:
   costs a full puzzle for every candidate. A node's identity must reach
   `IdentityWorkBits` (default 12, a one-time cost of seconds to tens of seconds
   that persists with the seed), and nodes reject requests, responses, referrals,
-  relays and introductions below it. Each identity is evaluated once per process;
-  at most 128 unknown identities are evaluated per second, so floods of fresh
-  identities cannot exhaust the CPU. All nodes of one network must use the same
-  value.
-- **Verified admission.** A contact enters the routing table only after it
-  answered at one of its advertised endpoints: an inbound request admits it at
-  once when it came from that endpoint, otherwise the node pings the advertised
-  endpoint, at most 16 at a time and eight times per source network per minute.
-  Peers reachable only through relays or punched routes are used but never
-  referred to others.
+  assisted routes and introductions below it. Each identity is evaluated once per
+  process; at most 128 unknown identities are evaluated per second, so floods of
+  fresh identities cannot exhaust the CPU. All nodes of one network must use the
+  same value.
+- **Verified admission.** A contact enters the routing table only at an endpoint
+  this node observed itself: the endpoint that answered a request, or the source
+  of an inbound request once the sender answered a Ping at that source, at most
+  16 verifications at a time and eight per source network per minute. Referred
+  endpoints are tried but never admitted on the referrer's word. Peers reachable
+  only through Forwarders or punched routes are used but never referred to others.
 - **Network diversity.** The routing table keeps at most two contacts per IPv4
   /24 or IPv6 /32 in a bucket and ten in total, and each file keeps at most three
   provider claims per such network, counted by observed source addresses.
   Loopback, private and link-local peers are exempt, so LANs keep working.
 - **Randomized selection.** Dial-back helpers are drawn at random, one per
-  network; routed relays are drawn at random from the nearest candidates; download
-  providers start in random order. Identities ground near a target cannot
-  predictably capture these roles.
+  network; routed Traversal nodes and Forwarders are drawn at random from the
+  nearest candidates; download providers start in random order. Identities ground
+  near a target cannot predictably capture these roles.
 - **Disjoint lookups.** Each lookup follows `DisjointLookupPaths` paths that never
   query the same node and each have their own share of `MaxLookupQueries`, then
   merges them. Sybil referrals can exhaust the paths they capture, but a record or
@@ -616,80 +626,98 @@ makes them costly and limits what they can reach:
 
 ## TCP, UDP and NAT traversal
 
-Bootstrapping through a peer advertising `Relay` automatically registers each
-common enabled transport. A relay observes the actual source address and port of
-an authenticated request. UDP requests retain their cookie validation, and TCP
-registrations originate from the listening port. Clients refresh these
-short-lived registrations and poll for pending introductions until shutdown. A
-node can also register explicitly and request a particular direct transport:
+Two capabilities assist nodes that cannot reach each other directly, and a node
+can advertise either or both:
+
+- A **Traversal** node coordinates direct connections. Registered peers refresh
+  their observed TCP and UDP endpoints with it, ask it to introduce them to
+  another registrant, and punch holes towards the endpoints it hands out. It also
+  arranges the dial-backs that probe whether a node accepts unsolicited packets.
+- A **Forwarder** relays traffic. Peers open forwarding sessions with it, so it
+  knows the endpoint, or duplex TCP connection, at which to deliver to them, and
+  any node can relay an opaque envelope to a session owner through it. Two peers
+  that cannot connect directly still communicate through a Forwarder.
+
+Bootstrapping through a peer advertising either capability automatically
+registers each common enabled transport with it. The assistant observes the
+actual source address and port of each authenticated request; UDP requests
+retain their cookie validation, and TCP registrations originate from the
+listening port. Clients refresh these short-lived registrations and sessions,
+and poll for pending introductions, until shutdown. A node can also register
+explicitly and request a particular direct transport:
 
 ```csharp
-await provider.RegisterRelayAsync(relayPeer, cancellationToken);
-await downloader.RegisterRelayAsync(relayPeer, cancellationToken);
-var connected = await downloader.TryPunchAsync(provider.LocalPeer, relayPeer,
+await provider.RegisterTraversalAsync(traversalPeer, cancellationToken);
+await downloader.RegisterTraversalAsync(traversalPeer, cancellationToken);
+var connected = await downloader.TryPunchAsync(providerPeer, traversalPeer,
     DHTTransport.Udp, cancellationToken);
+await provider.RegisterForwarderAsync(forwarderPeer, cancellationToken);
 ```
 
-Use `DHTTransport.Tcp` to request TCP simultaneous open. The relay distributes
-both observed endpoints and a random, expiring 128-bit ticket. Each peer probes
-from its bound listening port. A valid direct probe must match the ticket, peer
-identity, transport and observed endpoint; ordinary requests then use the
-authenticated direct route. TCP retains the established connection for further
-requests. Successful direct transfers can continue while the relay is offline.
-The registration loops and outstanding probes drain during `StopAsync`.
+Use `DHTTransport.Tcp` to request TCP simultaneous open. The Traversal node
+distributes both observed endpoints and a random, expiring 128-bit ticket. Each
+peer probes from its bound listening port. A valid direct probe must match the
+ticket, peer identity, transport and observed endpoint; ordinary requests then
+use the authenticated direct route. TCP retains the established connection for
+further requests. Successful direct transfers can continue while the Traversal
+node is offline. The session loops and outstanding probes drain during
+`StopAsync`.
 
 Assisted traversal requires a local listener for the transport being punched,
 because the outgoing probe must reuse that listener's port. Set
-`EnableNatTraversal = false` to disable client registration and automatic
-traversal; a peer advertising `Relay` still serves rendezvous requests subject to
-its registry limits. Defaults are a five-second traversal budget, one-second
-polling interval, 30-second registration lease, at most four assisting relays per
-client and 256 registered identities per relay. Introduction queues are bounded
-by `MaxConcurrentRequests`, and active tickets by four times that value.
+`EnableNatTraversal = false` to disable client registration, forwarding sessions
+and automatic traversal; a peer advertising `Traversal` or `Forwarder` still
+serves requests subject to its registry limits. Defaults are a five-second
+traversal budget, one-second polling interval, 30-second lease, at most four
+Traversal nodes and four Forwarders per client, and 256 registrations and 256
+sessions hosted per node. Introduction queues are bounded by
+`MaxConcurrentRequests`, and active tickets by four times that value.
 
 This is best-effort traversal: endpoint-dependent NAT mappings, blocked UDP, TCP
 stacks or firewalls that reject simultaneous open, and router policies can
-prevent a direct path. Opaque forwarding remains available when the relay can
-reach the destination. It reuses live authenticated registrations, including the
-existing TCP session or observed UDP mapping when the signed contact advertises a
-private endpoint. If an introduced probe succeeds but the following RPC fails,
-the requester still tries that same relay's opaque forwarding path.
+prevent a direct path. Forwarding remains available while a Forwarder holds the
+destination's session, including its existing TCP connection or observed UDP
+mapping. If an introduced probe through a node that is both a Traversal node and
+a Forwarder succeeds but the following RPC fails, the requester still forwards
+through that same node.
 
 ### Reachability on home networks
 
 A node behind a home router usually has no fixed reachable address. Leave
-`AdvertisedAddresses` empty and keep `EnableNatTraversal` enabled; the node then
+`PubliclyReachable` off and keep `EnableNatTraversal` enabled; the node then
 determines its reachability itself:
 
-1. **External address.** Relay registrations and Hello responses report the
-   endpoint each remote node observed. An address reported by relays in at least
-   two distinct networks (different IPv4 /24 or IPv6 /32 prefixes) becomes the
-   confirmed `ExternalAddress`. When relays report different ports for it, the
-   contact sets `HasEndpointDependentMapping` and requesters skip hole punching.
-   A changed external address, for example after a PPPoE redial, starts a new
-   epoch that discards earlier verification and checks reachability again.
-2. **Dial-back.** After each new relay registration and every
-   `ReachabilityCheckInterval`, the node asks its relays to arrange a dial-back.
-   The relay delegates it to an independent public helper in another network,
-   which probes only the address the relay observed. An accepted probe adds a
-   `Verified` endpoint and makes the contact `Public` once that address matches
-   the confirmed `ExternalAddress`, so one relay cannot get a foreign address
-   advertised.
-3. **Private contacts.** When dial-backs through relays in two distinct networks
-   time out, the contact becomes `Private`: it drops unreachable endpoints and
-   embeds up to three public relays with live registrations as `RelayHints`.
-   Requesters skip its endpoints (local endpoints are only tried behind the same
-   external address) and reach it through a hinted relay, punching first when
-   they already hold a registration with that relay.
+1. **External address.** Traversal registrations, forwarding sessions and Hello
+   responses report the endpoint each remote node observed. An address reported
+   by observers in at least two distinct networks (different IPv4 /24 or IPv6
+   /32 prefixes) becomes a confirmed external address, exposed through
+   `ExternalAddresses`. When observers report different ports for it, the contact
+   sets `HasEndpointDependentMapping` and requesters skip hole punching. A changed
+   external address, for example after a PPPoE redial, starts a new epoch that
+   discards earlier verification and checks reachability again.
+2. **Dial-back.** After each new traversal registration and every
+   `ReachabilityCheckInterval`, the node asks its Traversal nodes to arrange a
+   dial-back. The Traversal node delegates it to an independent public Traversal
+   node in another network, which probes only the address that was observed. An
+   accepted probe makes the contact `Public` once that address matches the
+   confirmed external address, so one Traversal node cannot make a node claim a
+   foreign address.
+3. **Private contacts.** When dial-backs through Traversal nodes in two distinct
+   networks time out, the contact becomes `Private` as soon as a public Forwarder
+   with a live session can be hinted: it embeds up to three public Traversal
+   nodes and Forwarders with live sessions, Forwarders first, as `Hints`, each
+   with the endpoints the node observed for it. Requesters dial none of its
+   endpoints and reach it through a hinted Forwarder, punching first through a
+   hinted Traversal node they already hold a registration with.
 
 Private nodes act as DHT clients: they search, download and provide content,
 but are never added to routing tables or returned as lookup hops. A contact
 change is re-signed immediately and local publications are reannounced five
 seconds later so provider indexes hold the new contact. Private and unverified
-contacts use a one-hour lease; public contacts use one day. A relay accepts at
-most three dial-back requests per requester each minute; a helper accepts at
-most ten delegations per relay and four dial-backs per target address each
-minute, and sends at most five probe rounds per delegation.
+contacts use a one-hour lease; public contacts use one day. A Traversal node
+accepts at most three dial-back requests per requester each minute; a helper
+accepts at most ten delegations per delegating node and four dial-backs per
+target address each minute, and sends at most five probe rounds per delegation.
 
 ## Custom routing
 
@@ -701,40 +729,44 @@ await using var node = new MajDHTNode(options, identity, store,
 ```
 
 - **`IDHTRoutingTable`** decides which authenticated contacts are kept as lookup
-  hops and which are returned as nearest to a target. The node calls
-  `Initialize` exactly once, so pass a new table to each node. It only passes
-  authenticated, non-private contacts to `Observe`, with the address at which the
-  contact proved an advertised endpoint, or null when it only refreshes a known
-  contact; it calls `Remove` after failures or when a node becomes private, and
-  discards expired, private, duplicate and local contacts that `Closest` returns.
-  The default `KademliaDHTRoutingTable` keeps 256 XOR buckets of `BucketSize`
-  contacts without evicting live entries, and admits at most two contacts per
-  globally routed network in a bucket and ten in the table.
+  hops and which are returned, with their observed endpoints, as nearest to a
+  target. The node calls `Initialize` exactly once, so pass a new table to each
+  node. It only passes authenticated, non-private contacts to `Observe`, with the
+  endpoint at which this node exchanged an authenticated packet with the contact,
+  or null when it only refreshes a known contact; it calls `Remove` after
+  failures or when a node becomes private, and discards expired, private,
+  duplicate and local peers that `Closest` returns. The default
+  `KademliaDHTRoutingTable` keeps 256 XOR buckets of `BucketSize` contacts without
+  evicting live entries, merges new observations into a contact's endpoints, and
+  admits at most two contacts per globally routed network in a bucket and ten in
+  the table.
 - **`IDHTRouteSelector`** decides how a destination is reached. It returns the
   ordered direct attempts (endpoint and transport) and, after they all fail, the
-  ordered relay attempts and whether to punch through each relay first. The
-  `DHTRouteContext` reports the preferred transport, whether NAT traversal is
-  enabled, the confirmed external addresses and the relays this node is
-  registered with. A selector may be shared between nodes.
+  ordered assisted attempts: which Traversal nodes and Forwarders to try and
+  whether to punch through each first. The `DHTRouteContext` reports the
+  preferred transport, whether NAT traversal is enabled and the Traversal nodes
+  this node is registered with. A selector may be shared between nodes.
 
-`DefaultDHTRouteSelector` orders configured or verified endpoints, then
-unverified endpoints, then local endpoints; a private destination's local
-endpoints are only used behind the same external address. Relay routes list the
-destination's relay hints, punching only through hints this node is registered
-with, followed by at most `BucketSize` routed relays; destinations with an
-endpoint-dependent mapping are never punched. Within each of these tiers, routes
-and relays with a lower measured packet loss come first; untried routes count as
-lossless, and equal rates keep the preferred transport and routing order first.
-Custom selectors read the same measurements through
-`DHTRouteContext.GetPeerStatistics` and `DHTRouteContext.PacketLossRate`.
+`DefaultDHTRouteSelector` dials a destination's observed endpoints, most recently
+observed first, and no endpoint of a private destination. Assisted routes list
+the destination's hints, punching only through hinted Traversal nodes this node
+is registered with, followed by at most `BucketSize` routed Traversal nodes and
+Forwarders; destinations with an endpoint-dependent mapping are never punched,
+and an assistant without the `Forwarder` capability is used for punching only.
+Within each of these tiers, routes and assistants with a lower measured packet
+loss come first; untried routes count as lossless, and equal rates keep the
+preferred transport and routing order first. Custom selectors read the same
+measurements through `DHTRouteContext.GetPeerStatistics` and
+`DHTRouteContext.PacketLossRate`.
 
 Both implementations must be thread-safe, return quickly and perform no network
 I/O. Routes are attempts, not trust decisions: every response is authenticated
 against the destination's identity whichever route carried it. Authenticated
-routes learned through punching or rendezvous registrations are always tried
-before the selected direct routes. The node attempts at most sixteen direct and
-thirty-two relay routes and skips relay routes through itself, the destination,
-expired contacts or peers without the `Relay` capability.
+routes learned through punching, hosted traversal registrations or hosted
+forwarding sessions are always tried before the selected direct routes. The node
+attempts at most sixteen direct and thirty-two assisted routes and skips
+assisted routes through itself, the destination, expired contacts or peers with
+neither the `Traversal` nor the `Forwarder` capability.
 
 ## Storage, quotas and lifecycle
 
@@ -895,17 +927,20 @@ pooled frames; its budget of 130,000 B/block fails if the frame copy returns.
 - Recipient keys are long-lived, so the protocol **does not** provide full
   forward secrecy; compromising an identity seed exposes historical traffic.
 - The implementation has **not** been independently audited.
-- Relays hide payloads but observe endpoints, sizes, timing and operation numbers.
-  This is not anonymous routing and does not resist Sybil or eclipse attacks.
+- Forwarders hide payloads but observe endpoints, sizes, timing and operation
+  numbers. This is not anonymous routing and does not resist Sybil or eclipse
+  attacks.
 - Provider advertisements are hints; only signed records, Merkle proofs and the
   complete-file hash are authoritative.
 - Applications must authenticate keys and publisher fingerprints out of band,
   configure bootstrap endpoints only from trusted sources, and persist identity
   seeds and revisions securely. A Hello request is signed but not encrypted.
-- Reachability evidence relies on independent relays and helpers. A single relay
-  cannot set the external address or get a foreign address advertised as
-  Verified; relays colluding across two networks can, and colluding relays can
-  make a node look private. Both affect reachability, never content integrity.
+- Reachability evidence relies on independent observers and helpers. A single
+  Traversal node cannot set the external address or make a node claim public
+  reachability at a foreign address; nodes colluding across two networks can, and
+  colluding Traversal nodes can make a node look private. Referred endpoints are
+  the referrer's claim and are only ever tried, never trusted. All of this affects
+  reachability, never content integrity.
 - Sybil identities are made expensive and contained (see
   [Sybil resistance](#sybil-resistance)) but not prevented: an attacker with
   enough CPU and addresses in many networks can still add identities. Lookups and
@@ -926,10 +961,11 @@ dotnet test src/MajDHTNetwork.Tests/MajDHTNetwork.Tests.csproj --configuration R
 ```
 
 Coverage includes protocol vectors and malformed input, authenticated envelopes
-and impersonation, Merkle geometry, three-node discovery and downloads, relay
-fallback, dual-transport, IPv6 and dual-stack transfers, endpoint bootstrap, UDP
-loss/replay, NAT registration and punching, external-address voting, dial-back
-and relay-hinted private nodes, packet-loss statistics and loss-ranked routes,
+and impersonation, Merkle geometry, three-node discovery and downloads,
+forwarding fallback, dual-transport, IPv6 and dual-stack transfers, endpoint
+bootstrap, UDP loss/replay, traversal registration and punching, forwarding
+sessions and deliveries, external-address voting, dial-back and hinted private
+nodes, packet-loss statistics and loss-ranked routes,
 concurrent multi-provider downloads, quota and lifecycle limits, pooled frame
 release checked by churning the array pool after a download, and warmed
 allocation budgets.
