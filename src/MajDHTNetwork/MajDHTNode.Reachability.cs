@@ -844,7 +844,7 @@ namespace MajDHTNetwork
             try
             {
                 await Task.Delay(ContactAnnouncementDelay, _lifetime.Token).ConfigureAwait(false);
-                await ReannounceLocalRecordsAsync(_lifetime.Token).ConfigureAwait(false);
+                await ReannounceLocalRecordsAsync(false, _lifetime.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
             {

@@ -93,6 +93,31 @@ namespace MajDHTNetwork.Tests
             Assert.Equal(2, small.BlockCount);
         }
 
+        /// <summary>
+        /// Counts the leaves of a geometry registered again under another key once, and returns the leaves of content the
+        /// node stopped providing to the quota.
+        /// </summary>
+        /// <returns>Completion after the quota checks.</returns>
+        [Fact]
+        public async Task LeafQuotaCountsReplacedContentOnceAndReleasesStoppedContent()
+        {
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            var token = deadline.Token;
+            var options = Options(DHTTransport.Tcp, DHTCapabilities.Download | DHTCapabilities.Provide);
+            options.MaxLocalLeaves = 4;
+            await using var node = new MajDHTNode(options);
+            await node.StartAsync(token);
+            var first = await node.PublishAsync("songs/first", new MemoryStream(Crypto.Random(16384 * 2)), cancellationToken: token);
+            await node.PublishAliasAsync("songs/first-alias", first, cancellationToken: token);
+            // The alias replaced the tree of the same geometry, so two leaves remain for a second two-block file.
+            await node.PublishAsync("songs/second", new MemoryStream(Crypto.Random(16384 * 2)), cancellationToken: token);
+            var third = Crypto.Random(16384 * 2);
+            await Assert.ThrowsAnyAsync<IOException>(() => node.PublishAsync("songs/third", new MemoryStream(third), cancellationToken: token));
+            Assert.True(node.StopProviding(first.FileHash), "The first file must have been provided.");
+            var released = await node.PublishAsync("songs/third", new MemoryStream(third), cancellationToken: token);
+            Assert.Equal(2, released.BlockCount);
+        }
+
         /// <summary>Asks the fallback once for unknown content, then serves the acquired content directly.</summary>
         /// <returns>Completion after the pulled-through block reads.</returns>
         [Fact]

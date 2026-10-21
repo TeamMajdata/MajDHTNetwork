@@ -38,9 +38,10 @@ namespace MajDHTNetwork
         /// <summary>
         /// Bounds the record replications in flight to <see cref="MaxConcurrentReplications"/>, so many publications, imports
         /// and maintenance announcements at once stay within the outgoing exchange budget of
-        /// <see cref="DHTNodeOptions.MaxConcurrentRequests"/> instead of failing requests and evicting routing contacts.
+        /// <see cref="DHTNodeOptions.MaxConcurrentRequests"/> instead of failing requests and evicting routing contacts, and
+        /// lets maintenance reannouncements yield their share of it to publications.
         /// </summary>
-        private readonly SemaphoreSlim _replications;
+        private readonly ReplicationGate _replications;
         /// <summary>The node shutdown token, also linked to all public operations.</summary>
         private readonly CancellationTokenSource _lifetime = new CancellationTokenSource();
         /// <summary>The signed records keyed by canonical lookup key.</summary>
@@ -51,6 +52,19 @@ namespace MajDHTNetwork
         private readonly Dictionary<string, Dictionary<string, ProviderClaim>> _providers = new Dictionary<string, Dictionary<string, ProviderClaim>>();
         /// <summary>The locally available Merkle trees indexed by file hash and block size.</summary>
         private readonly Dictionary<string, LocalContent> _contents = new Dictionary<string, LocalContent>();
+        /// <summary>
+        /// The Merkle leaves of every tree in <see cref="_contents"/>, kept in step with it by
+        /// <see cref="SetLocalContentLocked"/> and <see cref="RemoveLocalContentLocked"/>, so registering content checks the
+        /// leaf quota without walking every tree; that walk made registering N contents quadratic under the index lock.
+        /// </summary>
+        private long _localLeaves;
+        /// <summary>
+        /// The revision and <see cref="Stopwatch"/> timestamp with which each record last reached a remote replica, keyed by
+        /// canonical lookup key, so maintenance does not reannounce a record that a publication, import, renewal or an
+        /// earlier maintenance pass announced less than one <see cref="DHTNodeOptions.RepublishInterval"/> ago, and knows how
+        /// long a reannouncement may yield to publications. Entries leave with their records.
+        /// </summary>
+        private readonly Dictionary<string, (long Revision, long Timestamp)> _announced = new Dictionary<string, (long, long)>();
         /// <summary>
         /// The shortest interval between two opportunistic prunes of the index, in <see cref="Stopwatch"/> ticks. A prune
         /// walks every record, revision, provider claim and local tree, so pruning on every cached record made a node with
@@ -68,6 +82,11 @@ namespace MajDHTNetwork
         private DHTContact? _self;
         /// <summary>The maintenance loop task.</summary>
         private Task _maintenance = Task.CompletedTask;
+        /// <summary>
+        /// The reannouncement pass that the maintenance loop started last; only that loop reads or replaces it, and it starts
+        /// no other pass while this one runs.
+        /// </summary>
+        private Task _reannouncement = Task.CompletedTask;
         /// <summary>The initial background bootstrap through the configured endpoints.</summary>
         private Task _bootstrap = Task.CompletedTask;
         /// <summary>Tracks whether this single-use node has started.</summary>
@@ -163,7 +182,7 @@ namespace MajDHTNetwork
             _routing.Initialize(NodeId, _options.BucketSize);
             _routeSelector = routeSelector ?? new DefaultDHTRouteSelector();
             _contentFallback = contentFallback;
-            _replications = new SemaphoreSlim(MaxConcurrentReplications, MaxConcurrentReplications);
+            _replications = new ReplicationGate(MaxConcurrentReplications, PublicationQuietPeriod);
             _transport = new SocketTransport(_options, HandleAsync, _options.Logger);
         }
 

@@ -73,7 +73,7 @@ namespace MajDHTNetwork
                 _publishing.Release();
             }
             var fileHash = withdrawn != null && !withdrawn.IsWithdrawn ? withdrawn.FileHash : null;
-            var replicas = await AnnounceWithdrawalAsync(withdrawal, fileHash, cancellation.Token).ConfigureAwait(false);
+            var replicas = await AnnounceWithdrawalAsync(withdrawal, fileHash, publication: true, cancellation.Token).ConfigureAwait(false);
             Log(replicas == 0 ? LogLevel.Warning : LogLevel.Information,
                 replicas == 0 ? "Withdrawal is effective locally; no remote replica accepted it." : "Publication withdrawn.");
             return withdrawal;
@@ -105,7 +105,7 @@ namespace MajDHTNetwork
                 }
                 foreach (var geometry in geometries)
                 {
-                    removed |= _contents.Remove(geometry);
+                    removed |= RemoveLocalContentLocked(geometry);
                 }
                 if (_providers.TryGetValue(fileHash, out var providers))
                 {
@@ -122,12 +122,15 @@ namespace MajDHTNetwork
         /// <summary>Replicates a withdrawal near its key and, when known, near the withdrawn file hash.</summary>
         /// <param name="withdrawal">The signed withdrawal.</param>
         /// <param name="fileHash">The file hash of the withdrawn publication, whose nearby nodes also cached it, or null.</param>
+        /// <param name="publication">
+        /// Whether a caller waits for the announcement, so maintenance reannouncements yield to it; false for a reannouncement.
+        /// </param>
         /// <param name="cancellationToken">Cancels lookup and replication.</param>
         /// <returns>The number of remote replicas accepting the withdrawal.</returns>
         /// <exception cref="OperationCanceledException">Replication was cancelled.</exception>
-        private Task<int> AnnounceWithdrawalAsync(DHTRecord withdrawal, string? fileHash, CancellationToken cancellationToken)
+        private Task<int> AnnounceWithdrawalAsync(DHTRecord withdrawal, string? fileHash, bool publication, CancellationToken cancellationToken)
         {
-            return ReplicateAsync(withdrawal, withdrawal.Key.RoutingId, fileHash, cancellationToken);
+            return ReplicateAsync(withdrawal, withdrawal.Key.RoutingId, fileHash, publication, cancellationToken);
         }
 
         /// <summary>Selects the higher revision of two optional records.</summary>

@@ -114,6 +114,36 @@ namespace MajDHTNetwork.Tests
             Assert.Equal("second", replacement.Key.Name);
         }
 
+        /// <summary>Returns the Merkle leaves of content whose only record expired to the leaf quota when a registration needs them.</summary>
+        /// <returns>Completion after the publication that depends on the released leaves.</returns>
+        [Fact]
+        public async Task ExpiredContentReleasesTheLeafQuota()
+        {
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            var token = deadline.Token;
+            // Expiry is signed in whole seconds, so a two-second lifetime leaves the first record more than one second.
+            var options = new DHTNodeOptions
+            {
+                UdpPort = null,
+                MaxLocalLeaves = 2,
+                RecordLifetime = TimeSpan.FromSeconds(2),
+                MaintenanceInterval = TimeSpan.FromHours(1)
+            };
+            await using var node = new MajDHTNode(options);
+            await node.StartAsync(token);
+            using var first = new MemoryStream(Crypto.Random(16384 * 2));
+            var record = await node.PublishAsync("first", first, cancellationToken: token);
+            using var blocked = new MemoryStream(Crypto.Random(16384 * 2));
+            await Assert.ThrowsAnyAsync<IOException>(() => node.PublishAsync("second", blocked, cancellationToken: token));
+            while (!record.IsExpired)
+            {
+                await Task.Delay(100, token);
+            }
+            using var second = new MemoryStream(Crypto.Random(16384 * 2));
+            var replacement = await node.PublishAsync("second", second, cancellationToken: token);
+            Assert.Equal(2, replacement.BlockCount);
+        }
+
         /// <summary>Preserves the raw blocks and Merkle metadata when a signed alias is renewed after expiry.</summary>
         /// <returns>Completion after the regression assertions and node cleanup.</returns>
         [Fact]
