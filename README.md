@@ -608,7 +608,9 @@ makes them costly and limits what they can reach:
 - **Verified admission.** A contact enters the routing table only at an endpoint
   this node observed itself: the endpoint that answered a request, or the source
   of an inbound request once the sender answered a Ping at that source, at most
-  16 verifications at a time and eight per source network per minute. Referred
+  16 verifications at a time and eight per source network per minute. A known
+  node that sends from a new source, such as after a restart on another port,
+  is verified there again and learned at its new endpoint. Referred
   endpoints are tried but never admitted on the referrer's word. Peers reachable
   only through Forwarders or punched routes are used but never referred to others.
 - **Network diversity.** The routing table keeps at most two contacts per IPv4

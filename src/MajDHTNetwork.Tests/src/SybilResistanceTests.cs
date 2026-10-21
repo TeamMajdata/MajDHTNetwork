@@ -147,6 +147,61 @@ namespace MajDHTNetwork.Tests
             Assert.InRange(verifications, 1, MajDHTNode.VerificationsPerNetwork);
         }
 
+        /// <summary>
+        /// Re-verifies a routed sender that sends from a source it was never observed at, such as after a restart on another
+        /// port: the new source replaces the old port once it answers a Ping, and stays out of the table while it does not.
+        /// </summary>
+        /// <returns>Completion after the moved sender was admitted and the unverifiable one was not.</returns>
+        [Fact]
+        public async Task KnownSendersAreReverifiedAtANewSource()
+        {
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            var token = deadline.Token;
+            await using var node = new MajDHTNode(Options(DHTTransport.Tcp, DHTCapabilities.Download));
+            await node.StartAsync(token);
+            var address = IPAddress.Parse("127.0.0.6");
+            IPEndPoint original;
+            DHTIdentity identity;
+            await using (var honest = new ScriptedPeer(address, DHTCapabilities.Download, DHTReachability.Unknown))
+            {
+                original = honest.Endpoint;
+                identity = honest.Identity;
+                Assert.Equal(0, (await honest.SendAsync(node.LocalPeer, Operation.Ping, ReadOnlyMemory<byte>.Empty, token)).Status);
+                await WaitUntilAsync(() => Contains(node.KnownPeers, identity.NodeId), token);
+            }
+            // The same node restarts on another port of the same address and answers the verification Ping there.
+            await using var moved = new ScriptedPeer(address, DHTCapabilities.Download, DHTReachability.Unknown, identity);
+            Assert.Equal(0, (await moved.SendAsync(node.LocalPeer, Operation.Ping, ReadOnlyMemory<byte>.Empty, token)).Status);
+            await WaitUntilAsync(() => RoutedAt(node, identity.NodeId, moved.Endpoint), token);
+            Assert.True(moved.Received(Operation.Ping) > 0, "The moved sender must be verified at its new source.");
+            Assert.False(RoutedAt(node, identity.NodeId, original), "A port replaced at the same address must not linger.");
+            // A source that does not answer the verification Ping under the routed identity never replaces the admitted one.
+            await using var silent = new ScriptedPeer(address, DHTCapabilities.Download, DHTReachability.Unknown, identity);
+            silent.Script((packet, source) => ((byte)1, Array.Empty<byte>()));
+            Assert.Equal(0, (await silent.SendAsync(node.LocalPeer, Operation.Ping, ReadOnlyMemory<byte>.Empty, token)).Status);
+            await WaitUntilAsync(() => silent.Received(Operation.Ping) > 0, token);
+            await Task.Delay(TimeSpan.FromSeconds(1), token);
+            Assert.True(RoutedAt(node, identity.NodeId, moved.Endpoint), "A failed verification must keep the verified source.");
+            Assert.False(RoutedAt(node, identity.NodeId, silent.Endpoint));
+        }
+
+        /// <summary>Checks whether a node's routing table holds a peer observed at a TCP endpoint.</summary>
+        /// <param name="node">The node.</param>
+        /// <param name="nodeId">The peer identifier.</param>
+        /// <param name="endpoint">The TCP endpoint.</param>
+        /// <returns>Whether the peer is known and was observed there.</returns>
+        private static bool RoutedAt(MajDHTNode node, string nodeId, IPEndPoint endpoint)
+        {
+            foreach (var peer in node.KnownPeers)
+            {
+                if (peer.NodeId == nodeId)
+                {
+                    return peer.WasObservedAt(DHTTransport.Tcp, endpoint);
+                }
+            }
+            return false;
+        }
+
         /// <summary>Draws at most one dial-back helper per network, so one network cannot supply every helper.</summary>
         /// <returns>Completion after three dial-back requests.</returns>
         [Fact]

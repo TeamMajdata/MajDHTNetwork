@@ -79,16 +79,19 @@ namespace MajDHTNetwork
         }
 
         /// <summary>
-        /// Handles the sender of an inbound request: a known contact is refreshed, and an unknown one is queued for a bounded
-        /// verification at its observed source before it can occupy the routing table.
+        /// Handles the sender of an inbound request: a known contact is refreshed, and a sender that is unknown or sends from a
+        /// source this node never observed for it is queued for a bounded verification at that source before the source can
+        /// enter the routing table.
         /// </summary>
         /// <param name="sender">The authenticated sender.</param>
         /// <param name="transport">The receiving transport.</param>
         /// <param name="source">The observed source endpoint.</param>
         /// <remarks>
         /// Nodes send from their listening ports, so an honest directly reachable node answers a Ping at the endpoint its
-        /// request came from. A sender with unknown reachability that holds a traversal registration or forwarding session with
-        /// this node asked for NAT assistance, so its source stays unverified until a dial-back makes its contact public.
+        /// request came from, and a known node that restarted on another port or behind a new NAT mapping is learned at its
+        /// new source as soon as it sends a request. A sender with unknown reachability that holds a traversal registration
+        /// or forwarding session with this node asked for NAT assistance, so its source stays unverified until a dial-back
+        /// makes its contact public.
         /// </remarks>
         private void AdmitInbound(DHTContact sender, DHTTransport transport, IPEndPoint source)
         {
@@ -102,20 +105,38 @@ namespace MajDHTNetwork
             {
                 return;
             }
+            if (IsRoutedAt(sender.NodeId, transport, source))
+            {
+                return;
+            }
             ScheduleVerification(DHTPeer.Observed(sender, transport, source));
         }
 
-        /// <summary>Starts a bounded, rate-limited verification of an inbound sender at its observed source endpoint.</summary>
+        /// <summary>Checks whether the routing table already holds a node at a socket endpoint it observed itself.</summary>
+        /// <param name="nodeId">The node identifier.</param>
+        /// <param name="transport">The transport of the endpoint.</param>
+        /// <param name="endpoint">The socket endpoint.</param>
+        /// <returns>Whether the node is routed and was observed at that endpoint over that transport.</returns>
+        private bool IsRoutedAt(string nodeId, DHTTransport transport, IPEndPoint endpoint)
+        {
+            foreach (var routed in _routing.Closest(nodeId, 1) ?? Array.Empty<DHTPeer>())
+            {
+                if (routed?.NodeId == nodeId)
+                {
+                    return routed.WasObservedAt(transport, endpoint);
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Starts a bounded, rate-limited verification of an inbound sender at its observed source endpoint. A sender that is
+        /// verified at a source it was not routed at before is admitted there, and an already routed sender has the new
+        /// source merged into its observed endpoints.
+        /// </summary>
         /// <param name="candidate">The candidate at its observed source.</param>
         private void ScheduleVerification(DHTPeer candidate)
         {
-            foreach (var routed in _routing.Closest(candidate.NodeId, 1) ?? Array.Empty<DHTPeer>())
-            {
-                if (routed?.NodeId == candidate.NodeId)
-                {
-                    return;
-                }
-            }
             var source = candidate.Endpoints[0].NetworkAddress;
             lock (_gate)
             {

@@ -456,7 +456,10 @@ queries remove failed peers. A contact is admitted only at an endpoint the node
 itself observed: the destination that answered a request sent to one of the
 contact's known endpoints, or the source of an inbound request once the sender
 answered a direct Ping at that source, at most 16 verifications at a time and
-eight per source network per minute. A sender with Unknown reachability that
+eight per source network per minute. A routed sender that sends from a source
+the node never observed for it, such as after a restart on another port or
+behind a new NAT mapping, is verified at that source the same way, and the
+answered source is merged into its endpoints. A sender with Unknown reachability that
 holds a traversal registration or forwarding session with the node asked for NAT
 assistance, so it is not verified until a dial-back makes its contact public.
 Responses over punched routes, hosted registrations and sessions or Forwarders
